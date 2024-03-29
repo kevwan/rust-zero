@@ -1,9 +1,5 @@
-[package]
-name = "rust-zero"
-version = "0.1.0"
-edition = "2021"
-authors = ["Kevin Wan <wanjunfeng@gmail.com>"]
-description = "A web framework for Rust"
-license = "MIT"
-
-[dependencies]
+[workspace]
+resolver = "2"
+members = [ "demo",
+    "rest",
+]
