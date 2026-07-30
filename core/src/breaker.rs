@@ -1,0 +1,240 @@
+use std::{
+    fmt,
+    sync::Mutex,
+    time::{Duration, Instant},
+};
+
+/// Circuit-breaker behavior for an unreliable downstream dependency.
+#[derive(Debug, Clone, Copy)]
+pub struct CircuitBreakerConfig {
+    pub max_failures: u32,
+    pub reset_timeout: Duration,
+    pub half_open_max_calls: u32,
+}
+
+impl CircuitBreakerConfig {
+    pub fn new(max_failures: u32, reset_timeout: Duration) -> Self {
+        assert!(
+            max_failures > 0,
+            "maximum failures must be greater than zero"
+        );
+        assert!(
+            !reset_timeout.is_zero(),
+            "reset timeout must be greater than zero"
+        );
+
+        Self {
+            max_failures,
+            reset_timeout,
+            half_open_max_calls: 1,
+        }
+    }
+
+    pub fn with_half_open_max_calls(mut self, calls: u32) -> Self {
+        assert!(calls > 0, "half-open calls must be greater than zero");
+        self.half_open_max_calls = calls;
+        self
+    }
+}
+
+/// Externally visible circuit state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BreakerState {
+    Closed,
+    Open,
+    HalfOpen,
+}
+
+enum State {
+    Closed { consecutive_failures: u32 },
+    Open { opened_at: Instant },
+    HalfOpen { attempts: u32, successes: u32 },
+}
+
+impl State {
+    fn status(&self) -> BreakerState {
+        match self {
+            Self::Closed { .. } => BreakerState::Closed,
+            Self::Open { .. } => BreakerState::Open,
+            Self::HalfOpen { .. } => BreakerState::HalfOpen,
+        }
+    }
+}
+
+/// Prevents calls to a dependency that has failed repeatedly.
+pub struct CircuitBreaker {
+    config: CircuitBreakerConfig,
+    state: Mutex<State>,
+}
+
+impl CircuitBreaker {
+    pub fn new(config: CircuitBreakerConfig) -> Self {
+        Self {
+            config,
+            state: Mutex::new(State::Closed {
+                consecutive_failures: 0,
+            }),
+        }
+    }
+
+    pub fn state(&self) -> BreakerState {
+        self.state
+            .lock()
+            .expect("circuit breaker state lock poisoned")
+            .status()
+    }
+
+    /// Runs an operation if the circuit permits it.
+    pub fn execute<T, E, F>(&self, operation: F) -> Result<T, CircuitBreakerError<E>>
+    where
+        F: FnOnce() -> Result<T, E>,
+    {
+        self.before_call()?;
+        match operation() {
+            Ok(value) => {
+                self.record_success();
+                Ok(value)
+            }
+            Err(error) => {
+                self.record_failure();
+                Err(CircuitBreakerError::Operation(error))
+            }
+        }
+    }
+
+    fn before_call<E>(&self) -> Result<(), CircuitBreakerError<E>> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("circuit breaker state lock poisoned");
+
+        if let State::Open { opened_at } = *state {
+            if opened_at.elapsed() < self.config.reset_timeout {
+                return Err(CircuitBreakerError::Open);
+            }
+            *state = State::HalfOpen {
+                attempts: 0,
+                successes: 0,
+            };
+        }
+
+        if let State::HalfOpen { attempts, .. } = &mut *state {
+            if *attempts >= self.config.half_open_max_calls {
+                return Err(CircuitBreakerError::Open);
+            }
+            *attempts += 1;
+        }
+
+        Ok(())
+    }
+
+    fn record_success(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("circuit breaker state lock poisoned");
+        match &mut *state {
+            State::Closed {
+                consecutive_failures,
+            } => *consecutive_failures = 0,
+            State::Open { .. } => {}
+            State::HalfOpen {
+                attempts: _,
+                successes,
+            } => {
+                *successes += 1;
+                if *successes == self.config.half_open_max_calls {
+                    *state = State::Closed {
+                        consecutive_failures: 0,
+                    };
+                }
+            }
+        }
+    }
+
+    fn record_failure(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("circuit breaker state lock poisoned");
+        match &mut *state {
+            State::Closed {
+                consecutive_failures,
+            } => {
+                *consecutive_failures += 1;
+                if *consecutive_failures >= self.config.max_failures {
+                    *state = State::Open {
+                        opened_at: Instant::now(),
+                    };
+                }
+            }
+            State::Open { .. } => {}
+            State::HalfOpen { .. } => {
+                *state = State::Open {
+                    opened_at: Instant::now(),
+                };
+            }
+        }
+    }
+}
+
+/// An operation error or the rejection produced by an open circuit.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CircuitBreakerError<E> {
+    Open,
+    Operation(E),
+}
+
+impl<E: fmt::Display> fmt::Display for CircuitBreakerError<E> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Open => formatter.write_str("circuit breaker is open"),
+            Self::Operation(error) => write!(formatter, "protected operation failed: {error}"),
+        }
+    }
+}
+
+impl<E: std::error::Error + 'static> std::error::Error for CircuitBreakerError<E> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Open => None,
+            Self::Operation(error) => Some(error),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::thread;
+
+    #[test]
+    fn opens_after_the_configured_failure_threshold() {
+        let breaker = CircuitBreaker::new(CircuitBreakerConfig::new(2, Duration::from_secs(1)));
+
+        assert_eq!(
+            breaker.execute(|| Err::<(), _>("first")),
+            Err(CircuitBreakerError::Operation("first"))
+        );
+        assert_eq!(
+            breaker.execute(|| Err::<(), _>("second")),
+            Err(CircuitBreakerError::Operation("second"))
+        );
+        assert_eq!(breaker.state(), BreakerState::Open);
+        assert_eq!(
+            breaker.execute(|| Ok::<_, ()>(())),
+            Err(CircuitBreakerError::Open)
+        );
+    }
+
+    #[test]
+    fn closes_after_a_successful_half_open_probe() {
+        let breaker = CircuitBreaker::new(CircuitBreakerConfig::new(1, Duration::from_millis(5)));
+
+        let _ = breaker.execute(|| Err::<(), _>("unavailable"));
+        thread::sleep(Duration::from_millis(10));
+
+        assert_eq!(breaker.execute(|| Ok::<_, ()>(42)), Ok(42));
+        assert_eq!(breaker.state(), BreakerState::Closed);
+    }
+}

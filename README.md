@@ -9,6 +9,48 @@ A Rust web and RPC framework inspired by [go-zero](https://github.com/zeromicro/
 - Tonic-based gRPC client and server builders with deadline, connection concurrency, and stream
   limits plus gRPC health reporting.
 - A Tokio-based MapReduce primitive with bounded parallelism.
+- Framework-neutral runtime primitives in `rust-zero-core`: typed JSON/TOML/YAML configuration
+  loading with environment expansion, circuit breaking, adaptive concurrency shedding, consistent
+  hashing, bounded exponential retry, and async deadlines.
+
+## Core runtime
+
+`rust-zero-core` supplies the production controls that are shared by transport services and
+background workers:
+
+```rust
+use rust_zero_core::{
+    retry, AdaptiveShedder, CircuitBreaker, CircuitBreakerConfig, ConsistentHash,
+    LoadShedderConfig, RetryPolicy,
+};
+use std::time::Duration;
+
+let breaker = CircuitBreaker::new(CircuitBreakerConfig::new(5, Duration::from_secs(30)));
+let shedder = AdaptiveShedder::new(LoadShedderConfig::new(128, Duration::from_millis(100)));
+let mut backends = ConsistentHash::new(100);
+backends.add("http://users-a:8080");
+
+let _permit = shedder.try_acquire();
+let _response = breaker.execute(|| {
+    // call a selected backend
+    Ok::<_, std::io::Error>(())
+})?;
+
+retry(RetryPolicy::new(3, Duration::from_millis(50)), || async {
+    Ok::<_, std::io::Error>(())
+})
+.await?;
+```
+
+Configuration is deserialized directly into service types, selected by file extension, and
+expands `$VAR` or `${VAR}` values from the process environment:
+
+```rust
+use rust_zero_core::{load_config, ServiceConfig};
+
+let config: ServiceConfig = load_config("etc/users.toml")?;
+assert_eq!(config.address(), "0.0.0.0:8080");
+```
 
 The REST middleware is composable and returns standard HTTP responses when protection activates:
 
