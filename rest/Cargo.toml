@@ -10,5 +10,6 @@ actix-cors = "0.7"
 actix-rt = "2"
 actix-web = "4"
 futures = "0.3.30"
+rust-zero-core = { path = "../core" }
 tokio = { version = "1", features = ["sync"] }
 tracing = "0.1"

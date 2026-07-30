@@ -81,6 +81,9 @@ HttpServer::new(move || {
 })
 ```
 
+Register `HttpMetrics` in a shared `Metrics` registry to emit Prometheus-compatible request
+counts and latency histograms labeled by method, route, and response status.
+
 ## RPC
 
 `rpc` provides common transport controls while leaving protobuf service implementations as normal

@@ -1,9 +1,11 @@
 pub mod log;
+pub mod metrics;
 pub mod middleware;
 pub mod resilience;
 
 pub use actix_cors::Cors;
 pub use log::LoggingMiddleware;
+pub use metrics::{HttpMetrics, MetricsMiddleware};
 pub use middleware::{ConcurrencyLimit, RateLimit, Timeout};
 pub use resilience::{RequestId, RequestIdValue};
 
