@@ -12,7 +12,8 @@ A Rust web and RPC framework inspired by [go-zero](https://github.com/zeromicro/
 - Framework-neutral runtime primitives in `rust-zero-core`: typed JSON/TOML/YAML configuration
   loading with environment expansion, circuit breaking, adaptive concurrency shedding, consistent
   hashing, TTL caching, bounded exponential retry, async deadlines, and keyed single-flight work
-  coalescing.
+  coalescing. It also provides a dependency-free Prometheus text-format metrics registry with
+  labeled counters, gauges, and histograms.
 
 ## Core runtime
 
