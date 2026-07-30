@@ -9,3 +9,4 @@ edition = "2021"
 actix-rt = "2.9.0"
 actix-web = "4.5.1"
 rest = { path = "../rest" }
+tracing-subscriber = "0.3"

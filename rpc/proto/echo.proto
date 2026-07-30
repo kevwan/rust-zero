@@ -1,0 +1,15 @@
+syntax = "proto3";
+
+package rust_zero.echo;
+
+service Echo {
+  rpc Echo(EchoRequest) returns (EchoResponse);
+}
+
+message EchoRequest {
+  string message = 1;
+}
+
+message EchoResponse {
+  string message = 1;
+}
