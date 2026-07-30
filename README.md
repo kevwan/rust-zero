@@ -4,8 +4,8 @@ A Rust web and RPC framework inspired by [go-zero](https://github.com/zeromicro/
 
 ## Available features
 
-- Actix Web middleware for structured request logging, timeout control, overload shedding, and
-  token-bucket rate limiting.
+- Actix Web middleware for structured request logging, request identity propagation, CORS, timeout
+  control, overload shedding, and token-bucket rate limiting.
 - Tonic-based gRPC client and server builders with deadline, connection concurrency, and stream
   limits plus gRPC health reporting.
 - A Tokio-based MapReduce primitive with bounded parallelism.
@@ -62,7 +62,7 @@ The REST middleware is composable and returns standard HTTP responses when prote
 
 ```rust
 use actix_web::{App, HttpServer};
-use rest::{ConcurrencyLimit, LoggingMiddleware, RateLimit, Timeout};
+use rest::{ConcurrencyLimit, Cors, LoggingMiddleware, RateLimit, RequestId, Timeout};
 use std::time::Duration;
 
 let concurrency_limit = ConcurrencyLimit::new(1_024);
@@ -71,6 +71,8 @@ let rate_limit = RateLimit::new(1_000, 2_000);
 HttpServer::new(move || {
     App::new()
         .wrap(LoggingMiddleware)
+        .wrap(RequestId::new())
+        .wrap(Cors::permissive())
         .wrap(Timeout::new(Duration::from_secs(10)))
         .wrap(concurrency_limit.clone())
         .wrap(rate_limit.clone())
