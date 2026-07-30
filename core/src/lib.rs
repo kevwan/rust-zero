@@ -11,6 +11,7 @@ pub mod fx;
 pub mod hash;
 pub mod load;
 pub mod queue;
+pub mod singleflight;
 
 pub use breaker::{BreakerState, CircuitBreaker, CircuitBreakerConfig, CircuitBreakerError};
 pub use cache::TtlCache;
@@ -19,3 +20,4 @@ pub use fx::{retry, timeout, RetryPolicy};
 pub use hash::ConsistentHash;
 pub use load::{AdaptiveShedder, LoadShedderConfig, ShedPermit};
 pub use queue::{QueueReceiver, QueueSender};
+pub use singleflight::{SingleFlight, SingleFlightError};
