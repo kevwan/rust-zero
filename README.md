@@ -106,3 +106,22 @@ let channel = RpcClient::new(
 .connect()
 .await?;
 ```
+
+## Gateway routing
+
+`gateway` routes a request to the most-specific configured path prefix and balances calls across
+that route's upstreams:
+
+```rust
+use gateway::{GatewayRoute, GatewayRouter};
+
+let gateway = GatewayRouter::new([
+    GatewayRoute::new("/", vec!["http://frontend:8080".to_owned()])?,
+    GatewayRoute::new("/api", vec![
+        "http://users-a:8080".to_owned(),
+        "http://users-b:8080".to_owned(),
+    ])?,
+])?;
+
+assert!(gateway.select("/api/users").is_some());
+```
