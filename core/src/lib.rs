@@ -10,6 +10,7 @@ pub mod config;
 pub mod fx;
 pub mod hash;
 pub mod load;
+pub mod metric;
 pub mod queue;
 pub mod singleflight;
 
@@ -19,5 +20,8 @@ pub use config::{load_config, parse_config, ConfigError, ConfigFormat, ServiceCo
 pub use fx::{retry, timeout, RetryPolicy};
 pub use hash::ConsistentHash;
 pub use load::{AdaptiveShedder, LoadShedderConfig, ShedPermit};
+pub use metric::{
+    CounterVec, GaugeVec, HistogramOptions, HistogramVec, Metrics, MetricsError, VectorOptions,
+};
 pub use queue::{QueueReceiver, QueueSender};
 pub use singleflight::{SingleFlight, SingleFlightError};
