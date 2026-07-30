@@ -5,12 +5,14 @@
 //! particular HTTP or gRPC framework so REST, RPC, and background services can share them.
 
 pub mod breaker;
+pub mod cache;
 pub mod config;
 pub mod fx;
 pub mod hash;
 pub mod load;
 
 pub use breaker::{BreakerState, CircuitBreaker, CircuitBreakerConfig, CircuitBreakerError};
+pub use cache::TtlCache;
 pub use config::{load_config, parse_config, ConfigError, ConfigFormat, ServiceConfig};
 pub use fx::{retry, timeout, RetryPolicy};
 pub use hash::ConsistentHash;

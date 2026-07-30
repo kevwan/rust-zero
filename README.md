@@ -11,7 +11,7 @@ A Rust web and RPC framework inspired by [go-zero](https://github.com/zeromicro/
 - A Tokio-based MapReduce primitive with bounded parallelism.
 - Framework-neutral runtime primitives in `rust-zero-core`: typed JSON/TOML/YAML configuration
   loading with environment expansion, circuit breaking, adaptive concurrency shedding, consistent
-  hashing, bounded exponential retry, and async deadlines.
+  hashing, TTL caching, bounded exponential retry, and async deadlines.
 
 ## Core runtime
 
