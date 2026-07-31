@@ -2,6 +2,8 @@
 
 A Rust web and RPC framework inspired by [go-zero](https://github.com/zeromicro/go-zero).
 
+See [FEATURE_PARITY.md](FEATURE_PARITY.md) for runtime coverage against go-zero v1.10.2.
+
 ## Available features
 
 - Actix Web middleware for structured request logging, request identity propagation, CORS, bearer
