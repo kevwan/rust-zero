@@ -9,12 +9,14 @@ pub mod trace;
 
 pub use actix_cors::Cors;
 pub use auth::{encode_hs256, BearerAuth, JwtAuth, JwtError};
-pub use log::LoggingMiddleware;
+pub use log::{LoggingMiddleware, StructuredLogging};
 pub use metrics::{HttpMetrics, MetricsMiddleware};
 pub use middleware::{ConcurrencyLimit, RateLimit, RequestBodyLimit, Timeout};
 pub use recovery::Recover;
 pub use resilience::{RequestId, RequestIdValue};
 pub use security::SecurityHeaders;
+#[cfg(feature = "telemetry")]
+pub use trace::OpenTelemetryTracing;
 pub use trace::TraceContextMiddleware;
 
 #[cfg(test)]

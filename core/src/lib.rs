@@ -14,12 +14,15 @@ pub mod fx;
 pub mod hash;
 pub mod limit;
 pub mod load;
+pub mod log;
 pub mod metric;
 pub mod pubsub;
 pub mod queue;
 pub mod rolling;
 pub mod service;
 pub mod singleflight;
+#[cfg(feature = "telemetry")]
+pub mod telemetry;
 pub mod trace;
 
 pub use bloom::{BloomError, BloomFilter};
@@ -34,6 +37,10 @@ pub use fx::{retry, timeout, RetryPolicy};
 pub use hash::ConsistentHash;
 pub use limit::{LimitDecision, PeriodLimiter, TokenLimiter};
 pub use load::{AdaptiveShedder, LoadShedderConfig, ShedPermit};
+pub use log::{
+    LogConfig, LogContext, LogEncoding, LogError, LogField, LogLevel, LogSampler, LogTarget,
+    Logger, RotationPolicy, Sensitive,
+};
 pub use metric::{
     CounterVec, GaugeVec, HistogramOptions, HistogramVec, Metrics, MetricsError, VectorOptions,
 };
@@ -42,4 +49,8 @@ pub use queue::{QueueReceiver, QueueSender};
 pub use rolling::{RollingSnapshot, RollingWindow};
 pub use service::{RunningServices, ServiceGroup, ServiceGroupError, Shutdown, ShutdownHandle};
 pub use singleflight::{SingleFlight, SingleFlightError};
+#[cfg(feature = "telemetry")]
+pub use telemetry::{
+    OtlpTransport, Telemetry, TelemetryConfig, TelemetryError, TelemetrySpan, TelemetrySpanKind,
+};
 pub use trace::{TraceContext, TraceContextError, TraceFlags};

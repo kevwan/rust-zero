@@ -4,7 +4,18 @@ version = "0.1.0"
 edition = "2021"
 description = "Runtime primitives for rust-zero services"
 
+[features]
+default = []
+telemetry = [
+    "dep:opentelemetry",
+    "dep:opentelemetry-otlp",
+    "dep:opentelemetry_sdk",
+]
+
 [dependencies]
+opentelemetry = { version = "0.32", features = ["trace"], optional = true }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["grpc-tonic", "http-proto", "reqwest-blocking-client", "trace"], optional = true }
+opentelemetry_sdk = { version = "0.32", features = ["trace"], optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"

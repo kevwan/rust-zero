@@ -14,8 +14,8 @@ capability rather than identical package names or APIs.
 | In-process caching | Covered | TTL and bounded LRU caches, statistics, explicit invalidation, and single-flight read-through fetching |
 | Configuration | Covered | Typed JSON, TOML, and YAML loading with environment expansion and production service defaults |
 | Metrics | Covered | Labeled counters, gauges, histograms, Prometheus text rendering, and REST request metrics |
-| Tracing | Partial | W3C trace-context creation and propagation for REST and gRPC; OpenTelemetry exporters are not bundled |
-| Logging | Partial | Structured REST request logging through `tracing`; standalone `logx`-style rotation and field masking are not bundled |
+| Tracing | Covered | W3C propagation, exportable REST and gRPC client/server spans, parent-based ratio sampling, and batched OTLP/gRPC or OTLP/HTTP exporters behind opt-in `telemetry` features |
+| Logging | Covered | Leveled JSON/plain structured logging, trace and request context, deterministic sampling, opt-in sensitive-field masking, daily/size file rotation, and REST request logging |
 | Service discovery | Partial | Dynamic publish/withdraw subscriptions and balanced gRPC channels; Kubernetes and etcd adapters are not bundled |
 | Messaging | Partial | Typed in-process topic fan-out; Kafka and RabbitMQ adapters are not bundled |
 | Data stores | Backend-specific | No built-in Redis, SQL, MongoDB, or cache-aside database adapters; applications use the Rust ecosystem clients directly |

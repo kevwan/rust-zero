@@ -5,6 +5,8 @@ use actix_web::{
     Error, HttpMessage, HttpRequest,
 };
 use futures::future::{ok, LocalBoxFuture, Ready};
+#[cfg(feature = "telemetry")]
+use rust_zero_core::{TelemetrySpan, TelemetrySpanKind};
 use rust_zero_core::{TraceContext, TraceFlags};
 use std::task::{Context, Poll};
 
@@ -43,6 +45,118 @@ where
 
 pub struct TraceContextService<S> {
     service: S,
+}
+
+/// Creates OpenTelemetry server spans and propagates their W3C context.
+///
+/// Install a [`rust_zero_core::Telemetry`] provider before serving requests. This middleware
+/// replaces [`TraceContextMiddleware`] when the `telemetry` feature is enabled.
+#[cfg(feature = "telemetry")]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OpenTelemetryTracing;
+
+#[cfg(feature = "telemetry")]
+impl OpenTelemetryTracing {
+    pub fn new() -> Self {
+        Self
+    }
+
+    pub fn context(request: &HttpRequest) -> Option<TraceContext> {
+        request.extensions().get::<TraceContext>().cloned()
+    }
+}
+
+#[cfg(feature = "telemetry")]
+impl<S, B> Transform<S, ServiceRequest> for OpenTelemetryTracing
+where
+    S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = Error> + 'static,
+    S::Future: 'static,
+    B: MessageBody + 'static,
+{
+    type Response = ServiceResponse<B>;
+    type Error = Error;
+    type Transform = OpenTelemetryTracingService<S>;
+    type InitError = ();
+    type Future = Ready<Result<Self::Transform, Self::InitError>>;
+
+    fn new_transform(&self, service: S) -> Self::Future {
+        ok(OpenTelemetryTracingService { service })
+    }
+}
+
+#[cfg(feature = "telemetry")]
+pub struct OpenTelemetryTracingService<S> {
+    service: S,
+}
+
+#[cfg(feature = "telemetry")]
+impl<S, B> Service<ServiceRequest> for OpenTelemetryTracingService<S>
+where
+    S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = Error> + 'static,
+    S::Future: 'static,
+    B: MessageBody + 'static,
+{
+    type Response = ServiceResponse<B>;
+    type Error = Error;
+    type Future = LocalBoxFuture<'static, Result<Self::Response, Self::Error>>;
+
+    fn poll_ready(&self, context: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.service.poll_ready(context)
+    }
+
+    fn call(&self, request: ServiceRequest) -> Self::Future {
+        let method = request.method().to_string();
+        let path = request.path().to_owned();
+        let parent = request
+            .headers()
+            .get(&TRACEPARENT)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| TraceContext::parse(value).ok());
+        let span = TelemetrySpan::start(
+            format!("{method} {path}"),
+            TelemetrySpanKind::Server,
+            parent.as_ref(),
+            [
+                ("http.request.method", method),
+                ("url.path", path),
+                (
+                    "server.address",
+                    request.connection_info().host().to_owned(),
+                ),
+            ],
+        );
+        let context = span
+            .trace_context()
+            .cloned()
+            .unwrap_or_else(|| TraceContext::root(TraceFlags::SAMPLED));
+        let traceparent = context.traceparent();
+        request.extensions_mut().insert(context);
+        let future = self.service.call(request);
+
+        Box::pin(async move {
+            match future.await {
+                Ok(mut response) => {
+                    let status = response.status().as_u16();
+                    span.set_attribute("http.response.status_code", status.to_string());
+                    if status >= 500 {
+                        span.set_error(format!("HTTP {status}"));
+                    }
+                    response.headers_mut().insert(
+                        TRACEPARENT,
+                        HeaderValue::from_str(&traceparent)
+                            .expect("generated traceparent values are valid HTTP headers"),
+                    );
+                    span.end();
+                    Ok(response)
+                }
+                Err(error) => {
+                    span.set_error(error.to_string());
+                    span.end();
+                    Err(error)
+                }
+            }
+        })
+    }
 }
 
 impl<S, B> Service<ServiceRequest> for TraceContextService<S>
@@ -121,5 +235,36 @@ mod tests {
             .unwrap()
             .contains("4bf92f3577b34da6a3ce929d0e0e4736"));
         assert_eq!(test::read_body(response).await, "00f067aa0ba902b7");
+    }
+
+    #[cfg(feature = "telemetry")]
+    #[actix_rt::test]
+    async fn exports_a_server_span_with_matching_request_context() {
+        use rust_zero_core::Telemetry;
+
+        let telemetry = Telemetry::local("test-api", 1.0).unwrap();
+        let inbound = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+        let app = test::init_service(App::new().wrap(OpenTelemetryTracing::new()).route(
+            "/users",
+            web::get().to(|request: HttpRequest| async move {
+                HttpResponse::Ok().body(OpenTelemetryTracing::context(&request).unwrap().trace_id())
+            }),
+        ))
+        .await;
+        let response = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/users")
+                .insert_header(("traceparent", inbound))
+                .to_request(),
+        )
+        .await;
+
+        assert_eq!(response.status(), actix_web::http::StatusCode::OK);
+        assert_eq!(
+            test::read_body(response).await,
+            "4bf92f3577b34da6a3ce929d0e0e4736"
+        );
+        telemetry.force_flush().unwrap();
     }
 }

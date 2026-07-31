@@ -12,6 +12,8 @@ See [FEATURE_PARITY.md](FEATURE_PARITY.md) for runtime coverage against go-zero 
 - Tonic-based gRPC client and server builders with deadline, connection concurrency, and stream
   limits plus gRPC health reporting, bearer-auth interceptors, and registry-backed dynamic endpoint
   balancing.
+- Optional OpenTelemetry tracing with parent-based sampling, full REST and gRPC client/server
+  spans, and batched OTLP export over gRPC or HTTP.
 - A Tokio-based MapReduce primitive with bounded parallelism.
 - Framework-neutral runtime primitives in `rust-zero-core`: typed JSON/TOML/YAML configuration
   loading with environment expansion, circuit breaking, adaptive concurrency shedding, consistent
@@ -19,7 +21,8 @@ See [FEATURE_PARITY.md](FEATURE_PARITY.md) for runtime coverage against go-zero 
   coalescing. It also provides a dependency-free Prometheus text-format metrics registry with
   labeled counters, gauges, and histograms, a reference-counted service registry for dynamic
   endpoint publication and subscriptions, Bloom filters, rolling statistics, timed batch
-  execution, and fail-fast service groups with graceful shutdown.
+  execution, fail-fast service groups with graceful shutdown, and a standalone structured logger
+  with trace context, sensitive-field masking, sampling, and file rotation.
 
 ## Core runtime
 
@@ -60,6 +63,47 @@ let config: ServiceConfig = load_config("etc/users.toml")?;
 assert_eq!(config.address(), "0.0.0.0:8080");
 ```
 
+## OpenTelemetry
+
+Enable the `telemetry` feature on `rust-zero-core` and whichever transport crates need
+instrumentation. OTLP exporters are opt-in so applications that only need local W3C propagation
+do not pay their dependency or runtime cost.
+
+```rust
+use rust_zero_core::{OtlpTransport, Telemetry, TelemetryConfig};
+
+let telemetry = Telemetry::init(
+    TelemetryConfig::new(
+        "users-api",
+        "http://otel-collector:4317",
+        OtlpTransport::Grpc,
+    )
+    .with_sample_ratio(0.1),
+)?;
+
+// Keep `telemetry` alive for the service lifetime. Dropping it flushes and
+// shuts down the exporter.
+```
+
+For REST, use `OpenTelemetryTracing` in place of `TraceContextMiddleware`. It records method,
+path, host, status, errors, and exposes the matching `TraceContext` through request extensions:
+
+```rust
+use rest::OpenTelemetryTracing;
+
+// App::new().wrap(OpenTelemetryTracing::new())
+```
+
+For gRPC, apply the server layer to the Tonic builder and wrap client channels:
+
+```rust
+use rpc::RpcTelemetryLayer;
+
+let server = tonic::transport::Server::builder()
+    .layer(RpcTelemetryLayer::server());
+let traced_channel = RpcTelemetryLayer::client().wrap(channel);
+```
+
 The REST middleware is composable and returns standard HTTP responses when protection activates:
 
 | Middleware | Response |
@@ -95,6 +139,29 @@ HttpServer::new(move || {
 
 Register `HttpMetrics` in a shared `Metrics` registry to emit Prometheus-compatible request
 counts and latency histograms labeled by method, route, and response status.
+
+The standalone logger can write JSON or plain records to the console or to daily/size-rotated
+files. `StructuredLogging` connects it to Actix requests and includes request and W3C trace
+identifiers when the corresponding middleware runs outside it:
+
+```rust
+use rust_zero_core::{LogConfig, Logger, RotationPolicy};
+use rest::{RequestId, StructuredLogging, TraceContextMiddleware};
+
+let logger = Logger::new(LogConfig::file(
+    "users-api",
+    "logs",
+    RotationPolicy::Size {
+        max_bytes: 100 * 1024 * 1024,
+        max_backups: 10,
+    },
+))?;
+
+// App::new()
+//     .wrap(StructuredLogging::new(logger))
+//     .wrap(TraceContextMiddleware::new())
+//     .wrap(RequestId::new())
+```
 
 ## RPC
 

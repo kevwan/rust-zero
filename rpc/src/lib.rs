@@ -19,6 +19,8 @@ pub mod echo {
 pub use auth::{BearerToken, RpcBearerAuth};
 pub use tonic_health::server::{health_reporter, HealthReporter};
 pub use trace::RpcTrace;
+#[cfg(feature = "telemetry")]
+pub use trace::{RpcTelemetryLayer, RpcTelemetryMode};
 
 /// Transport settings applied to every gRPC service on a server.
 #[derive(Debug, Clone)]
