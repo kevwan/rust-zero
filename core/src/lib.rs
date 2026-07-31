@@ -12,16 +12,19 @@ pub mod discov;
 pub mod executor;
 pub mod fx;
 pub mod hash;
+pub mod limit;
 pub mod load;
 pub mod metric;
+pub mod pubsub;
 pub mod queue;
 pub mod rolling;
 pub mod service;
 pub mod singleflight;
+pub mod trace;
 
 pub use bloom::{BloomError, BloomFilter};
 pub use breaker::{BreakerState, CircuitBreaker, CircuitBreakerConfig, CircuitBreakerError};
-pub use cache::TtlCache;
+pub use cache::{CacheStats, MemoryCache, ReadThroughCache, TtlCache};
 pub use config::{load_config, parse_config, ConfigError, ConfigFormat, ServiceConfig};
 pub use discov::{
     DiscoveryError, ServiceEvent, ServiceLease, ServiceRegistry, ServiceSubscription,
@@ -29,11 +32,14 @@ pub use discov::{
 pub use executor::{BatchExecutor, BatchExecutorError};
 pub use fx::{retry, timeout, RetryPolicy};
 pub use hash::ConsistentHash;
+pub use limit::{LimitDecision, PeriodLimiter, TokenLimiter};
 pub use load::{AdaptiveShedder, LoadShedderConfig, ShedPermit};
 pub use metric::{
     CounterVec, GaugeVec, HistogramOptions, HistogramVec, Metrics, MetricsError, VectorOptions,
 };
+pub use pubsub::{Broker, Subscription};
 pub use queue::{QueueReceiver, QueueSender};
 pub use rolling::{RollingSnapshot, RollingWindow};
 pub use service::{RunningServices, ServiceGroup, ServiceGroupError, Shutdown, ShutdownHandle};
 pub use singleflight::{SingleFlight, SingleFlightError};
+pub use trace::{TraceContext, TraceContextError, TraceFlags};

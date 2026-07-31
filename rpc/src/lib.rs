@@ -10,6 +10,7 @@ use tonic::transport::{Channel, Endpoint, Server};
 use tower::discover::Change;
 
 pub mod auth;
+pub mod trace;
 
 pub mod echo {
     tonic::include_proto!("rust_zero.echo");
@@ -17,6 +18,7 @@ pub mod echo {
 
 pub use auth::{BearerToken, RpcBearerAuth};
 pub use tonic_health::server::{health_reporter, HealthReporter};
+pub use trace::RpcTrace;
 
 /// Transport settings applied to every gRPC service on a server.
 #[derive(Debug, Clone)]
@@ -106,6 +108,10 @@ pub struct RpcClientConfig {
     request_timeout: Option<Duration>,
     connect_timeout: Option<Duration>,
     concurrency_limit: Option<usize>,
+    tcp_keepalive: Option<Duration>,
+    http2_keepalive_interval: Option<Duration>,
+    keepalive_timeout: Option<Duration>,
+    keepalive_while_idle: bool,
 }
 
 impl RpcClientConfig {
@@ -115,6 +121,10 @@ impl RpcClientConfig {
             request_timeout: None,
             connect_timeout: None,
             concurrency_limit: None,
+            tcp_keepalive: None,
+            http2_keepalive_interval: None,
+            keepalive_timeout: None,
+            keepalive_while_idle: false,
         }
     }
 
@@ -139,6 +149,34 @@ impl RpcClientConfig {
     pub fn with_concurrency_limit(mut self, limit: usize) -> Self {
         assert!(limit > 0, "concurrency limit must be greater than zero");
         self.concurrency_limit = Some(limit);
+        self
+    }
+
+    pub fn with_tcp_keepalive(mut self, interval: Duration) -> Self {
+        assert!(
+            !interval.is_zero(),
+            "TCP keepalive interval must be greater than zero"
+        );
+        self.tcp_keepalive = Some(interval);
+        self
+    }
+
+    pub fn with_http2_keepalive(mut self, interval: Duration, timeout: Duration) -> Self {
+        assert!(
+            !interval.is_zero(),
+            "HTTP/2 keepalive interval must be greater than zero"
+        );
+        assert!(
+            !timeout.is_zero(),
+            "HTTP/2 keepalive timeout must be greater than zero"
+        );
+        self.http2_keepalive_interval = Some(interval);
+        self.keepalive_timeout = Some(timeout);
+        self
+    }
+
+    pub fn keepalive_while_idle(mut self, enabled: bool) -> Self {
+        self.keepalive_while_idle = enabled;
         self
     }
 }
@@ -264,6 +302,16 @@ impl RpcClient {
         if let Some(limit) = self.config.concurrency_limit {
             endpoint = endpoint.concurrency_limit(limit);
         }
+        if let Some(interval) = self.config.tcp_keepalive {
+            endpoint = endpoint.tcp_keepalive(Some(interval));
+        }
+        if let Some(interval) = self.config.http2_keepalive_interval {
+            endpoint = endpoint.http2_keep_alive_interval(interval);
+        }
+        if let Some(timeout) = self.config.keepalive_timeout {
+            endpoint = endpoint.keep_alive_timeout(timeout);
+        }
+        endpoint = endpoint.keep_alive_while_idle(self.config.keepalive_while_idle);
 
         Ok(endpoint)
     }

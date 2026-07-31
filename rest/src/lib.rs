@@ -5,15 +5,17 @@ pub mod middleware;
 pub mod recovery;
 pub mod resilience;
 pub mod security;
+pub mod trace;
 
 pub use actix_cors::Cors;
-pub use auth::BearerAuth;
+pub use auth::{encode_hs256, BearerAuth, JwtAuth, JwtError};
 pub use log::LoggingMiddleware;
 pub use metrics::{HttpMetrics, MetricsMiddleware};
-pub use middleware::{ConcurrencyLimit, RateLimit, Timeout};
+pub use middleware::{ConcurrencyLimit, RateLimit, RequestBodyLimit, Timeout};
 pub use recovery::Recover;
 pub use resilience::{RequestId, RequestIdValue};
 pub use security::SecurityHeaders;
+pub use trace::TraceContextMiddleware;
 
 #[cfg(test)]
 mod tests {
