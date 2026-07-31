@@ -1,6 +1,9 @@
 //! Gateway route selection with longest-prefix matching and round-robin upstream pools.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::{
+    cmp::Reverse,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 /// A configured HTTP path prefix and its upstream endpoints.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,8 +46,7 @@ impl GatewayRouter {
             })
             .collect();
 
-        routes
-            .sort_unstable_by(|left, right| right.route.prefix.len().cmp(&left.route.prefix.len()));
+        routes.sort_unstable_by_key(|route| Reverse(route.route.prefix.len()));
         for routes_with_same_prefix in routes.windows(2) {
             if routes_with_same_prefix[0].route.prefix == routes_with_same_prefix[1].route.prefix {
                 return Err(GatewayError::DuplicatePrefix(

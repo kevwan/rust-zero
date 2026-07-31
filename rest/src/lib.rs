@@ -1,13 +1,19 @@
+pub mod auth;
 pub mod log;
 pub mod metrics;
 pub mod middleware;
+pub mod recovery;
 pub mod resilience;
+pub mod security;
 
 pub use actix_cors::Cors;
+pub use auth::BearerAuth;
 pub use log::LoggingMiddleware;
 pub use metrics::{HttpMetrics, MetricsMiddleware};
 pub use middleware::{ConcurrencyLimit, RateLimit, Timeout};
+pub use recovery::Recover;
 pub use resilience::{RequestId, RequestIdValue};
+pub use security::SecurityHeaders;
 
 #[cfg(test)]
 mod tests {
