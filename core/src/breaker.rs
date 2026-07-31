@@ -1,5 +1,6 @@
 use std::{
     fmt,
+    future::Future,
     sync::Mutex,
     time::{Duration, Instant},
 };
@@ -89,16 +90,65 @@ impl CircuitBreaker {
     where
         F: FnOnce() -> Result<T, E>,
     {
+        self.execute_with_accept(operation, Result::is_ok)
+    }
+
+    /// Runs an operation and uses `acceptable` to decide whether its result is
+    /// healthy for circuit-breaker accounting.
+    ///
+    /// The original operation result is preserved. This is useful for protocols
+    /// such as HTTP, where a 5xx response should trip the breaker while still
+    /// being returned to the caller.
+    pub fn execute_with_accept<T, E, F, A>(
+        &self,
+        operation: F,
+        acceptable: A,
+    ) -> Result<T, CircuitBreakerError<E>>
+    where
+        F: FnOnce() -> Result<T, E>,
+        A: FnOnce(&Result<T, E>) -> bool,
+    {
         self.before_call()?;
-        match operation() {
-            Ok(value) => {
-                self.record_success();
-                Ok(value)
-            }
-            Err(error) => {
-                self.record_failure();
-                Err(CircuitBreakerError::Operation(error))
-            }
+        let result = operation();
+        self.record_acceptable(acceptable(&result));
+        result.map_err(CircuitBreakerError::Operation)
+    }
+
+    /// Async counterpart to [`Self::execute`].
+    pub async fn execute_async<T, E, F, Fut>(
+        &self,
+        operation: F,
+    ) -> Result<T, CircuitBreakerError<E>>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<T, E>>,
+    {
+        self.execute_async_with_accept(operation, Result::is_ok)
+            .await
+    }
+
+    /// Async counterpart to [`Self::execute_with_accept`].
+    pub async fn execute_async_with_accept<T, E, F, Fut, A>(
+        &self,
+        operation: F,
+        acceptable: A,
+    ) -> Result<T, CircuitBreakerError<E>>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<T, E>>,
+        A: FnOnce(&Result<T, E>) -> bool,
+    {
+        self.before_call()?;
+        let result = operation().await;
+        self.record_acceptable(acceptable(&result));
+        result.map_err(CircuitBreakerError::Operation)
+    }
+
+    fn record_acceptable(&self, acceptable: bool) {
+        if acceptable {
+            self.record_success();
+        } else {
+            self.record_failure();
         }
     }
 
@@ -236,5 +286,20 @@ mod tests {
 
         assert_eq!(breaker.execute(|| Ok::<_, ()>(42)), Ok(42));
         assert_eq!(breaker.state(), BreakerState::Closed);
+    }
+
+    #[tokio::test]
+    async fn async_acceptance_can_reject_a_successful_result() {
+        let breaker = CircuitBreaker::new(CircuitBreakerConfig::new(1, Duration::from_secs(1)));
+
+        let response = breaker
+            .execute_async_with_accept(
+                || async { Ok::<_, ()>(503) },
+                |result| result.as_ref().is_ok_and(|status| *status < 500),
+            )
+            .await;
+
+        assert_eq!(response, Ok(503));
+        assert_eq!(breaker.state(), BreakerState::Open);
     }
 }

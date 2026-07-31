@@ -4,10 +4,12 @@
 //! consistent hashing, and async retry helpers.  They intentionally do not depend on a
 //! particular HTTP or gRPC framework so REST, RPC, and background services can share them.
 
+pub mod balancer;
 pub mod bloom;
 pub mod breaker;
 pub mod cache;
 pub mod config;
+pub mod config_center;
 pub mod discov;
 pub mod executor;
 pub mod fx;
@@ -24,11 +26,14 @@ pub mod singleflight;
 #[cfg(feature = "telemetry")]
 pub mod telemetry;
 pub mod trace;
+pub mod validation;
 
+pub use balancer::{BalancerError, NodeSnapshot, P2cBalancer, P2cRequest};
 pub use bloom::{BloomError, BloomFilter};
 pub use breaker::{BreakerState, CircuitBreaker, CircuitBreakerConfig, CircuitBreakerError};
 pub use cache::{CacheStats, MemoryCache, ReadThroughCache, TtlCache};
 pub use config::{load_config, parse_config, ConfigError, ConfigFormat, ServiceConfig};
+pub use config_center::{ConfigCenterError, ConfigSnapshot, DynamicConfig};
 pub use discov::{
     DiscoveryError, ServiceEvent, ServiceLease, ServiceRegistry, ServiceSubscription,
 };
@@ -54,3 +59,4 @@ pub use telemetry::{
     OtlpTransport, Telemetry, TelemetryConfig, TelemetryError, TelemetrySpan, TelemetrySpanKind,
 };
 pub use trace::{TraceContext, TraceContextError, TraceFlags};
+pub use validation::{Validate, Validation, ValidationErrors, Violation};

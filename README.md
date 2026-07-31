@@ -16,13 +16,16 @@ See [FEATURE_PARITY.md](FEATURE_PARITY.md) for runtime coverage against go-zero 
   spans, and batched OTLP export over gRPC or HTTP.
 - A Tokio-based MapReduce primitive with bounded parallelism.
 - Framework-neutral runtime primitives in `rust-zero-core`: typed JSON/TOML/YAML configuration
-  loading with environment expansion, circuit breaking, adaptive concurrency shedding, consistent
-  hashing, TTL caching, bounded exponential retry, async deadlines, and keyed single-flight work
-  coalescing. It also provides a dependency-free Prometheus text-format metrics registry with
-  labeled counters, gauges, and histograms, a reference-counted service registry for dynamic
-  endpoint publication and subscriptions, Bloom filters, rolling statistics, timed batch
-  execution, fail-fast service groups with graceful shutdown, and a standalone structured logger
-  with trace context, sensitive-field masking, sampling, and file rotation.
+  loading with environment expansion, atomic dynamic configuration subscriptions, sync/async
+  circuit breaking, adaptive concurrency shedding, consistent hashing, feedback-aware P2C
+  balancing, TTL caching, bounded exponential retry, async deadlines, keyed single-flight work
+  coalescing, and typed validation. It also provides a dependency-free Prometheus text-format
+  metrics registry with labeled counters, gauges, and histograms, a reference-counted service
+  registry for dynamic endpoint publication and subscriptions, Bloom filters, rolling statistics,
+  timed batch execution, fail-fast service groups with graceful shutdown, and a standalone
+  structured logger with trace context, sensitive-field masking, sampling, and file rotation.
+- A resilient named REST client with request deadlines, circuit breaking, response-size limits,
+  JSON helpers, and W3C trace propagation, plus validated JSON/query extractors for inbound APIs.
 
 ## Core runtime
 
@@ -51,6 +54,22 @@ retry(RetryPolicy::new(3, Duration::from_millis(50)), || async {
     Ok::<_, std::io::Error>(())
 })
 .await?;
+```
+
+Dynamic configuration updates are parsed before publication, so consumers always observe a
+complete, last-known-good typed value:
+
+```rust
+use rust_zero_core::{ConfigFormat, DynamicConfig};
+
+let limits = DynamicConfig::<std::collections::HashMap<String, u64>>::new(
+    "requests = 100",
+    ConfigFormat::Toml,
+)?;
+let mut changes = limits.subscribe();
+limits.update("requests = 200")?;
+changes.changed().await?;
+assert_eq!(changes.borrow().value()["requests"], 200);
 ```
 
 Configuration is deserialized directly into service types, selected by file extension, and
