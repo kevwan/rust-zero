@@ -4,16 +4,20 @@ A Rust web and RPC framework inspired by [go-zero](https://github.com/zeromicro/
 
 ## Available features
 
-- Actix Web middleware for structured request logging, request identity propagation, CORS, timeout
-  control, overload shedding, and token-bucket rate limiting.
+- Actix Web middleware for structured request logging, request identity propagation, CORS, bearer
+  authentication, panic recovery, browser security headers, timeout control, overload shedding,
+  and token-bucket rate limiting.
 - Tonic-based gRPC client and server builders with deadline, connection concurrency, and stream
-  limits plus gRPC health reporting.
+  limits plus gRPC health reporting, bearer-auth interceptors, and registry-backed dynamic endpoint
+  balancing.
 - A Tokio-based MapReduce primitive with bounded parallelism.
 - Framework-neutral runtime primitives in `rust-zero-core`: typed JSON/TOML/YAML configuration
   loading with environment expansion, circuit breaking, adaptive concurrency shedding, consistent
   hashing, TTL caching, bounded exponential retry, async deadlines, and keyed single-flight work
   coalescing. It also provides a dependency-free Prometheus text-format metrics registry with
-  labeled counters, gauges, and histograms.
+  labeled counters, gauges, and histograms, a reference-counted service registry for dynamic
+  endpoint publication and subscriptions, Bloom filters, rolling statistics, timed batch
+  execution, and fail-fast service groups with graceful shutdown.
 
 ## Core runtime
 
@@ -64,7 +68,10 @@ The REST middleware is composable and returns standard HTTP responses when prote
 
 ```rust
 use actix_web::{App, HttpServer};
-use rest::{ConcurrencyLimit, Cors, LoggingMiddleware, RateLimit, RequestId, Timeout};
+use rest::{
+    BearerAuth, ConcurrencyLimit, Cors, LoggingMiddleware, RateLimit, Recover, RequestId,
+    SecurityHeaders, Timeout,
+};
 use std::time::Duration;
 
 let concurrency_limit = ConcurrencyLimit::new(1_024);
@@ -74,6 +81,9 @@ HttpServer::new(move || {
     App::new()
         .wrap(LoggingMiddleware)
         .wrap(RequestId::new())
+        .wrap(Recover::new())
+        .wrap(SecurityHeaders::new())
+        .wrap(BearerAuth::new(|token| (token == "secret").then_some(())))
         .wrap(Cors::permissive())
         .wrap(Timeout::new(Duration::from_secs(10)))
         .wrap(concurrency_limit.clone())
@@ -87,14 +97,17 @@ counts and latency histograms labeled by method, route, and response status.
 ## RPC
 
 `rpc` provides common transport controls while leaving protobuf service implementations as normal
-Tonic services. The crate includes a generated `rust_zero.echo` service and runnable server:
+Tonic services. Static clients use `connect`; registry-backed clients use `connect_service` and
+automatically follow endpoint publication and withdrawal events. The crate includes a generated
+`rust_zero.echo` service and runnable server:
 
 ```bash
 cargo run -p rpc --example echo_server
 ```
 
 ```rust
-use rpc::{RpcClient, RpcClientConfig, RpcServer, RpcServerConfig};
+use rpc::{BearerToken, RpcClient, RpcClientConfig, RpcServer, RpcServerConfig};
+use rust_zero_core::ServiceRegistry;
 use std::time::Duration;
 
 let server = RpcServer::new(
@@ -110,6 +123,39 @@ let channel = RpcClient::new(
 )
 .connect()
 .await?;
+
+let registry = ServiceRegistry::new();
+let _lease = registry.publish("users", "http://127.0.0.1:50051")?;
+let balanced_channel = RpcClient::new(RpcClientConfig::new("http://unused"))
+    .connect_service(&registry, "users")?;
+let client_auth = BearerToken::new("service-token")?;
+```
+
+## Service lifecycle and background batching
+
+`ServiceGroup` supervises long-running tasks. An unexpected exit stops sibling services, while an
+explicit shutdown waits for every task up to the configured deadline. `BatchExecutor` flushes
+background work when either a size or time threshold is reached.
+
+```rust
+use rust_zero_core::{BatchExecutor, ServiceGroup};
+use std::{io, time::Duration};
+
+let mut services = ServiceGroup::new().with_shutdown_timeout(Duration::from_secs(10));
+services.add("worker", |mut shutdown| async move {
+    shutdown.requested().await;
+    Ok::<_, io::Error>(())
+});
+let running = services.start()?;
+let shutdown = running.shutdown_handle();
+shutdown.shutdown();
+running.wait().await?;
+
+let batches = BatchExecutor::new(100, Duration::from_secs(1), |items: Vec<String>| async move {
+    // persist items
+});
+batches.push("event".to_owned()).await?;
+batches.shutdown().await?;
 ```
 
 ## Gateway routing

@@ -3,14 +3,19 @@
 //! Service implementations remain ordinary Tonic services. [`RpcServer`] and [`RpcClient`]
 //! centralize the transport safeguards that should be applied consistently across services.
 
-use std::{error::Error as StdError, fmt, net::SocketAddr, time::Duration};
+use std::{collections::BTreeSet, error::Error as StdError, fmt, net::SocketAddr, time::Duration};
 
+use rust_zero_core::{DiscoveryError, ServiceEvent, ServiceRegistry};
 use tonic::transport::{Channel, Endpoint, Server};
+use tower::discover::Change;
+
+pub mod auth;
 
 pub mod echo {
     tonic::include_proto!("rust_zero.echo");
 }
 
+pub use auth::{BearerToken, RpcBearerAuth};
 pub use tonic_health::server::{health_reporter, HealthReporter};
 
 /// Transport settings applied to every gRPC service on a server.
@@ -154,8 +159,101 @@ impl RpcClient {
     }
 
     pub async fn connect(&self) -> Result<Channel, RpcClientError> {
-        let mut endpoint =
-            Endpoint::from_shared(self.config.uri.clone()).map_err(RpcClientError::Transport)?;
+        let endpoint = self.endpoint(self.config.uri.clone())?;
+        endpoint.connect().await.map_err(RpcClientError::Transport)
+    }
+
+    /// Creates a channel that follows a service registry and balances calls across its endpoints.
+    ///
+    /// Existing endpoints are installed before this method returns. A background task applies
+    /// subsequent publications and withdrawals; it stops automatically when all channel clones
+    /// have been dropped.
+    pub fn connect_service(
+        &self,
+        registry: &ServiceRegistry,
+        service: impl Into<String>,
+    ) -> Result<Channel, RpcClientError> {
+        let mut subscription = registry
+            .subscribe(service)
+            .map_err(RpcClientError::Discovery)?;
+        let initial = subscription.endpoints();
+        let mut configured = Vec::with_capacity(initial.len());
+        for uri in initial {
+            configured.push((uri.clone(), self.endpoint(uri)?));
+        }
+
+        let capacity = configured.len().max(128);
+        let (channel, changes) = Channel::balance_channel(capacity);
+        let mut known = BTreeSet::new();
+        for (uri, endpoint) in configured {
+            known.insert(uri.clone());
+            changes
+                .try_send(Change::Insert(uri, endpoint))
+                .expect("discovery channel is sized for its initial endpoint snapshot");
+        }
+
+        let client = self.clone();
+        tokio::spawn(async move {
+            loop {
+                let event = tokio::select! {
+                    _ = changes.closed() => return,
+                    event = subscription.recv() => event,
+                };
+                match event {
+                    Ok(ServiceEvent::Added { endpoint: uri, .. }) => {
+                        let Ok(endpoint) = client.endpoint(uri.clone()) else {
+                            continue;
+                        };
+                        if changes
+                            .send(Change::Insert(uri.clone(), endpoint))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                        known.insert(uri);
+                    }
+                    Ok(ServiceEvent::Removed { endpoint: uri, .. }) => {
+                        if changes.send(Change::Remove(uri.clone())).await.is_err() {
+                            return;
+                        }
+                        known.remove(&uri);
+                    }
+                    Err(DiscoveryError::SubscriptionLagged(_)) => {
+                        subscription.resync();
+                        let current: BTreeSet<_> = subscription.endpoints().into_iter().collect();
+
+                        for uri in known.difference(&current).cloned().collect::<Vec<_>>() {
+                            if changes.send(Change::Remove(uri.clone())).await.is_err() {
+                                return;
+                            }
+                            known.remove(&uri);
+                        }
+                        for uri in current.difference(&known).cloned().collect::<Vec<_>>() {
+                            let Ok(endpoint) = client.endpoint(uri.clone()) else {
+                                continue;
+                            };
+                            if changes
+                                .send(Change::Insert(uri.clone(), endpoint))
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                            known.insert(uri);
+                        }
+                    }
+                    Err(DiscoveryError::RegistryClosed) => return,
+                    Err(_) => return,
+                }
+            }
+        });
+
+        Ok(channel)
+    }
+
+    fn endpoint(&self, uri: String) -> Result<Endpoint, RpcClientError> {
+        let mut endpoint = Endpoint::from_shared(uri).map_err(RpcClientError::Transport)?;
 
         if let Some(timeout) = self.config.request_timeout {
             endpoint = endpoint.timeout(timeout);
@@ -167,19 +265,21 @@ impl RpcClient {
             endpoint = endpoint.concurrency_limit(limit);
         }
 
-        endpoint.connect().await.map_err(RpcClientError::Transport)
+        Ok(endpoint)
     }
 }
 
 #[derive(Debug)]
 pub enum RpcClientError {
     Transport(tonic::transport::Error),
+    Discovery(DiscoveryError),
 }
 
 impl fmt::Display for RpcClientError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Transport(error) => write!(formatter, "gRPC transport error: {error}"),
+            Self::Discovery(error) => write!(formatter, "gRPC service discovery error: {error}"),
         }
     }
 }
@@ -188,6 +288,7 @@ impl StdError for RpcClientError {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match self {
             Self::Transport(error) => Some(error),
+            Self::Discovery(error) => Some(error),
         }
     }
 }
@@ -276,5 +377,48 @@ mod tests {
 
         assert_eq!(response.into_inner().message, "hello");
         server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn discovered_client_tracks_published_rpc_endpoints() {
+        let first_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let first_address = first_listener.local_addr().unwrap();
+        let first_server = tokio::spawn(async move {
+            Server::builder()
+                .add_service(EchoServer::new(EchoService))
+                .serve_with_incoming(TcpListenerStream::new(first_listener))
+                .await
+                .unwrap();
+        });
+
+        let registry = ServiceRegistry::new();
+        let channel = RpcClient::new(RpcClientConfig::new("http://unused"))
+            .connect_service(&registry, "echo")
+            .unwrap();
+        let first_lease = registry
+            .publish("echo", format!("http://{first_address}"))
+            .unwrap();
+        let response = EchoClient::new(channel.clone())
+            .echo(Request::new(EchoRequest {
+                message: "discovered".to_owned(),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(response.into_inner().message, "discovered");
+
+        drop(first_lease);
+        drop(channel);
+        first_server.abort();
+    }
+
+    #[test]
+    fn discovered_client_rejects_invalid_service_names() {
+        let registry = ServiceRegistry::new();
+        let client = RpcClient::new(RpcClientConfig::new("http://unused"));
+
+        assert!(matches!(
+            client.connect_service(&registry, ""),
+            Err(RpcClientError::Discovery(DiscoveryError::EmptyService))
+        ));
     }
 }
