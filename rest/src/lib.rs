@@ -1,5 +1,6 @@
 pub mod auth;
 pub mod client;
+pub mod devserver;
 pub mod extract;
 pub mod log;
 pub mod metrics;
@@ -12,6 +13,7 @@ pub mod trace;
 pub use actix_cors::Cors;
 pub use auth::{encode_hs256, BearerAuth, JwtAuth, JwtError};
 pub use client::{HttpClient, HttpClientConfig, HttpClientError};
+pub use devserver::{DevServer, DevServerConfig};
 pub use extract::{ValidatedJson, ValidatedQuery};
 pub use log::{LoggingMiddleware, StructuredLogging};
 pub use metrics::{HttpMetrics, MetricsMiddleware};

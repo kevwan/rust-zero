@@ -2,7 +2,7 @@
 
 A Rust web and RPC framework inspired by [go-zero](https://github.com/zeromicro/go-zero).
 
-See [FEATURE_PARITY.md](FEATURE_PARITY.md) for runtime coverage against go-zero v1.10.2.
+See [FEATURE_PARITY.md](FEATURE_PARITY.md) for runtime coverage against go-zero v1.10.1.
 
 ## Available features
 
@@ -26,6 +26,12 @@ See [FEATURE_PARITY.md](FEATURE_PARITY.md) for runtime coverage against go-zero 
   structured logger with trace context, sensitive-field masking, sampling, and file rotation.
 - A resilient named REST client with request deadlines, circuit breaking, response-size limits,
   JSON helpers, and W3C trace propagation, plus validated JSON/query extractors for inbound APIs.
+- An opt-in named duration profiler and an internal Actix dev server exposing route discovery,
+  health, Prometheus metrics, profiling reports, and process/runtime diagnostics.
+- Feature-gated external stores: an async standalone/clustered Redis adapter with strings, hashes,
+  lists, sets, sorted sets, JSON values, TTLs, counters, ownership-safe distributed locks, and
+  coalesced cache-aside reads; and typed SQLx pools for SQLite, PostgreSQL, and MySQL with
+  standardized lifecycle, health checks, and transactions.
 
 ## Core runtime
 
@@ -158,6 +164,72 @@ HttpServer::new(move || {
 
 Register `HttpMetrics` in a shared `Metrics` registry to emit Prometheus-compatible request
 counts and latency histograms labeled by method, route, and response status.
+
+## Internal diagnostics
+
+`DevServer` provides the internal observability listener corresponding to go-zero's dev server.
+It defaults to port `6060` and publishes `/healthz`, `/metrics`, `/debug/profile`,
+`/debug/runtime`, and a route index at `/`. Profiling is opt-in at the core primitive and enabled
+automatically by a dev server configured with profiling support.
+
+```rust
+use rest::{DevServer, DevServerConfig};
+use rust_zero_core::{Metrics, Profiler};
+use std::sync::Arc;
+
+let diagnostics = DevServer::new(
+    DevServerConfig::default(),
+    Arc::new(Metrics::new()),
+    Arc::new(Profiler::new()),
+);
+
+// Spawn or await the returned Actix server alongside the application service.
+let server = diagnostics.run()?;
+actix_web::rt::spawn(server);
+# Ok::<(), std::io::Error>(())
+```
+
+## External stores
+
+Enable `stores-redis`, `stores-sql`, or the combined `stores` feature on `rust-zero-core`.
+Applications retain direct access to SQLx's typed pools and compile-time checked queries.
+
+```rust
+use rust_zero_core::{
+    RedisJsonCache, RedisStore, RedisStoreConfig, SqlStoreConfig, SqliteStore,
+};
+use std::time::Duration;
+
+let redis = RedisStore::new(RedisStoreConfig::new("redis://127.0.0.1/"))?;
+redis
+    .set_json("user:42", &serde_json::json!({"name": "Ada"}), Some(Duration::from_secs(60)))
+    .await?;
+
+// Seed addresses may point at any reachable nodes in the same Redis Cluster.
+let cluster = RedisStore::new(
+    RedisStoreConfig::cluster([
+        "redis://redis-0:6379/",
+        "redis://redis-1:6379/",
+        "redis://redis-2:6379/",
+    ])
+    .with_key_prefix("users:"),
+)?;
+cluster.hash_set("{42}:profile", "name", "Ada").await?;
+
+let users = RedisJsonCache::<serde_json::Value, std::io::Error>::new(
+    redis,
+    Duration::from_secs(60),
+);
+let user = users
+    .get_or_fetch("user:43", || async {
+        Ok(serde_json::json!({"name": "Grace"}))
+    })
+    .await?;
+
+let sql = SqliteStore::connect_sqlite(SqlStoreConfig::new("sqlite://service.db")).await?;
+let mut transaction = sql.begin().await?;
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
 
 The standalone logger can write JSON or plain records to the console or to daily/size-rotated
 files. `StructuredLogging` connects it to Actix requests and includes request and W3C trace

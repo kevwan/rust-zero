@@ -20,20 +20,18 @@ capability rather than identical package names or APIs.
 | Logging | Covered | Leveled JSON/plain structured logging, trace and request context, deterministic sampling, opt-in sensitive-field masking, daily/size file rotation, and REST request logging |
 | Service discovery | Partial | Dynamic publish/withdraw subscriptions and balanced gRPC channels; Kubernetes and etcd adapters are not bundled |
 | Messaging | Ecosystem-backed | Typed in-process topic fan-out is included; external brokers use application-selected clients |
-| Data stores | Not yet at parity | No built-in Redis, SQL, MongoDB, or distributed cache-aside adapters; applications currently use Rust ecosystem clients directly |
+| Data stores | Partial | Feature-gated standalone/clustered Redis strings, hashes, lists, sets, sorted sets, JSON, TTLs, counters, pub/sub publishing, ownership-safe locks, and coalesced cache-aside reads; typed SQLx pools, health checks, and transactions for SQLite, PostgreSQL, and MySQL; MongoDB and cached SQL/Mongo models remain |
 | Validation | Covered | Multi-field typed validation plus Actix JSON and query extractors that reject invalid requests before handlers run |
 | REST | Covered | Actix routing/extractors, resilient named HTTP clients, CORS, bearer and JWT auth, request IDs, W3C tracing, recovery, security headers, gzip input, size/deadline/concurrency/rate controls, and metrics |
 | gRPC | Covered | Tonic client/server configuration, health reporting, authentication, dynamic balancing, trace propagation, deadlines, limits, and keepalives |
 | Gateway | Covered for HTTP proxying | Longest-prefix routing, health-aware round robin, safe header forwarding, deadlines, body limits, and an executable Actix proxy handler |
-| Profiling | Ecosystem-provided | Use platform profilers such as `perf`, Instruments, or Tokio Console; no always-on profiler is bundled |
+| Profiling and diagnostics | Covered for framework diagnostics | Opt-in named duration profiling plus an internal HTTP server with route discovery, health, Prometheus metrics, aggregate profile reports, and process/runtime information; sampling/flamegraph profiling remains platform-specific |
 
 ## Remaining upstream gaps
 
-The largest remaining gap is go-zero's `core/stores` surface: Redis commands and locks, SQL
-sessions/transactions, MongoDB helpers, and distributed cache-aside implementations. The other
-material gaps are concrete etcd/Kubernetes discovery and configuration-center adapters and an
-always-on profiling/dev-server endpoint. These are deliberately marked as gaps rather than being
-counted as covered by a backend-neutral trait.
+The remaining `core/stores` gaps are MongoDB helpers and cached SQL/Mongo models. The other material
+gaps are concrete etcd/Kubernetes discovery and configuration-center adapters. These are
+deliberately marked as gaps rather than being counted as covered by a backend-neutral trait.
 
 External adapters should be feature-gated and added with integration tests against the real
 backend. This keeps the default framework small without presenting an unverified wrapper as
