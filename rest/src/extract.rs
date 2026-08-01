@@ -110,4 +110,74 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
+
+    #[actix_web::test]
+    async fn accepts_valid_json_and_query_values() {
+        let app = test::init_service(
+            App::new()
+                .route(
+                    "/json",
+                    web::post().to(|value: ValidatedJson<Request>| async move {
+                        HttpResponse::Ok().body(value.name.clone())
+                    }),
+                )
+                .route(
+                    "/query",
+                    web::get().to(|value: ValidatedQuery<Request>| async move {
+                        HttpResponse::Ok().body(value.name.clone())
+                    }),
+                ),
+        )
+        .await;
+
+        let json_response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/json")
+                .set_json(serde_json::json!({ "name": "Ada" }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(test::read_body(json_response).await, "Ada");
+
+        let query_response = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/query?name=Grace")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(test::read_body(query_response).await, "Grace");
+    }
+
+    #[actix_web::test]
+    async fn rejects_invalid_queries_before_the_handler() {
+        let app = test::init_service(App::new().route(
+            "/",
+            web::get().to(|_: ValidatedQuery<Request>| async { HttpResponse::Ok().finish() }),
+        ))
+        .await;
+        let response = test::call_service(
+            &app,
+            test::TestRequest::get().uri("/?name=%20").to_request(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[actix_web::test]
+    async fn wrappers_support_mutable_dereferencing() {
+        let mut json = ValidatedJson(Request {
+            name: "before".to_owned(),
+        });
+        json.name = "after".to_owned();
+        assert_eq!(json.name, "after");
+
+        let mut query = ValidatedQuery(Request {
+            name: "before".to_owned(),
+        });
+        query.name = "after".to_owned();
+        assert_eq!(query.name, "after");
+    }
 }

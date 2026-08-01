@@ -178,6 +178,7 @@ impl std::error::Error for ConfigError {
 mod tests {
     use super::*;
     use serde::Deserialize;
+    use std::error::Error as _;
 
     #[derive(Debug, Deserialize, PartialEq)]
     struct Credentials {
@@ -232,5 +233,87 @@ mod tests {
         assert_eq!(config.host, "0.0.0.0");
         assert_eq!(config.mode, ServiceMode::Production);
         assert_eq!(config.address(), "0.0.0.0:8080");
+    }
+
+    #[test]
+    fn parses_json_yaml_and_unbraced_environment_references() {
+        unsafe {
+            env::set_var("RUST_ZERO_CONFIG_USER", "worker");
+        }
+
+        let json: Credentials = parse_config(
+            r#"{"username":"$RUST_ZERO_CONFIG_USER","password":"secret"}"#,
+            ConfigFormat::Json,
+        )
+        .unwrap();
+        let yaml: Credentials =
+            parse_config("username: worker\npassword: secret", ConfigFormat::Yaml).unwrap();
+
+        assert_eq!(json, yaml);
+        assert_eq!(expand_environment("$ ${}").unwrap(), "$ $");
+
+        unsafe {
+            env::remove_var("RUST_ZERO_CONFIG_USER");
+        }
+    }
+
+    #[test]
+    fn loads_supported_file_extensions() {
+        let directory = env::temp_dir();
+        let process = std::process::id();
+        let fixtures = [
+            ("json", r#"{"username":"service","password":"secret"}"#),
+            ("toml", "username = \"service\"\npassword = \"secret\""),
+            ("yaml", "username: service\npassword: secret"),
+            ("yml", "username: service\npassword: secret"),
+        ];
+
+        for (extension, contents) in fixtures {
+            let path = directory.join(format!("rust-zero-config-{process}.{extension}"));
+            fs::write(&path, contents).unwrap();
+            let credentials: Credentials = load_config(&path).unwrap();
+            assert_eq!(credentials.username, "service");
+            fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn reports_io_format_reference_and_parse_errors() {
+        let missing = env::temp_dir().join(format!(
+            "rust-zero-missing-config-{}.json",
+            std::process::id()
+        ));
+        let io_error = load_config::<Credentials>(&missing).unwrap_err();
+        assert!(matches!(io_error, ConfigError::Io { .. }));
+        assert!(io_error.source().is_some());
+        assert!(io_error
+            .to_string()
+            .contains("failed to read configuration"));
+
+        let unsupported =
+            env::temp_dir().join(format!("rust-zero-config-{}.txt", std::process::id()));
+        fs::write(&unsupported, "{}").unwrap();
+        let format_error = load_config::<Credentials>(&unsupported).unwrap_err();
+        fs::remove_file(unsupported).unwrap();
+        assert!(matches!(format_error, ConfigError::UnsupportedFormat(_)));
+        assert!(format_error.to_string().contains("use .json, .toml, .yaml"));
+        assert!(format_error.source().is_none());
+
+        let reference_error =
+            parse_config::<Credentials>("${UNCLOSED", ConfigFormat::Json).unwrap_err();
+        assert!(matches!(
+            reference_error,
+            ConfigError::InvalidEnvironmentReference
+        ));
+        assert_eq!(
+            reference_error.to_string(),
+            "unterminated ${VAR} configuration reference"
+        );
+
+        let parse_error = parse_config::<Credentials>("not json", ConfigFormat::Json).unwrap_err();
+        assert!(matches!(parse_error, ConfigError::Parse(_)));
+        assert!(parse_error
+            .to_string()
+            .starts_with("failed to parse configuration:"));
     }
 }

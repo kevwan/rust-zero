@@ -213,7 +213,63 @@ impl std::error::Error for HttpClientError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use actix_web::{web, App, HttpRequest, HttpResponse, HttpServer};
+    use futures::stream;
     use rust_zero_core::TraceFlags;
+    use serde_json::{json, Value};
+
+    async fn spawn_server() -> (String, actix_web::dev::ServerHandle) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = HttpServer::new(|| {
+            App::new()
+                .route(
+                    "/get",
+                    web::get().to(|| async { HttpResponse::Ok().json(json!({"method": "get"})) }),
+                )
+                .route(
+                    "/post",
+                    web::post().to(|body: web::Json<Value>| async move {
+                        HttpResponse::Ok().json(body.into_inner())
+                    }),
+                )
+                .route(
+                    "/trace",
+                    web::get().to(|request: HttpRequest| async move {
+                        HttpResponse::Ok().json(json!({
+                            "traceparent": request
+                                .headers()
+                                .get("traceparent")
+                                .unwrap()
+                                .to_str()
+                                .unwrap()
+                        }))
+                    }),
+                )
+                .route(
+                    "/failure",
+                    web::get().to(|| async { HttpResponse::ServiceUnavailable().finish() }),
+                )
+                .route(
+                    "/invalid",
+                    web::get().to(|| async { HttpResponse::Ok().body("not json") }),
+                )
+                .route(
+                    "/chunked",
+                    web::get().to(|| async {
+                        HttpResponse::Ok().streaming(stream::once(async {
+                            Ok::<_, actix_web::Error>(web::Bytes::from_static(b"123456"))
+                        }))
+                    }),
+                )
+        })
+        .listen(listener)
+        .unwrap()
+        .run();
+        let handle = server.handle();
+        actix_web::rt::spawn(server);
+        (format!("http://{address}"), handle)
+    }
 
     #[test]
     fn rejects_empty_service_names() {
@@ -237,5 +293,180 @@ mod tests {
             .insert("traceparent", child.traceparent().parse().unwrap());
 
         assert!(request.headers().contains_key("traceparent"));
+    }
+
+    #[actix_web::test]
+    async fn gets_posts_and_propagates_trace_context() {
+        let (base_url, server) = spawn_server().await;
+        let client = HttpClient::new(
+            HttpClientConfig::new("users")
+                .with_timeout(Duration::from_secs(1))
+                .with_max_response_bytes(1024),
+        )
+        .unwrap();
+
+        assert_eq!(client.service(), "users");
+        assert_eq!(
+            client
+                .get_json::<Value>(format!("{base_url}/get"))
+                .await
+                .unwrap(),
+            json!({"method": "get"})
+        );
+        assert_eq!(
+            client
+                .post_json::<_, Value>(format!("{base_url}/post"), &json!({"id": 42}))
+                .await
+                .unwrap(),
+            json!({"id": 42})
+        );
+
+        let parent = TraceContext::root(TraceFlags::SAMPLED);
+        let request = client
+            .request(Method::GET, format!("{base_url}/trace"))
+            .build()
+            .unwrap();
+        let response: Value = client
+            .decode_json(client.execute_traced(request, &parent).await.unwrap())
+            .await
+            .unwrap();
+        let propagated = response["traceparent"].as_str().unwrap();
+        assert!(propagated.starts_with(&format!("00-{}-", parent.trace_id())));
+
+        server.stop(true).await;
+    }
+
+    #[actix_web::test]
+    async fn reports_status_decode_and_response_limit_errors() {
+        let (base_url, server) = spawn_server().await;
+        let client =
+            HttpClient::new(HttpClientConfig::new("users").with_max_response_bytes(4)).unwrap();
+
+        let status = client
+            .get_json::<Value>(format!("{base_url}/failure"))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            status,
+            HttpClientError::Status(StatusCode::SERVICE_UNAVAILABLE)
+        ));
+
+        let invalid = client
+            .get_json::<Value>(format!("{base_url}/invalid"))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            invalid,
+            HttpClientError::BodyTooLarge { limit: 4 }
+        ));
+
+        let chunked = client
+            .get_json::<Value>(format!("{base_url}/chunked"))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            chunked,
+            HttpClientError::BodyTooLarge { limit: 4 }
+        ));
+
+        let decode_client = HttpClient::new(HttpClientConfig::new("users")).unwrap();
+        let decode = decode_client
+            .get_json::<Value>(format!("{base_url}/invalid"))
+            .await
+            .unwrap_err();
+        assert!(matches!(decode, HttpClientError::Decode(_)));
+
+        server.stop(true).await;
+    }
+
+    #[actix_web::test]
+    async fn opens_the_circuit_after_a_server_failure() {
+        let (base_url, server) = spawn_server().await;
+        let client = HttpClient::new(
+            HttpClientConfig::new("inventory")
+                .with_breaker(CircuitBreakerConfig::new(1, Duration::from_secs(60))),
+        )
+        .unwrap();
+
+        let first = client
+            .execute(
+                client
+                    .request(Method::GET, format!("{base_url}/failure"))
+                    .build()
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let second = client
+            .execute(
+                client
+                    .request(Method::GET, format!("{base_url}/get"))
+                    .build()
+                    .unwrap(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            second,
+            HttpClientError::CircuitOpen { service } if service == "inventory"
+        ));
+
+        server.stop(true).await;
+    }
+
+    #[actix_web::test]
+    async fn reports_request_build_and_transport_errors() {
+        let client = HttpClient::new(HttpClientConfig::new("users")).unwrap();
+        let build = client.get_json::<Value>("not a URL").await.unwrap_err();
+        assert!(matches!(build, HttpClientError::Build(_)));
+        assert!(std::error::Error::source(&build).is_some());
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let request = client
+            .request(Method::GET, format!("http://{address}"))
+            .build()
+            .unwrap();
+        let transport = client.execute(request).await.unwrap_err();
+        assert!(matches!(transport, HttpClientError::Transport(_)));
+        assert!(std::error::Error::source(&transport).is_some());
+    }
+
+    #[test]
+    fn formats_public_errors() {
+        let invalid = HttpClientError::InvalidServiceName;
+        assert_eq!(invalid.to_string(), "HTTP service name cannot be empty");
+        assert!(std::error::Error::source(&invalid).is_none());
+
+        assert_eq!(
+            HttpClientError::CircuitOpen {
+                service: "users".to_owned()
+            }
+            .to_string(),
+            "HTTP circuit for service users is open"
+        );
+        assert_eq!(
+            HttpClientError::Status(StatusCode::BAD_GATEWAY).to_string(),
+            "HTTP service returned 502 Bad Gateway"
+        );
+        assert_eq!(
+            HttpClientError::BodyTooLarge { limit: 16 }.to_string(),
+            "HTTP response exceeds the 16-byte limit"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "HTTP timeout must be greater than zero")]
+    fn rejects_zero_timeouts() {
+        let _ = HttpClientConfig::new("users").with_timeout(Duration::ZERO);
+    }
+
+    #[test]
+    #[should_panic(expected = "HTTP response limit must be greater than zero")]
+    fn rejects_zero_response_limits() {
+        let _ = HttpClientConfig::new("users").with_max_response_bytes(0);
     }
 }
