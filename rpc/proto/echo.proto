@@ -4,6 +4,9 @@ package rust_zero.echo;
 
 service Echo {
   rpc Echo(EchoRequest) returns (EchoResponse);
+  rpc ServerStream(EchoRequest) returns (stream EchoResponse);
+  rpc ClientStream(stream EchoRequest) returns (EchoResponse);
+  rpc BidirectionalStream(stream EchoRequest) returns (stream EchoResponse);
 }
 
 message EchoRequest {

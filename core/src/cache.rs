@@ -9,6 +9,31 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// Adds a bounded, deterministic-per-call spread to an expiry duration.
+///
+/// Cache adapters use this to avoid a large set of records expiring at exactly the same instant.
+/// The caller owns the sequence so independent cache instances do not contend on a global RNG.
+#[cfg(any(feature = "stores-sql", feature = "stores-mongo", test))]
+pub(crate) fn jittered_ttl(base: Duration, jitter: Duration, sequence: u64) -> Duration {
+    if jitter.is_zero() {
+        return base;
+    }
+
+    // SplitMix64 gives a well-distributed value without pulling an RNG into the cache hot path.
+    let mut value = sequence.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^= value >> 31;
+
+    let jitter_nanos = jitter.as_nanos();
+    let added_nanos = u128::from(value) % (jitter_nanos.saturating_add(1));
+    let added = Duration::new(
+        (added_nanos / 1_000_000_000).min(u128::from(u64::MAX)) as u64,
+        (added_nanos % 1_000_000_000) as u32,
+    );
+    base.saturating_add(added)
+}
+
 use crate::{SingleFlight, SingleFlightError};
 
 struct Entry<V> {
@@ -304,6 +329,21 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expiry_jitter_is_bounded_and_varies_by_sequence() {
+        let base = Duration::from_secs(10);
+        let jitter = Duration::from_secs(5);
+        let values: Vec<_> = (0..8)
+            .map(|sequence| jittered_ttl(base, jitter, sequence))
+            .collect();
+
+        assert!(values
+            .iter()
+            .all(|ttl| *ttl >= base && *ttl <= base + jitter));
+        assert!(values.windows(2).any(|pair| pair[0] != pair[1]));
+        assert_eq!(jittered_ttl(base, Duration::ZERO, 99), base);
+    }
     use std::thread;
 
     #[test]

@@ -1,12 +1,32 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fmt,
+    future::Future,
+    pin::Pin,
     sync::{Arc, Mutex},
 };
 
 use tokio::sync::broadcast;
 
 const EVENT_BUFFER_SIZE: usize = 128;
+
+/// Future returned while waiting for a discovery snapshot to change.
+pub type EndpointChangeFuture<'a, E> =
+    Pin<Box<dyn Future<Output = Result<Vec<String>, E>> + Send + 'a>>;
+
+/// A live, complete snapshot of the endpoints for one logical service.
+///
+/// Discovery backends expose snapshots rather than backend-specific add/remove events so
+/// transports can recover consistently after a watch reconnect or a lagged consumer.
+pub trait EndpointSubscription: Send + 'static {
+    type Error: Send + 'static;
+
+    /// Returns the latest complete endpoint snapshot in stable order.
+    fn endpoints(&self) -> Vec<String>;
+
+    /// Waits until a new complete endpoint snapshot is available.
+    fn changed(&mut self) -> EndpointChangeFuture<'_, Self::Error>;
+}
 
 /// A local service registry with reference-counted endpoint leases and change subscriptions.
 #[derive(Clone)]
@@ -233,6 +253,27 @@ impl ServiceSubscription {
                 }
             }
         }
+    }
+}
+
+impl EndpointSubscription for ServiceSubscription {
+    type Error = DiscoveryError;
+
+    fn endpoints(&self) -> Vec<String> {
+        ServiceSubscription::endpoints(self)
+    }
+
+    fn changed(&mut self) -> EndpointChangeFuture<'_, Self::Error> {
+        Box::pin(async move {
+            match self.recv().await {
+                Ok(_) => Ok(self.endpoints()),
+                Err(DiscoveryError::SubscriptionLagged(_)) => {
+                    self.resync();
+                    Ok(self.endpoints())
+                }
+                Err(error) => Err(error),
+            }
+        })
     }
 }
 

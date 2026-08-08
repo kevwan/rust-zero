@@ -51,8 +51,8 @@ impl ProfileSnapshot {
 
 /// Low-overhead, named duration profiling.
 ///
-/// Profiling starts disabled, matching go-zero's opt-in profiler. Calling [`snapshot`] returns
-/// lifetime aggregates and resets only the interval aggregates.
+/// Profiling starts disabled, matching go-zero's opt-in profiler. Calling
+/// [`Profiler::snapshot`] returns lifetime aggregates and resets only the interval aggregates.
 #[derive(Debug, Default)]
 pub struct Profiler {
     enabled: AtomicBool,

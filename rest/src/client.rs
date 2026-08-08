@@ -1,7 +1,12 @@
+use crate::HttpClientMetrics;
 use reqwest::{Client, Method, Request, RequestBuilder, Response, StatusCode};
 use rust_zero_core::{CircuitBreaker, CircuitBreakerConfig, CircuitBreakerError, TraceContext};
 use serde::{de::DeserializeOwned, Serialize};
-use std::{fmt, sync::Arc, time::Duration};
+use std::{
+    fmt,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 /// Production defaults for calls to a named HTTP dependency.
 #[derive(Debug, Clone)]
@@ -48,6 +53,7 @@ pub struct HttpClient {
     client: Client,
     breaker: Arc<CircuitBreaker>,
     max_response_bytes: usize,
+    metrics: Option<HttpClientMetrics>,
 }
 
 impl HttpClient {
@@ -65,7 +71,14 @@ impl HttpClient {
             client,
             breaker: Arc::new(CircuitBreaker::new(config.breaker)),
             max_response_bytes: config.max_response_bytes,
+            metrics: None,
         })
+    }
+
+    /// Records transport outcomes for this client in a shared metrics registry.
+    pub fn with_metrics(mut self, metrics: HttpClientMetrics) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     pub fn service(&self) -> &str {
@@ -78,7 +91,14 @@ impl HttpClient {
 
     /// Executes a pre-built request through the service circuit breaker.
     pub async fn execute(&self, request: Request) -> Result<Response, HttpClientError> {
-        self.breaker
+        let method = request.method().as_str().to_owned();
+        let started_at = Instant::now();
+        let _in_flight = self
+            .metrics
+            .as_ref()
+            .map(|metrics| metrics.track_in_flight(self.service.to_string(), method.clone()));
+        let result = self
+            .breaker
             .execute_async_with_accept(
                 || self.client.execute(request),
                 |result| match result {
@@ -92,7 +112,24 @@ impl HttpClient {
                     service: self.service.to_string(),
                 },
                 CircuitBreakerError::Operation(error) => HttpClientError::Transport(error),
-            })
+            });
+
+        if let Some(metrics) = &self.metrics {
+            let result_label = match &result {
+                Ok(response) => response.status().as_str().to_owned(),
+                Err(HttpClientError::CircuitOpen { .. }) => "circuit_open".to_owned(),
+                Err(HttpClientError::Transport(_)) => "transport_error".to_owned(),
+                Err(_) => "client_error".to_owned(),
+            };
+            metrics.record(
+                &self.service,
+                &method,
+                &result_label,
+                started_at.elapsed().as_secs_f64(),
+            );
+        }
+
+        result
     }
 
     /// Adds a child `traceparent` header and executes the request.
@@ -215,7 +252,7 @@ mod tests {
     use super::*;
     use actix_web::{web, App, HttpRequest, HttpResponse, HttpServer};
     use futures::stream;
-    use rust_zero_core::TraceFlags;
+    use rust_zero_core::{Metrics, TraceFlags};
     use serde_json::{json, Value};
 
     async fn spawn_server() -> (String, actix_web::dev::ServerHandle) {
@@ -382,11 +419,13 @@ mod tests {
     #[actix_web::test]
     async fn opens_the_circuit_after_a_server_failure() {
         let (base_url, server) = spawn_server().await;
+        let metrics = Metrics::new();
         let client = HttpClient::new(
             HttpClientConfig::new("inventory")
                 .with_breaker(CircuitBreakerConfig::new(1, Duration::from_secs(60))),
         )
-        .unwrap();
+        .unwrap()
+        .with_metrics(HttpClientMetrics::new(&metrics, "test").unwrap());
 
         let first = client
             .execute(
@@ -411,6 +450,17 @@ mod tests {
         assert!(matches!(
             second,
             HttpClientError::CircuitOpen { service } if service == "inventory"
+        ));
+
+        let rendered = metrics.render();
+        assert!(rendered.contains(
+            "test_http_client_requests_total{service=\"inventory\",method=\"GET\",result=\"503\"} 1"
+        ));
+        assert!(rendered.contains(
+            "test_http_client_requests_total{service=\"inventory\",method=\"GET\",result=\"circuit_open\"} 1"
+        ));
+        assert!(rendered.contains(
+            "test_http_client_requests_in_flight{service=\"inventory\",method=\"GET\"} 0"
         ));
 
         server.stop(true).await;

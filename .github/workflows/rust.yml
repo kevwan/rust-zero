@@ -2,21 +2,146 @@ name: Rust
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [main]
   pull_request:
-    branches: [ "main" ]
+    branches: [main]
 
 env:
   CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
 
 jobs:
-  build:
-
+  test:
     runs-on: ubuntu-latest
-
     steps:
-    - uses: actions/checkout@v3
-    - name: Build
-      run: cargo build --verbose
-    - name: Run tests
-      run: cargo test --verbose
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: cargo test --workspace --all-targets
+
+  real-backends:
+    runs-on: ubuntu-latest
+    services:
+      etcd:
+        image: quay.io/coreos/etcd:v3.5.17
+        ports:
+          - 2379:2379
+        env:
+          ETCD_ADVERTISE_CLIENT_URLS: http://0.0.0.0:2379
+          ETCD_LISTEN_CLIENT_URLS: http://0.0.0.0:2379
+      redis:
+        image: redis:7.4-alpine
+        ports:
+          - 6379:6379
+      postgres:
+        image: postgres:17-alpine
+        ports:
+          - 5432:5432
+        env:
+          POSTGRES_USER: rust_zero
+          POSTGRES_PASSWORD: rust_zero
+          POSTGRES_DB: rust_zero
+      mysql:
+        image: mysql:8.4
+        ports:
+          - 3306:3306
+        env:
+          MYSQL_DATABASE: rust_zero
+          MYSQL_USER: rust_zero
+          MYSQL_PASSWORD: rust_zero
+          MYSQL_ROOT_PASSWORD: root
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -proot"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+    env:
+      RUST_ZERO_ETCD_ENDPOINT: http://127.0.0.1:2379
+      RUST_ZERO_REDIS_URL: redis://127.0.0.1:6379/
+      RUST_ZERO_POSTGRES_URL: postgres://rust_zero:rust_zero@127.0.0.1:5432/rust_zero
+      RUST_ZERO_MYSQL_URL: mysql://rust_zero:rust_zero@127.0.0.1:3306/rust_zero
+      RUST_ZERO_MONGODB_URI: mongodb://127.0.0.1:27017/?replicaSet=rs0
+      RUST_ZERO_MONGODB_TRANSACTIONS: 1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Start a transactional MongoDB replica set
+        run: |
+          docker run -d --name rust-zero-mongo -p 27017:27017 mongo:8 \
+            --replSet rs0 --bind_ip_all
+          timeout 90 bash -c 'until docker exec rust-zero-mongo mongosh --quiet --eval "db.adminCommand({ping:1}).ok" | grep 1; do sleep 1; done'
+          docker exec rust-zero-mongo mongosh --quiet --eval \
+            'rs.initiate({_id:"rs0",members:[{_id:0,host:"127.0.0.1:27017"}]})'
+          timeout 90 bash -c 'until docker exec rust-zero-mongo mongosh --quiet --eval "db.hello().isWritablePrimary" | grep true; do sleep 1; done'
+      - name: Wait for real backends
+        run: |
+          for port in 2379 6379 5432 3306 27017; do
+            timeout 90 bash -c "until (echo > /dev/tcp/127.0.0.1/$port) 2>/dev/null; do sleep 1; done"
+          done
+      - name: Exercise etcd, Redis, SQL, and MongoDB
+        run: cargo test -p rust-zero-core --all-features -- --test-threads=1
+
+  redis-cluster:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Start a real six-node Redis cluster
+        run: |
+          for port in 7000 7001 7002 7003 7004 7005; do
+            docker run -d --name "redis-$port" --network host redis:7.4-alpine \
+              redis-server --port "$port" --cluster-enabled yes \
+              --cluster-config-file "nodes-$port.conf" --cluster-node-timeout 5000 \
+              --appendonly no --protected-mode no
+          done
+          timeout 60 bash -c 'until docker exec redis-7000 redis-cli -p 7000 ping; do sleep 1; done'
+          yes yes | docker exec -i redis-7000 redis-cli --cluster create \
+            127.0.0.1:7000 127.0.0.1:7001 127.0.0.1:7002 \
+            127.0.0.1:7003 127.0.0.1:7004 127.0.0.1:7005 \
+            --cluster-replicas 1
+      - name: Exercise cluster routing and cache/lock semantics
+        env:
+          RUST_ZERO_REDIS_CLUSTER_URLS: redis://127.0.0.1:7000/,redis://127.0.0.1:7001/,redis://127.0.0.1:7002/
+        run: cargo test -p rust-zero-core --features stores-redis redis_cluster_integration -- --nocapture
+
+  kubernetes-endpointslices:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: helm/kind-action@v1
+        with:
+          cluster_name: rust-zero
+      - name: Create real EndpointSlice resources
+        run: |
+          kubectl create namespace rust-zero
+          kubectl apply -n rust-zero -f - <<'YAML'
+          apiVersion: discovery.k8s.io/v1
+          kind: EndpointSlice
+          metadata:
+            name: users-a
+            labels:
+              kubernetes.io/service-name: users
+          addressType: IPv4
+          ports:
+            - name: grpc
+              protocol: TCP
+              port: 50051
+          endpoints:
+            - addresses: ["10.0.0.1"]
+              conditions:
+                ready: true
+          YAML
+      - name: Exercise EndpointSlice list/watch adapter
+        env:
+          RUST_ZERO_KUBERNETES_SERVICE: users
+          RUST_ZERO_KUBERNETES_NAMESPACE: rust-zero
+          RUST_ZERO_KUBERNETES_PORT_NAME: grpc
+        run: cargo test -p rust-zero-core --features kubernetes kubernetes_integration -- --nocapture

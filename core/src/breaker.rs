@@ -1,6 +1,8 @@
 use std::{
+    convert::Infallible,
     fmt,
     future::Future,
+    sync::Arc,
     sync::Mutex,
     time::{Duration, Instant},
 };
@@ -83,6 +85,21 @@ impl CircuitBreaker {
             .lock()
             .expect("circuit breaker state lock poisoned")
             .status()
+    }
+
+    /// Reserves a call for wrappers that cannot observe the result in one future.
+    ///
+    /// Protocol transports commonly receive the final outcome in response-body trailers. The
+    /// returned permit can be held by that body and completed once the final status is known.
+    /// Dropping an unfinished permit releases it as healthy, so caller cancellation does not trip
+    /// the dependency circuit or leave a half-open circuit stuck forever. Wrappers should call
+    /// [`CircuitBreakerPermit::finish`] explicitly for transport and protocol failures.
+    pub fn acquire(self: &Arc<Self>) -> Option<CircuitBreakerPermit> {
+        self.before_call::<Infallible>().ok()?;
+        Some(CircuitBreakerPermit {
+            breaker: Arc::clone(self),
+            finished: false,
+        })
     }
 
     /// Runs an operation if the circuit permits it.
@@ -228,6 +245,28 @@ impl CircuitBreaker {
     }
 }
 
+/// An admitted circuit-breaker call whose outcome may arrive later.
+pub struct CircuitBreakerPermit {
+    breaker: Arc<CircuitBreaker>,
+    finished: bool,
+}
+
+impl CircuitBreakerPermit {
+    /// Records whether the dependency outcome was healthy.
+    pub fn finish(mut self, acceptable: bool) {
+        self.breaker.record_acceptable(acceptable);
+        self.finished = true;
+    }
+}
+
+impl Drop for CircuitBreakerPermit {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.breaker.record_success();
+        }
+    }
+}
+
 /// An operation error or the rejection produced by an open circuit.
 #[derive(Debug, PartialEq, Eq)]
 pub enum CircuitBreakerError<E> {
@@ -300,6 +339,20 @@ mod tests {
             .await;
 
         assert_eq!(response, Ok(503));
+        assert_eq!(breaker.state(), BreakerState::Open);
+    }
+
+    #[test]
+    fn dropped_transport_permit_does_not_treat_caller_cancellation_as_failure() {
+        let breaker = Arc::new(CircuitBreaker::new(CircuitBreakerConfig::new(
+            1,
+            Duration::from_secs(1),
+        )));
+
+        drop(breaker.acquire().unwrap());
+
+        assert_eq!(breaker.state(), BreakerState::Closed);
+        breaker.acquire().unwrap().finish(false);
         assert_eq!(breaker.state(), BreakerState::Open);
     }
 }

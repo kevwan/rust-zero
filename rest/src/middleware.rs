@@ -1,3 +1,4 @@
+use crate::{metrics::HttpMetrics, route::RequestPolicy};
 use actix_web::{
     body::{EitherBody, MessageBody},
     dev::{Service, ServiceRequest, ServiceResponse, Transform},
@@ -20,12 +21,14 @@ use tokio::sync::Semaphore;
 /// Rejects requests that exceed the configured maximum execution time.
 pub struct Timeout {
     duration: Duration,
+    metrics: Option<HttpMetrics>,
 }
 
 impl Clone for Timeout {
     fn clone(&self) -> Self {
         Self {
             duration: self.duration,
+            metrics: self.metrics.clone(),
         }
     }
 }
@@ -36,7 +39,15 @@ impl Timeout {
             !duration.is_zero(),
             "timeout duration must be greater than zero"
         );
-        Self { duration }
+        Self {
+            duration,
+            metrics: None,
+        }
+    }
+
+    pub fn with_metrics(mut self, metrics: HttpMetrics) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 }
 
@@ -56,6 +67,7 @@ where
         ok(TimeoutMiddleware {
             service,
             duration: self.duration,
+            metrics: self.metrics.clone(),
         })
     }
 }
@@ -63,6 +75,7 @@ where
 pub struct TimeoutMiddleware<S> {
     service: S,
     duration: Duration,
+    metrics: Option<HttpMetrics>,
 }
 
 impl<S, B> Service<ServiceRequest> for TimeoutMiddleware<S>
@@ -80,13 +93,26 @@ where
     }
 
     fn call(&self, request: ServiceRequest) -> Self::Future {
+        let (duration, sse) = request
+            .extensions()
+            .get::<RequestPolicy>()
+            .map(|policy| (policy.timeout.unwrap_or(self.duration), policy.sse))
+            .unwrap_or((self.duration, false));
         let future = self.service.call(request);
-        let duration = self.duration;
+        let metrics = self.metrics.clone();
 
         Box::pin(async move {
+            if sse {
+                return future.await;
+            }
             match actix_rt::time::timeout(duration, future).await {
                 Ok(response) => response,
-                Err(_) => Err(actix_web::error::ErrorGatewayTimeout("request timed out")),
+                Err(_) => {
+                    if let Some(metrics) = metrics {
+                        metrics.record_protection("timeout", "rejected");
+                    }
+                    Err(actix_web::error::ErrorGatewayTimeout("request timed out"))
+                }
             }
         })
     }
@@ -95,12 +121,16 @@ where
 /// Sheds excess load instead of queueing requests when all execution slots are busy.
 pub struct ConcurrencyLimit {
     semaphore: Arc<Semaphore>,
+    priority_reserve: Arc<Semaphore>,
+    metrics: Option<HttpMetrics>,
 }
 
 impl Clone for ConcurrencyLimit {
     fn clone(&self) -> Self {
         Self {
             semaphore: Arc::clone(&self.semaphore),
+            priority_reserve: Arc::clone(&self.priority_reserve),
+            metrics: self.metrics.clone(),
         }
     }
 }
@@ -113,7 +143,21 @@ impl ConcurrencyLimit {
         );
         Self {
             semaphore: Arc::new(Semaphore::new(max_concurrent_requests)),
+            priority_reserve: Arc::new(Semaphore::new(max_concurrent_requests.div_ceil(4))),
+            metrics: None,
         }
+    }
+
+    /// Sets the additional capacity reserved exclusively for priority routes.
+    pub fn with_priority_reserve(mut self, capacity: usize) -> Self {
+        assert!(capacity > 0, "priority reserve must be greater than zero");
+        self.priority_reserve = Arc::new(Semaphore::new(capacity));
+        self
+    }
+
+    pub fn with_metrics(mut self, metrics: HttpMetrics) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 }
 
@@ -133,6 +177,8 @@ where
         ok(ConcurrencyLimitMiddleware {
             service,
             semaphore: Arc::clone(&self.semaphore),
+            priority_reserve: Arc::clone(&self.priority_reserve),
+            metrics: self.metrics.clone(),
         })
     }
 }
@@ -140,6 +186,8 @@ where
 pub struct ConcurrencyLimitMiddleware<S> {
     service: S,
     semaphore: Arc<Semaphore>,
+    priority_reserve: Arc<Semaphore>,
+    metrics: Option<HttpMetrics>,
 }
 
 impl<S, B> Service<ServiceRequest> for ConcurrencyLimitMiddleware<S>
@@ -157,9 +205,24 @@ where
     }
 
     fn call(&self, request: ServiceRequest) -> Self::Future {
-        let permit = match Arc::clone(&self.semaphore).try_acquire_owned() {
+        let priority = request
+            .extensions()
+            .get::<RequestPolicy>()
+            .is_some_and(|policy| policy.priority);
+        let permit = match Arc::clone(&self.semaphore)
+            .try_acquire_owned()
+            .or_else(|error| {
+                if priority {
+                    Arc::clone(&self.priority_reserve).try_acquire_owned()
+                } else {
+                    Err(error)
+                }
+            }) {
             Ok(permit) => permit,
             Err(_) => {
+                if let Some(metrics) = &self.metrics {
+                    metrics.record_protection("concurrency", "rejected");
+                }
                 return Box::pin(async move {
                     Ok(request.into_response(
                         HttpResponse::build(StatusCode::SERVICE_UNAVAILABLE)
@@ -183,6 +246,7 @@ where
 pub struct RateLimit {
     state: Arc<Mutex<TokenBucket>>,
     permits_per_second: f64,
+    metrics: Option<HttpMetrics>,
 }
 
 impl Clone for RateLimit {
@@ -190,6 +254,7 @@ impl Clone for RateLimit {
         Self {
             state: Arc::clone(&self.state),
             permits_per_second: self.permits_per_second,
+            metrics: self.metrics.clone(),
         }
     }
 }
@@ -209,7 +274,13 @@ impl RateLimit {
                 last_refill: Instant::now(),
             })),
             permits_per_second: f64::from(permits_per_second),
+            metrics: None,
         }
+    }
+
+    pub fn with_metrics(mut self, metrics: HttpMetrics) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 }
 
@@ -230,6 +301,7 @@ where
             service,
             state: Arc::clone(&self.state),
             permits_per_second: self.permits_per_second,
+            metrics: self.metrics.clone(),
         })
     }
 }
@@ -238,6 +310,7 @@ pub struct RateLimitMiddleware<S> {
     service: S,
     state: Arc<Mutex<TokenBucket>>,
     permits_per_second: f64,
+    metrics: Option<HttpMetrics>,
 }
 
 impl<S, B> Service<ServiceRequest> for RateLimitMiddleware<S>
@@ -262,6 +335,9 @@ where
             .try_acquire(self.permits_per_second);
 
         if let Some(retry_after) = retry_after {
+            if let Some(metrics) = &self.metrics {
+                metrics.record_protection("rate_limit", "rejected");
+            }
             let retry_after_seconds = retry_after.as_secs_f64().ceil().max(1.0) as u64;
             return Box::pin(async move {
                 Ok(request.into_response(
@@ -354,7 +430,11 @@ where
     }
 
     fn call(&self, mut request: ServiceRequest) -> Self::Future {
-        let max_bytes = self.max_bytes;
+        let max_bytes = request
+            .extensions()
+            .get::<RequestPolicy>()
+            .and_then(|policy| policy.max_body_bytes)
+            .unwrap_or(self.max_bytes);
         let decompress_gzip = self.decompress_gzip;
         let service = Rc::clone(&self.service);
 
@@ -475,6 +555,7 @@ mod tests {
         web::{self, Data},
         App, HttpResponse,
     };
+    use rust_zero_core::Metrics;
     use std::{
         future::{poll_fn, Future},
         sync::Arc,
@@ -484,9 +565,11 @@ mod tests {
 
     #[actix_rt::test]
     async fn timeout_returns_gateway_timeout() {
+        let metrics = Metrics::new();
+        let http_metrics = HttpMetrics::new(&metrics, "test").unwrap();
         let app = test::init_service(
             App::new()
-                .wrap(Timeout::new(Duration::from_millis(5)))
+                .wrap(Timeout::new(Duration::from_millis(5)).with_metrics(http_metrics))
                 .route(
                     "/",
                     web::get().to(|| async {
@@ -505,15 +588,20 @@ mod tests {
             actix_web::error::ResponseError::status_code(error.as_response_error()),
             StatusCode::GATEWAY_TIMEOUT
         );
+        assert!(metrics.render().contains(
+            "test_http_protection_decisions_total{mechanism=\"timeout\",decision=\"rejected\"} 1"
+        ));
     }
 
     #[actix_rt::test]
     async fn concurrency_limit_sheds_busy_requests() {
         let release = Arc::new(Notify::new());
+        let metrics = Metrics::new();
+        let http_metrics = HttpMetrics::new(&metrics, "test").unwrap();
         let app = test::init_service(
             App::new()
                 .app_data(Data::from(Arc::clone(&release)))
-                .wrap(ConcurrencyLimit::new(1))
+                .wrap(ConcurrencyLimit::new(1).with_metrics(http_metrics))
                 .route(
                     "/",
                     web::get().to(|release: Data<Notify>| async move {
@@ -534,6 +622,9 @@ mod tests {
 
         let second = test::call_service(&app, test::TestRequest::get().uri("/").to_request()).await;
         assert_eq!(second.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(metrics.render().contains(
+            "test_http_protection_decisions_total{mechanism=\"concurrency\",decision=\"rejected\"} 1"
+        ));
 
         release.notify_waiters();
         assert_eq!(first.await.status(), StatusCode::OK);
@@ -541,9 +632,11 @@ mod tests {
 
     #[actix_rt::test]
     async fn rate_limit_returns_retry_after() {
+        let metrics = Metrics::new();
+        let http_metrics = HttpMetrics::new(&metrics, "test").unwrap();
         let app = test::init_service(
             App::new()
-                .wrap(RateLimit::new(1, 1))
+                .wrap(RateLimit::new(1, 1).with_metrics(http_metrics))
                 .route("/", web::get().to(|| async { HttpResponse::Ok().finish() })),
         )
         .await;
@@ -554,6 +647,9 @@ mod tests {
         assert_eq!(first.status(), StatusCode::OK);
         assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(second.headers().get(header::RETRY_AFTER).unwrap(), "1");
+        assert!(metrics.render().contains(
+            "test_http_protection_decisions_total{mechanism=\"rate_limit\",decision=\"rejected\"} 1"
+        ));
     }
 
     #[actix_rt::test]

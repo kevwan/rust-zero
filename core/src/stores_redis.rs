@@ -102,6 +102,23 @@ impl RedisStore {
         Ok(())
     }
 
+    /// Executes an arbitrary Redis command using this store's connection and timeout policy.
+    ///
+    /// Arguments are passed through exactly as provided. In particular, keys in a raw command are
+    /// not automatically namespaced with [`RedisStoreConfig::key_prefix`]; callers can use
+    /// [`Self::prefixed_key`] when constructing commands that should share the store namespace.
+    pub async fn do_command<T: FromRedisValue>(
+        &self,
+        mut command: Cmd,
+    ) -> Result<T, RedisStoreError> {
+        self.query(&mut command).await
+    }
+
+    /// Applies this store's configured namespace to a key for use with [`Self::do_command`].
+    pub fn prefixed_key(&self, key: &str) -> String {
+        self.key(key)
+    }
+
     pub async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, RedisStoreError> {
         let mut connection = self.connection().await?;
         let key = self.key(key);
@@ -445,6 +462,28 @@ impl RedisStore {
         let mut command = redis::cmd("PUBLISH");
         command.arg(self.key(channel)).arg(message.as_ref());
         self.query(&mut command).await
+    }
+
+    /// Moves a Redis stream consumer group's last-delivered cursor.
+    ///
+    /// `id` accepts Redis stream IDs as well as the special `$` and `0` values. This corresponds
+    /// to `XGROUP SETID`, including the helper added by go-zero v1.10.3.
+    pub async fn stream_group_set_id(
+        &self,
+        key: &str,
+        group: &str,
+        id: &str,
+    ) -> Result<(), RedisStoreError> {
+        let mut command = redis::cmd("XGROUP");
+        command.arg("SETID").arg(self.key(key)).arg(group).arg(id);
+        let response: String = self.query(&mut command).await?;
+        if response == "OK" {
+            Ok(())
+        } else {
+            Err(RedisStoreError::UnexpectedResponse(format!(
+                "XGROUP SETID returned {response}"
+            )))
+        }
     }
 
     pub fn lock(&self, key: impl Into<String>, ttl: Duration) -> RedisLock {
@@ -794,6 +833,7 @@ mod tests {
             RedisStore::new(RedisStoreConfig::new("redis://127.0.0.1/").with_key_prefix("test:"))
                 .unwrap();
         assert_eq!(store.key("users"), "test:users");
+        assert_eq!(store.prefixed_key("users"), "test:users");
         assert_ne!(
             store.lock("lock", Duration::from_secs(1)).token,
             store.lock("lock", Duration::from_secs(1)).token
@@ -844,7 +884,7 @@ mod tests {
         store.ping().await.unwrap();
         store
             .delete(&[
-                "user", "count", "lock", "string", "hash", "list", "set", "sorted",
+                "user", "count", "lock", "string", "hash", "list", "set", "sorted", "stream",
             ])
             .await
             .unwrap();
@@ -860,6 +900,34 @@ mod tests {
         assert_eq!(store.get_json::<User>("user").await.unwrap(), Some(user));
         assert_eq!(store.increment("count", 2).await.unwrap(), 2);
         assert_eq!(store.decrement("count", 1).await.unwrap(), 1);
+        let raw_count: i64 = store
+            .do_command(
+                redis::cmd("INCRBY")
+                    .arg(store.prefixed_key("count"))
+                    .arg(4)
+                    .to_owned(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(raw_count, 5);
+
+        let group_created: String = store
+            .do_command(
+                redis::cmd("XGROUP")
+                    .arg("CREATE")
+                    .arg(store.prefixed_key("stream"))
+                    .arg("workers")
+                    .arg("0")
+                    .arg("MKSTREAM")
+                    .to_owned(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(group_created, "OK");
+        store
+            .stream_group_set_id("stream", "workers", "$")
+            .await
+            .unwrap();
 
         assert!(store
             .set_if_absent("string", "first", Some(Duration::from_secs(10)))
@@ -968,9 +1036,33 @@ mod tests {
                 .unwrap(),
             vec![Some(b"one".to_vec()), Some(b"two".to_vec())]
         );
+        let user = User {
+            id: 9,
+            name: "Cluster".to_owned(),
+        };
+        store
+            .set_json("{user:9}:json", &user, Some(Duration::from_secs(10)))
+            .await
+            .unwrap();
         assert_eq!(
-            store.delete(&["{one}:value", "{two}:value"]).await.unwrap(),
-            2
+            store.get_json::<User>("{user:9}:json").await.unwrap(),
+            Some(user)
+        );
+        let mut lock = store.lock("{user:9}:lock", Duration::from_secs(5));
+        assert!(lock.acquire().await.unwrap());
+        assert!(lock.extend(Duration::from_secs(10)).await.unwrap());
+        assert!(lock.release().await.unwrap());
+        assert_eq!(
+            store
+                .delete(&[
+                    "{one}:value",
+                    "{two}:value",
+                    "{user:9}:json",
+                    "{user:9}:lock",
+                ])
+                .await
+                .unwrap(),
+            3
         );
     }
 }

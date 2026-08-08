@@ -1,5 +1,12 @@
 //! Health-aware gateway routing and an Actix/Reqwest reverse proxy.
 
+mod transcode;
+
+pub use transcode::{
+    grpc_status_to_http, transcode, HttpBinding, HttpVerb, TranscodeError, Transcoder,
+    TranscoderBuilder,
+};
+
 use actix_web::{
     http::{header, StatusCode},
     web, HttpRequest, HttpResponse,

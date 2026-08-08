@@ -51,10 +51,18 @@ struct DynamicConfigState<T> {
 ///
 /// Backend adapters feed new serialized values through [`Self::update`]. Invalid
 /// updates are rejected without disturbing the last known-good snapshot.
-#[derive(Clone)]
 pub struct DynamicConfig<T> {
     format: ConfigFormat,
     state: Arc<DynamicConfigState<T>>,
+}
+
+impl<T> Clone for DynamicConfig<T> {
+    fn clone(&self) -> Self {
+        Self {
+            format: self.format,
+            state: Arc::clone(&self.state),
+        }
+    }
 }
 
 impl<T> DynamicConfig<T>

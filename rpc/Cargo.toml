@@ -5,13 +5,18 @@ edition = "2021"
 
 [features]
 default = []
-telemetry = ["dep:http", "rust-zero-core/telemetry"]
+telemetry = ["rust-zero-core/telemetry"]
 
 [dependencies]
-http = { version = "1", optional = true }
+bytes = "1"
+futures = "0.3"
+http = "1"
+http-body = "1"
+pin-project-lite = "0.2"
 prost = "0.13"
 rust-zero-core = { path = "../core" }
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 tonic = { version = "0.12", features = ["transport"] }
 tonic-health = "0.12"

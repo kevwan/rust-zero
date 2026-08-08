@@ -1,4 +1,4 @@
-use std::{error::Error, fmt, future::Future, pin::Pin, time::Duration};
+use std::{error::Error, fmt, future::Future, io, pin::Pin, time::Duration};
 
 use tokio::{
     sync::watch,
@@ -170,6 +170,39 @@ impl RunningServices {
         }
     }
 
+    /// Waits until SIGINT/SIGTERM requests shutdown or one service exits unexpectedly.
+    ///
+    /// Receiving a process signal asks every service to stop and then applies the group's
+    /// configured shutdown timeout while draining their tasks. On platforms without Unix
+    /// signals, Ctrl-C is used as the shutdown signal.
+    pub async fn wait_for_signal(self) -> Result<(), ServiceGroupError> {
+        self.wait_for_signal_from(wait_for_shutdown_signal()).await
+    }
+
+    async fn wait_for_signal_from<F>(self, signal: F) -> Result<(), ServiceGroupError>
+    where
+        F: Future<Output = io::Result<ShutdownSignal>>,
+    {
+        let handle = self.shutdown_handle();
+        let wait = self.wait();
+        tokio::pin!(signal);
+        tokio::pin!(wait);
+
+        tokio::select! {
+            result = &mut wait => result,
+            received = &mut signal => {
+                handle.shutdown();
+                match received {
+                    Ok(_) => wait.await,
+                    Err(error) => {
+                        let _ = wait.await;
+                        Err(ServiceGroupError::Signal(error.to_string()))
+                    }
+                }
+            }
+        }
+    }
+
     async fn drain(
         &mut self,
         initial_error: Option<ServiceGroupError>,
@@ -216,6 +249,7 @@ pub enum ServiceGroupError {
     ServicePanicked(String),
     ShutdownTimeout { remaining: usize },
     SignalClosed,
+    Signal(String),
 }
 
 impl fmt::Display for ServiceGroupError {
@@ -234,6 +268,12 @@ impl fmt::Display for ServiceGroupError {
                 "service shutdown timed out with {remaining} task(s) still running"
             ),
             Self::SignalClosed => formatter.write_str("service shutdown signal closed"),
+            Self::Signal(message) => {
+                write!(
+                    formatter,
+                    "failed to listen for a process shutdown signal: {message}"
+                )
+            }
         }
     }
 }
@@ -242,6 +282,35 @@ impl Error for ServiceGroupError {}
 
 fn join_error(error: JoinError) -> ServiceGroupError {
     ServiceGroupError::ServicePanicked(error.to_string())
+}
+
+/// A process signal that conventionally requests graceful shutdown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShutdownSignal {
+    Interrupt,
+    Terminate,
+}
+
+/// Waits for SIGINT or SIGTERM without terminating the process immediately.
+///
+/// Callers that do not use [`ServiceGroup`] can use this function to connect process lifecycle
+/// events to their own cancellation mechanism.
+#[cfg(unix)]
+pub async fn wait_for_shutdown_signal() -> io::Result<ShutdownSignal> {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let mut interrupt = signal(SignalKind::interrupt())?;
+    let mut terminate = signal(SignalKind::terminate())?;
+    tokio::select! {
+        _ = interrupt.recv() => Ok(ShutdownSignal::Interrupt),
+        _ = terminate.recv() => Ok(ShutdownSignal::Terminate),
+    }
+}
+
+#[cfg(not(unix))]
+pub async fn wait_for_shutdown_signal() -> io::Result<ShutdownSignal> {
+    tokio::signal::ctrl_c().await?;
+    Ok(ShutdownSignal::Interrupt)
 }
 
 #[cfg(test)]
@@ -295,6 +364,54 @@ mod tests {
             }
         );
         sibling_stopped.notified().await;
+    }
+
+    #[tokio::test]
+    async fn process_signal_gracefully_stops_all_services() {
+        let stopped = Arc::new(Notify::new());
+        let mut group = ServiceGroup::new().with_shutdown_timeout(Duration::from_secs(1));
+        group.add("worker", {
+            let stopped = Arc::clone(&stopped);
+            move |mut shutdown| async move {
+                shutdown.requested().await;
+                stopped.notify_one();
+                Ok::<_, io::Error>(())
+            }
+        });
+
+        group
+            .start()
+            .unwrap()
+            .wait_for_signal_from(async { Ok(ShutdownSignal::Terminate) })
+            .await
+            .unwrap();
+        stopped.notified().await;
+    }
+
+    #[tokio::test]
+    async fn signal_registration_failure_still_stops_services() {
+        let stopped = Arc::new(Notify::new());
+        let mut group = ServiceGroup::new().with_shutdown_timeout(Duration::from_secs(1));
+        group.add("worker", {
+            let stopped = Arc::clone(&stopped);
+            move |mut shutdown| async move {
+                shutdown.requested().await;
+                stopped.notify_one();
+                Ok::<_, io::Error>(())
+            }
+        });
+
+        let error = group
+            .start()
+            .unwrap()
+            .wait_for_signal_from(async { Err(io::Error::other("signals unavailable")) })
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error,
+            ServiceGroupError::Signal("signals unavailable".to_owned())
+        );
+        stopped.notified().await;
     }
 
     #[test]

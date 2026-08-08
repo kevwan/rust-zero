@@ -8,6 +8,7 @@ use std::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigFormat {
     Json,
+    Json5,
     Toml,
     Yaml,
 }
@@ -16,6 +17,7 @@ impl ConfigFormat {
     fn from_path(path: &Path) -> Result<Self, ConfigError> {
         match path.extension().and_then(|extension| extension.to_str()) {
             Some("json") => Ok(Self::Json),
+            Some("json5") => Ok(Self::Json5),
             Some("toml") => Ok(Self::Toml),
             Some("yaml" | "yml") => Ok(Self::Yaml),
             _ => Err(ConfigError::UnsupportedFormat(path.to_path_buf())),
@@ -33,7 +35,7 @@ pub fn load_config<T: DeserializeOwned>(path: impl AsRef<Path>) -> Result<T, Con
     parse_config(&contents, ConfigFormat::from_path(path)?)
 }
 
-/// Parses a typed configuration value from JSON, TOML, or YAML.
+/// Parses a typed configuration value from JSON, JSON5, TOML, or YAML.
 ///
 /// `${VAR}` and `$VAR` references are expanded from the process environment before parsing.
 pub fn parse_config<T: DeserializeOwned>(
@@ -44,6 +46,9 @@ pub fn parse_config<T: DeserializeOwned>(
     match format {
         ConfigFormat::Json => {
             serde_json::from_str(&contents).map_err(|error| ConfigError::Parse(error.to_string()))
+        }
+        ConfigFormat::Json5 => {
+            json5::from_str(&contents).map_err(|error| ConfigError::Parse(error.to_string()))
         }
         ConfigFormat::Toml => {
             toml::from_str(&contents).map_err(|error| ConfigError::Parse(error.to_string()))
@@ -148,7 +153,7 @@ impl fmt::Display for ConfigError {
             }
             Self::UnsupportedFormat(path) => write!(
                 formatter,
-                "unsupported configuration format for {}; use .json, .toml, .yaml, or .yml",
+                "unsupported configuration format for {}; use .json, .json5, .toml, .yaml, or .yml",
                 path.display()
             ),
             Self::InvalidEnvironmentReference => {
@@ -258,11 +263,33 @@ mod tests {
     }
 
     #[test]
+    fn parses_json5_comments_trailing_commas_and_unquoted_keys() {
+        let credentials: Credentials = parse_config(
+            r#"{
+                // JSON5 configuration can remain friendly to humans.
+                username: 'service',
+                password: 'secret',
+            }"#,
+            ConfigFormat::Json5,
+        )
+        .unwrap();
+
+        assert_eq!(
+            credentials,
+            Credentials {
+                username: "service".to_owned(),
+                password: "secret".to_owned(),
+            }
+        );
+    }
+
+    #[test]
     fn loads_supported_file_extensions() {
         let directory = env::temp_dir();
         let process = std::process::id();
         let fixtures = [
             ("json", r#"{"username":"service","password":"secret"}"#),
+            ("json5", "{username: 'service', password: 'secret',}"),
             ("toml", "username = \"service\"\npassword = \"secret\""),
             ("yaml", "username: service\npassword: secret"),
             ("yml", "username: service\npassword: secret"),
@@ -296,7 +323,9 @@ mod tests {
         let format_error = load_config::<Credentials>(&unsupported).unwrap_err();
         fs::remove_file(unsupported).unwrap();
         assert!(matches!(format_error, ConfigError::UnsupportedFormat(_)));
-        assert!(format_error.to_string().contains("use .json, .toml, .yaml"));
+        assert!(format_error
+            .to_string()
+            .contains("use .json, .json5, .toml, .yaml"));
         assert!(format_error.source().is_none());
 
         let reference_error =

@@ -17,6 +17,10 @@ impl BearerToken {
         let authorization = format!("Bearer {token}").parse()?;
         Ok(Self { authorization })
     }
+
+    pub(crate) fn authorization(&self) -> MetadataValue<Ascii> {
+        self.authorization.clone()
+    }
 }
 
 impl Interceptor for BearerToken {

@@ -130,7 +130,7 @@ where
     }
 }
 
-fn bearer_token(value: &str) -> Option<&str> {
+pub(crate) fn bearer_token(value: &str) -> Option<&str> {
     let (scheme, token) = value.split_once(char::is_whitespace)?;
     let token = token.trim();
     (scheme.eq_ignore_ascii_case("bearer")
@@ -185,7 +185,11 @@ where
     Ok(format!("{signing_input}.{signature}"))
 }
 
-fn decode_hs256<T>(token: &str, secrets: &[Arc<[u8]>], leeway_seconds: u64) -> Result<T, JwtError>
+pub(crate) fn decode_hs256<T>(
+    token: &str,
+    secrets: &[Arc<[u8]>],
+    leeway_seconds: u64,
+) -> Result<T, JwtError>
 where
     T: DeserializeOwned,
 {
@@ -308,7 +312,7 @@ where
 }
 
 #[derive(Debug, Clone)]
-struct JwtClaims<T>(T);
+pub(crate) struct JwtClaims<T>(pub(crate) T);
 
 impl<S, B, T> Transform<S, ServiceRequest> for JwtAuth<T>
 where

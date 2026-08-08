@@ -1,0 +1,19 @@
+syntax = "proto3";
+
+package rust_zero.gateway_test;
+
+service Greeter {
+  rpc Get(GetRequest) returns (GetResponse);
+  rpc Watch(GetRequest) returns (stream GetResponse);
+  rpc Fail(GetRequest) returns (GetResponse);
+}
+
+message GetRequest {
+  int32 id = 1;
+  string view = 2;
+}
+
+message GetResponse {
+  int32 id = 1;
+  string message = 2;
+}

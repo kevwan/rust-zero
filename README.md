@@ -2,16 +2,36 @@
 
 A Rust web and RPC framework inspired by [go-zero](https://github.com/zeromicro/go-zero).
 
-See [FEATURE_PARITY.md](FEATURE_PARITY.md) for runtime coverage against go-zero v1.10.1.
+See [FEATURE_PARITY.md](FEATURE_PARITY.md) for runtime coverage against go-zero v1.10.3 and
+[BACKLOG.md](BACKLOG.md) for the prioritized remaining work.
 
 ## Available features
 
 - Actix Web middleware for structured request logging, request identity propagation, CORS, bearer
   authentication, panic recovery, browser security headers, timeout control, overload shedding,
   and token-bucket rate limiting.
+- A validated, deserializable REST server configuration that binds Actix and installs the standard
+  logging, recovery, identity, tracing, metrics, security, timeout, request-size, and shedding stack.
+- Per-server REST response policies with request-aware success/error envelopes, typed stable
+  application errors, gRPC-to-HTTP status translation, safe serialization failure handling, and
+  anti-buffered chunk streaming.
+- Declarative REST route groups with inherited and per-route JWT, timeout, body-size, priority, and
+  SSE policies, plus signal-driven serving that gracefully drains in-flight requests.
 - Tonic-based gRPC client and server builders with deadline, connection concurrency, and stream
-  limits plus gRPC health reporting, bearer-auth interceptors, and registry-backed dynamic endpoint
-  balancing.
+  limits plus gRPC health reporting, bearer-auth interceptors, and backend-neutral dynamic endpoint
+  balancing for in-memory, etcd, or Kubernetes discovery, protocol-aware client circuit breaking,
+  adaptive server load shedding, and reusable
+  client/server layers for cardinality-bounded request, latency, in-flight, final-status, error,
+  and cancellation metrics across unary and streaming calls.
+- A generated-service-independent gRPC server layer that installs bearer authentication, W3C
+  trace extraction, adaptive shedding, panic-to-`Internal` recovery, and transport metrics once
+  for every generated service on a Tonic server.
+- A generated-client-friendly gRPC service stack that installs bearer credentials, W3C trace
+  propagation, default deadlines, transport metrics, and trailer-aware circuit breaking around a
+  direct or discovery-balanced channel.
+- Descriptor-driven HTTP-to-gRPC transcoding with compiled descriptor sets or live gRPC server
+  reflection, explicit and `google.api.http` bindings, protobuf JSON, metadata forwarding,
+  canonical status mapping, and newline-delimited server streaming.
 - Optional OpenTelemetry tracing with parent-based sampling, full REST and gRPC client/server
   spans, and batched OTLP export over gRPC or HTTP.
 - A Tokio-based MapReduce primitive with bounded parallelism.
@@ -24,14 +44,39 @@ See [FEATURE_PARITY.md](FEATURE_PARITY.md) for runtime coverage against go-zero 
   registry for dynamic endpoint publication and subscriptions, Bloom filters, rolling statistics,
   timed batch execution, fail-fast service groups with graceful shutdown, and a standalone
   structured logger with trace context, sensitive-field masking, sampling, and file rotation.
+- Signal-aware service supervision that turns SIGINT/SIGTERM into cooperative cancellation and
+  enforces a bounded graceful-shutdown window across all background and transport services.
+- Feature-gated etcd coordination with typed last-known-good configuration watches, renewable
+  service leases, and revision-safe endpoint subscriptions.
+- Feature-gated Kubernetes EndpointSlice discovery with readiness filtering, atomic relists,
+  resource-version recovery, stable snapshots, and IPv6-safe endpoint URIs.
 - A resilient named REST client with request deadlines, circuit breaking, response-size limits,
-  JSON helpers, and W3C trace propagation, plus validated JSON/query extractors for inbound APIs.
+  JSON helpers, W3C trace propagation, and optional request/duration/in-flight metrics, plus
+  validated JSON, query, path, and form extractors for
+  inbound APIs, including application-typed headers, combined path/query/header/JSON parsing, and
+  stable machine-readable extraction errors. Multipart forms stream uploads to automatically
+  cleaned temporary files with independently configurable text-field, file, and aggregate limits.
+- EventSource-compatible server-sent event responses with multiline events, event IDs, retry hints,
+  heartbeat comments, and proxy anti-buffering headers.
+- Non-overlapping periodic background execution with surfaced job failures and a bounded shutdown
+  deadline, alongside count- and byte-batched execution, coalesced delayed work, and
+  threshold-based execution suppression.
+- Supervised in-process queues with configurable worker pools, pause/resume, bounded shutdown,
+  lifecycle and failure events, Prometheus processing metrics, round-robin failover pushing, and
+  fan-out delivery.
 - An opt-in named duration profiler and an internal Actix dev server exposing route discovery,
   health, Prometheus metrics, profiling reports, and process/runtime diagnostics.
 - Feature-gated external stores: an async standalone/clustered Redis adapter with strings, hashes,
   lists, sets, sorted sets, JSON values, TTLs, counters, ownership-safe distributed locks, and
-  coalesced cache-aside reads; and typed SQLx pools for SQLite, PostgreSQL, and MySQL with
-  standardized lifecycle, health checks, and transactions.
+  consumer-group cursor updates, plus coalesced cache-aside reads; and typed SQLx pools for SQLite,
+  PostgreSQL, and MySQL with
+  standardized lifecycle, health checks, transactions, and bounded cache-aside record loading
+  with configurable negative caching, bounded TTL jitter, statistics, and race-safe mutation
+  invalidation; plus typed MongoDB collections, health checks, sessions, transactions, and the
+  same configurable cached-record expiry policy.
+
+Configuration files may use JSON, JSON5, TOML, YAML, or YML. JSON5 supports comments, trailing
+commas, single-quoted strings, and unquoted object keys while retaining environment expansion.
 
 ## Core runtime
 
@@ -129,6 +174,25 @@ let server = tonic::transport::Server::builder()
 let traced_channel = RpcTelemetryLayer::client().wrap(channel);
 ```
 
+Unary gRPC calls can use transport-aware resilience without counting application statuses such as
+`InvalidArgument` or `NotFound` as dependency failures:
+
+```rust
+use rpc::{RpcCircuitBreaker, RpcLoadShedder};
+use rust_zero_core::{CircuitBreakerConfig, LoadShedderConfig};
+use std::time::Duration;
+
+let breaker = RpcCircuitBreaker::new(CircuitBreakerConfig::new(5, Duration::from_secs(30)));
+let response = breaker.call(|| client.echo(request)).await?;
+
+let shedder = RpcLoadShedder::new(LoadShedderConfig::new(
+    1_024,
+    Duration::from_millis(100),
+));
+let response = shedder.call(|| service.echo(request)).await?;
+# Ok::<(), tonic::Status>(())
+```
+
 The REST middleware is composable and returns standard HTTP responses when protection activates:
 
 | Middleware | Response |
@@ -163,7 +227,79 @@ HttpServer::new(move || {
 ```
 
 Register `HttpMetrics` in a shared `Metrics` registry to emit Prometheus-compatible request
-counts and latency histograms labeled by method, route, and response status.
+counts, latency histograms, and in-flight gauges labeled by method, route, and response status.
+The standard REST server also counts timeout, concurrency-shed, and rate-limit rejections. Attach a
+shared `HttpClientMetrics` instance with `HttpClient::with_metrics` to record bounded service,
+method, status/error, latency, and in-flight client metrics without labeling raw URLs.
+
+For the standard production stack, load `RestServerConfig` and provide only application routes:
+
+```rust
+use actix_web::{web, HttpResponse};
+use rest::{RestServer, RestServerConfig};
+use rust_zero_core::load_config;
+
+let config: RestServerConfig = load_config("etc/users.toml")?;
+let server = RestServer::new(config)?.run(|routes| {
+    routes.route("/healthz", web::get().to(HttpResponse::Ok));
+})?;
+server.await?;
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+Install a response policy on the standard server and extract it as Actix application data from
+handlers. Mappers receive the current request, so envelopes can include request identity without
+global mutable hooks:
+
+```rust
+use actix_web::{web, HttpRequest};
+use rest::{ApiError, ResponsePolicy, RestServer};
+use serde_json::json;
+
+let policy = ResponsePolicy::new().with_success_mapper(|request, data| {
+    json!({
+        "request_id": request.headers().get("x-request-id").and_then(|v| v.to_str().ok()),
+        "data": data,
+    })
+});
+let server = RestServer::new(Default::default())?.with_response_policy(policy);
+
+async fn handler(request: HttpRequest, policy: web::Data<ResponsePolicy>) -> actix_web::HttpResponse {
+    policy.respond(&request, Ok::<_, ApiError>(json!({"ready": true})))
+}
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+Route policies are matched by HTTP method and the registered Actix route pattern. Group settings
+are inherited, while a route can override them or set `public = true` to opt out of group JWT:
+
+```toml
+[[route_groups]]
+prefix = "/api"
+timeout_ms = 2000
+max_body_bytes = 1048576
+
+[route_groups.jwt]
+secret = "${API_JWT_SECRET}"
+leeway_seconds = 30
+
+[[route_groups.routes]]
+method = "GET"
+path = "/users/{id}"
+
+[[route_groups.routes]]
+method = "GET"
+path = "/events"
+public = true
+sse = true
+priority = true
+```
+
+Use `serve_until` (or `serve_on_until` with a pre-bound listener) to connect an application signal
+future to graceful Actix draining.
+
+REST and RPC duration fields in serialized transport configs use millisecond-suffixed names such
+as `request_timeout_ms`, `shutdown_timeout_ms`, and `connect_timeout_ms`.
 
 ## Internal diagnostics
 
@@ -189,14 +325,83 @@ actix_web::rt::spawn(server);
 # Ok::<(), std::io::Error>(())
 ```
 
+Long-running services can be supervised as one fail-fast group. `wait_for_signal` listens for
+SIGINT/SIGTERM, broadcasts cancellation, and waits up to the configured deadline for every task.
+
+```rust
+use rust_zero_core::ServiceGroup;
+use std::{io, time::Duration};
+
+let mut services = ServiceGroup::new().with_shutdown_timeout(Duration::from_secs(30));
+services.add("worker", |mut shutdown| async move {
+    shutdown.requested().await;
+    Ok::<_, io::Error>(())
+});
+services.start()?.wait_for_signal().await?;
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+## Etcd configuration and discovery
+
+Enable the `etcd` feature on `rust-zero-core`. Configuration watches start from the revision of
+their initial read, so no update is lost between loading and subscribing. Published endpoints are
+automatically withdrawn when their renewable lease is revoked or expires.
+
+```rust
+use rust_zero_core::{EtcdClient, EtcdConfig};
+use std::time::Duration;
+
+let etcd = EtcdClient::connect(EtcdConfig::new(["http://127.0.0.1:2379"])).await?;
+let mut users = etcd.subscribe("users").await?;
+let lease = etcd
+    .publish(
+        "users",
+        "users-1",
+        "http://127.0.0.1:8080",
+        Duration::from_secs(10),
+    )
+    .await?;
+
+let endpoints = users.changed().await?;
+lease.revoke().await?;
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+## Kubernetes discovery
+
+Enable the `kubernetes` feature on `rust-zero-core`. The adapter uses the local kubeconfig or an
+in-cluster service account and needs `list` and `watch` RBAC permissions for
+`discovery.k8s.io/v1` EndpointSlices. It atomically replaces snapshots after relists and excludes
+unready or terminating endpoints.
+
+```rust
+use rust_zero_core::{KubernetesDiscovery, KubernetesDiscoveryConfig};
+
+let discovery = KubernetesDiscovery::infer(
+    KubernetesDiscoveryConfig::new("production")
+        .with_port_name("grpc")
+        .with_scheme("http"),
+)
+.await?;
+let mut users = discovery.subscribe("users").await?;
+
+for endpoint in users.endpoints() {
+    println!("ready user service: {endpoint}");
+}
+let changed_endpoints = users.changed().await?;
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
 ## External stores
 
-Enable `stores-redis`, `stores-sql`, or the combined `stores` feature on `rust-zero-core`.
+Enable `stores-redis`, `stores-sql`, `stores-mongo`, or the combined `stores` feature on
+`rust-zero-core`.
 Applications retain direct access to SQLx's typed pools and compile-time checked queries.
 
 ```rust
 use rust_zero_core::{
-    RedisJsonCache, RedisStore, RedisStoreConfig, SqlStoreConfig, SqliteStore,
+    CachedSqlStore, MongoCacheConfig, MongoStore, MongoStoreConfig, RedisJsonCache, RedisStore,
+    RedisStoreConfig, SqlCacheConfig, SqlStoreConfig, SqliteStore,
 };
 use std::time::Duration;
 
@@ -228,6 +433,36 @@ let user = users
 
 let sql = SqliteStore::connect_sqlite(SqlStoreConfig::new("sqlite://service.db")).await?;
 let mut transaction = sql.begin().await?;
+
+let users = CachedSqlStore::<sqlx::Sqlite, i64, String, sqlx::Error>::new(
+    sql,
+    SqlCacheConfig::new(10_000, Duration::from_secs(60)),
+);
+let name = users
+    .find(42, |pool| async move {
+        sqlx::query_scalar("SELECT name FROM users WHERE id = ?")
+            .bind(42_i64)
+            .fetch_optional(&pool)
+            .await
+    })
+    .await?;
+
+let mongo = MongoStore::connect(MongoStoreConfig::new(
+    "mongodb://127.0.0.1:27017",
+    "service",
+))
+.await?;
+let profiles = mongo.cached_collection::<i64, mongodb::bson::Document>(
+    "profiles",
+    MongoCacheConfig::new(10_000, Duration::from_secs(60)),
+);
+let profile = profiles
+    .find(42, |collection| async move {
+        collection
+            .find_one(mongodb::bson::doc! { "user_id": 42_i64 })
+            .await
+    })
+    .await?;
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 

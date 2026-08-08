@@ -1,0 +1,592 @@
+//! Generated-service-independent client and server assembly.
+
+use crate::{BearerToken, RpcMetrics, RpcMetricsLayer};
+use futures::FutureExt;
+use http::{Request, Response};
+use http_body::{Body, Frame};
+use pin_project_lite::pin_project;
+use rust_zero_core::{
+    AdaptiveShedder, CircuitBreaker, CircuitBreakerConfig, CircuitBreakerPermit, LoadShedderConfig,
+    TraceContext, TraceFlags,
+};
+use std::{
+    future::Future,
+    panic::AssertUnwindSafe,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+    time::Duration,
+};
+use tonic::{body::BoxBody, Code, Status};
+use tower::{Layer, Service};
+
+type Validator<T> = dyn Fn(&str) -> Option<T> + Send + Sync;
+
+/// Creates the common server layer once and applies it to every generated Tonic service.
+///
+/// The layer installs authentication, W3C trace extraction, panic recovery, adaptive admission
+/// control, and complete unary/streaming metrics. Add it to [`tonic::transport::Server`] before
+/// adding generated services; those services need no per-service interceptors.
+pub struct RpcServerStackBuilder<T = ()> {
+    metrics: RpcMetrics,
+    auth: Option<Arc<Validator<T>>>,
+    shedder: Option<AdaptiveShedder>,
+}
+
+impl RpcServerStackBuilder<()> {
+    pub fn new(metrics: RpcMetrics) -> Self {
+        Self {
+            metrics,
+            auth: None,
+            shedder: None,
+        }
+    }
+}
+
+impl<T> RpcServerStackBuilder<T>
+where
+    T: Clone + Send + Sync + 'static,
+{
+    pub fn with_bearer_auth<U>(
+        self,
+        validator: impl Fn(&str) -> Option<U> + Send + Sync + 'static,
+    ) -> RpcServerStackBuilder<U>
+    where
+        U: Clone + Send + Sync + 'static,
+    {
+        RpcServerStackBuilder {
+            metrics: self.metrics,
+            auth: Some(Arc::new(validator)),
+            shedder: self.shedder,
+        }
+    }
+
+    pub fn with_load_shedder(mut self, config: LoadShedderConfig) -> Self {
+        self.shedder = Some(AdaptiveShedder::new(config));
+        self
+    }
+
+    pub fn build(self) -> RpcServerStack<T> {
+        RpcServerStack {
+            metrics: RpcMetricsLayer::new(self.metrics),
+            auth: self.auth,
+            shedder: self.shedder,
+        }
+    }
+}
+
+pub struct RpcServerStack<T> {
+    metrics: RpcMetricsLayer,
+    auth: Option<Arc<Validator<T>>>,
+    shedder: Option<AdaptiveShedder>,
+}
+
+impl<T> Clone for RpcServerStack<T> {
+    fn clone(&self) -> Self {
+        Self {
+            metrics: self.metrics.clone(),
+            auth: self.auth.clone(),
+            shedder: self.shedder.clone(),
+        }
+    }
+}
+
+impl<S, T> Layer<S> for RpcServerStack<T>
+where
+    T: Clone + Send + Sync + 'static,
+{
+    type Service = RpcServerStackService<crate::metrics::RpcMetricsService<S>, T>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        RpcServerStackService {
+            inner: self.metrics.layer(inner),
+            auth: self.auth.clone(),
+            shedder: self.shedder.clone(),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct RpcServerStackService<S, T> {
+    inner: S,
+    auth: Option<Arc<Validator<T>>>,
+    shedder: Option<AdaptiveShedder>,
+}
+
+impl<S, T, RequestBody, ResponseBody> Service<Request<RequestBody>> for RpcServerStackService<S, T>
+where
+    S: Service<Request<RequestBody>, Response = Response<ResponseBody>> + Send + 'static,
+    S::Future: Send + 'static,
+    S::Error: Send + 'static,
+    RequestBody: Send + 'static,
+    ResponseBody: Body<Data = bytes::Bytes> + Send + 'static,
+    ResponseBody::Error: Into<tonic::codegen::StdError>,
+    T: Clone + Send + Sync + 'static,
+{
+    type Response = Response<BoxBody>;
+    type Error = S::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, context: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(context)
+    }
+
+    fn call(&mut self, mut request: Request<RequestBody>) -> Self::Future {
+        if let Some(auth) = &self.auth {
+            let identity = request
+                .headers()
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                .and_then(bearer_token)
+                .and_then(|token| auth(token));
+            let Some(identity) = identity else {
+                return Box::pin(async {
+                    Ok(
+                        Status::unauthenticated("valid bearer credentials are required")
+                            .into_http(),
+                    )
+                });
+            };
+            request.extensions_mut().insert(identity);
+        }
+
+        let trace = request
+            .headers()
+            .get("traceparent")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| TraceContext::parse(value).ok())
+            .map(|parent| parent.child())
+            .unwrap_or_else(|| TraceContext::root(TraceFlags::SAMPLED));
+        request.extensions_mut().insert(trace);
+
+        let permit = match &self.shedder {
+            Some(shedder) => match shedder.try_acquire() {
+                Some(permit) => Some(permit),
+                None => {
+                    return Box::pin(async {
+                        Ok(Status::resource_exhausted("gRPC server is overloaded").into_http())
+                    });
+                }
+            },
+            None => None,
+        };
+
+        let future = self.inner.call(request);
+        Box::pin(async move {
+            let result = AssertUnwindSafe(future).catch_unwind().await;
+            drop(permit);
+            match result {
+                Ok(Ok(response)) => {
+                    let (parts, body) = response.into_parts();
+                    Ok(Response::from_parts(parts, tonic::body::boxed(body)))
+                }
+                Ok(Err(error)) => Err(error),
+                Err(_) => Ok(Status::internal("gRPC handler panicked").into_http()),
+            }
+        })
+    }
+}
+
+fn bearer_token(value: &str) -> Option<&str> {
+    let (scheme, token) = value.split_once(char::is_whitespace)?;
+    let token = token.trim();
+    (scheme.eq_ignore_ascii_case("bearer")
+        && !token.is_empty()
+        && !token.contains(char::is_whitespace))
+    .then_some(token)
+}
+
+/// Builds one transport service that can be passed directly to any generated Tonic client.
+///
+/// The stack installs bearer credentials, W3C trace propagation, bounded metrics, a default
+/// deadline, and protocol-aware circuit breaking. Final streaming statuses are observed from
+/// trailers before circuit health is recorded.
+pub struct RpcClientStackBuilder {
+    metrics: RpcMetrics,
+    token: Option<BearerToken>,
+    default_timeout: Option<Duration>,
+    breaker: Option<Arc<CircuitBreaker>>,
+}
+
+impl RpcClientStackBuilder {
+    pub fn new(metrics: RpcMetrics) -> Self {
+        Self {
+            metrics,
+            token: None,
+            default_timeout: None,
+            breaker: None,
+        }
+    }
+
+    pub fn with_bearer_token(mut self, token: BearerToken) -> Self {
+        self.token = Some(token);
+        self
+    }
+
+    pub fn with_default_timeout(mut self, timeout: Duration) -> Self {
+        assert!(!timeout.is_zero(), "RPC timeout must be greater than zero");
+        self.default_timeout = Some(timeout);
+        self
+    }
+
+    pub fn with_circuit_breaker(mut self, config: CircuitBreakerConfig) -> Self {
+        self.breaker = Some(Arc::new(CircuitBreaker::new(config)));
+        self
+    }
+
+    pub fn build(self) -> RpcClientStack {
+        RpcClientStack {
+            metrics: RpcMetricsLayer::new(self.metrics),
+            token: self.token,
+            default_timeout: self.default_timeout,
+            breaker: self.breaker,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct RpcClientStack {
+    metrics: RpcMetricsLayer,
+    token: Option<BearerToken>,
+    default_timeout: Option<Duration>,
+    breaker: Option<Arc<CircuitBreaker>>,
+}
+
+impl<S> Layer<S> for RpcClientStack {
+    type Service = RpcClientStackService<crate::metrics::RpcMetricsService<S>>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        RpcClientStackService {
+            inner: self.metrics.layer(inner),
+            token: self.token.clone(),
+            default_timeout: self.default_timeout,
+            breaker: self.breaker.clone(),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct RpcClientStackService<S> {
+    inner: S,
+    token: Option<BearerToken>,
+    default_timeout: Option<Duration>,
+    breaker: Option<Arc<CircuitBreaker>>,
+}
+
+impl<S, RequestBody, ResponseBody> Service<Request<RequestBody>> for RpcClientStackService<S>
+where
+    S: Service<Request<RequestBody>, Response = Response<ResponseBody>> + Send + 'static,
+    S::Future: Send + 'static,
+    S::Error: Send + 'static,
+    RequestBody: Send + 'static,
+    ResponseBody: Body<Data = bytes::Bytes> + Send + 'static,
+    ResponseBody::Error: Into<tonic::codegen::StdError>,
+{
+    type Response = Response<BoxBody>;
+    type Error = S::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, context: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(context)
+    }
+
+    fn call(&mut self, mut request: Request<RequestBody>) -> Self::Future {
+        if let Some(token) = &self.token {
+            request.headers_mut().insert(
+                "authorization",
+                http::HeaderValue::from_bytes(token.authorization().as_encoded_bytes())
+                    .expect("ASCII gRPC metadata is a valid HTTP header"),
+            );
+        }
+
+        let parent = request
+            .extensions()
+            .get::<TraceContext>()
+            .cloned()
+            .or_else(|| {
+                request
+                    .headers()
+                    .get("traceparent")
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| TraceContext::parse(value).ok())
+            });
+        let trace = parent
+            .as_ref()
+            .map(TraceContext::child)
+            .unwrap_or_else(|| TraceContext::root(TraceFlags::SAMPLED));
+        request.headers_mut().insert(
+            "traceparent",
+            trace
+                .traceparent()
+                .parse()
+                .expect("generated traceparent is a valid HTTP header"),
+        );
+        request.extensions_mut().insert(trace);
+
+        if !request.headers().contains_key("grpc-timeout") {
+            if let Some(timeout) = self.default_timeout {
+                request.headers_mut().insert(
+                    "grpc-timeout",
+                    grpc_timeout(timeout)
+                        .parse()
+                        .expect("formatted gRPC timeout is a valid HTTP header"),
+                );
+            }
+        }
+
+        let permit = match &self.breaker {
+            Some(breaker) => match breaker.acquire() {
+                Some(permit) => Some(permit),
+                None => {
+                    return Box::pin(async {
+                        Ok(Status::unavailable("gRPC dependency circuit is open").into_http())
+                    });
+                }
+            },
+            None => None,
+        };
+
+        let future = self.inner.call(request);
+        Box::pin(async move {
+            match future.await {
+                Ok(response) => {
+                    let header_code = grpc_status(response.headers());
+                    let (parts, body) = response.into_parts();
+                    let mut wrapped = RpcCircuitBody {
+                        inner: body,
+                        permit,
+                    };
+                    if let Some(code) = header_code {
+                        wrapped.finish(status_is_acceptable(code));
+                    } else if !parts.status.is_success() {
+                        wrapped.finish(false);
+                    }
+                    Ok(Response::from_parts(parts, tonic::body::boxed(wrapped)))
+                }
+                Err(error) => {
+                    if let Some(permit) = permit {
+                        permit.finish(false);
+                    }
+                    Err(error)
+                }
+            }
+        })
+    }
+}
+
+pin_project! {
+    struct RpcCircuitBody<B> {
+        #[pin]
+        inner: B,
+        permit: Option<CircuitBreakerPermit>,
+    }
+}
+
+impl<B> RpcCircuitBody<B> {
+    fn finish(&mut self, acceptable: bool) {
+        if let Some(permit) = self.permit.take() {
+            permit.finish(acceptable);
+        }
+    }
+}
+
+impl<B> Body for RpcCircuitBody<B>
+where
+    B: Body,
+{
+    type Data = B::Data;
+    type Error = B::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let mut this = self.project();
+        match this.inner.as_mut().poll_frame(context) {
+            Poll::Ready(Some(Ok(frame))) => {
+                if let Some(code) = frame.trailers_ref().and_then(grpc_status) {
+                    if let Some(permit) = this.permit.take() {
+                        permit.finish(status_is_acceptable(code));
+                    }
+                }
+                Poll::Ready(Some(Ok(frame)))
+            }
+            Poll::Ready(Some(Err(error))) => {
+                if let Some(permit) = this.permit.take() {
+                    permit.finish(false);
+                }
+                Poll::Ready(Some(Err(error)))
+            }
+            Poll::Ready(None) => {
+                if let Some(permit) = this.permit.take() {
+                    permit.finish(true);
+                }
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+fn grpc_status(headers: &http::HeaderMap) -> Option<Code> {
+    headers
+        .get("grpc-status")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<i32>().ok())
+        .map(Code::from_i32)
+}
+
+fn status_is_acceptable(code: Code) -> bool {
+    !matches!(
+        code,
+        Code::DeadlineExceeded
+            | Code::Internal
+            | Code::Unavailable
+            | Code::DataLoss
+            | Code::Unimplemented
+            | Code::ResourceExhausted
+    )
+}
+
+fn grpc_timeout(timeout: Duration) -> String {
+    let nanos = timeout.as_nanos().max(1);
+    for (unit, divisor) in [
+        ('n', 1_u128),
+        ('u', 1_000),
+        ('m', 1_000_000),
+        ('S', 1_000_000_000),
+        ('M', 60_000_000_000),
+        ('H', 3_600_000_000_000),
+    ] {
+        let value = nanos.saturating_add(divisor - 1) / divisor;
+        if value <= 99_999_999 {
+            return format!("{value}{unit}");
+        }
+    }
+    "99999999H".to_owned()
+}
+
+#[cfg(test)]
+mod client_tests {
+    use super::*;
+    use crate::RpcMetricMode;
+    use std::{
+        convert::Infallible,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+    use tower::ServiceExt;
+
+    #[derive(Clone)]
+    struct FailingTransport {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl Service<Request<()>> for FailingTransport {
+        type Response = Response<TrailerBody>;
+        type Error = Infallible;
+        type Future = std::future::Ready<Result<Self::Response, Self::Error>>;
+
+        fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, request: Request<()>) -> Self::Future {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            assert_eq!(
+                request
+                    .headers()
+                    .get("authorization")
+                    .and_then(|value| value.to_str().ok()),
+                Some("Bearer secret")
+            );
+            assert_eq!(
+                request
+                    .headers()
+                    .get("grpc-timeout")
+                    .and_then(|value| value.to_str().ok()),
+                Some("250000u")
+            );
+            assert!(request.headers().contains_key("traceparent"));
+            std::future::ready(Ok(Response::new(TrailerBody(true))))
+        }
+    }
+
+    struct TrailerBody(bool);
+
+    impl Body for TrailerBody {
+        type Data = bytes::Bytes;
+        type Error = Status;
+
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            if !self.0 {
+                return Poll::Ready(None);
+            }
+            self.0 = false;
+            let mut trailers = http::HeaderMap::new();
+            trailers.insert("grpc-status", "14".parse().unwrap());
+            Poll::Ready(Some(Ok(Frame::trailers(trailers))))
+        }
+    }
+
+    #[tokio::test]
+    async fn client_stack_composes_headers_metrics_deadline_and_trailer_breaking() {
+        let registry = rust_zero_core::Metrics::new();
+        let metrics = RpcMetrics::new(
+            &registry,
+            "stacked",
+            RpcMetricMode::Client,
+            ["/echo.Echo/Call"],
+        )
+        .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut service = RpcClientStackBuilder::new(metrics)
+            .with_bearer_token(BearerToken::new("secret").unwrap())
+            .with_default_timeout(Duration::from_millis(250))
+            .with_circuit_breaker(CircuitBreakerConfig::new(1, Duration::from_secs(60)))
+            .build()
+            .layer(FailingTransport {
+                calls: Arc::clone(&calls),
+            });
+
+        let response = service
+            .ready()
+            .await
+            .unwrap()
+            .call(Request::builder().uri("/echo.Echo/Call").body(()).unwrap())
+            .await
+            .unwrap();
+        let mut body = Box::pin(response.into_body());
+        std::future::poll_fn(|context| body.as_mut().poll_frame(context)).await;
+
+        let rejected = service
+            .ready()
+            .await
+            .unwrap()
+            .call(Request::builder().uri("/echo.Echo/Call").body(()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(rejected.headers().get("grpc-status").unwrap(), "14");
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert!(registry.render().contains(
+            "stacked_rpc_client_requests_total{method=\"/echo.Echo/Call\",code=\"14\"} 1"
+        ));
+    }
+
+    #[test]
+    fn grpc_deadlines_use_the_smallest_exact_unit() {
+        assert_eq!(grpc_timeout(Duration::from_nanos(7)), "7n");
+        assert_eq!(grpc_timeout(Duration::from_millis(250)), "250000u");
+        assert_eq!(grpc_timeout(Duration::from_secs(100)), "100000m");
+    }
+}
