@@ -1,10 +1,23 @@
 [workspace]
 resolver = "2"
 members = [
+    "benchmarks",
     "core",
     "gateway",
+    "mcp",
     "rest",
     "demo",
     "mapreduce",
     "rpc",
 ]
+
+[workspace.package]
+version = "0.1.0-alpha.1"
+edition = "2021"
+rust-version = "1.89"
+license = "MIT"
+repository = "https://github.com/kevwan/rust-zero"
+homepage = "https://github.com/kevwan/rust-zero"
+readme = "README.md"
+keywords = ["web", "grpc", "microservices", "middleware", "runtime"]
+categories = ["web-programming", "network-programming", "asynchronous"]

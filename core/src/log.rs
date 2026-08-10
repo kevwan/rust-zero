@@ -6,11 +6,13 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
+        mpsc::{self, TrySendError},
         Arc, Mutex,
     },
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use flate2::{write::GzEncoder, Compression};
 use serde::Serialize;
 use serde_json::{Map, Value};
 
@@ -77,6 +79,11 @@ pub struct LogConfig {
     pub encoding: LogEncoding,
     pub target: LogTarget,
     pub max_content_length: Option<usize>,
+    /// Number of UTC daily log files to retain, including the active day.
+    /// `None` retains daily files indefinitely. Size rotation continues to use `max_backups`.
+    pub retention_days: Option<u64>,
+    /// Compresses files after they leave the active daily or size-rotated position.
+    pub compress_rotated: bool,
 }
 
 impl LogConfig {
@@ -87,6 +94,8 @@ impl LogConfig {
             encoding: LogEncoding::Json,
             target: LogTarget::Console,
             max_content_length: None,
+            retention_days: None,
+            compress_rotated: false,
         }
     }
 
@@ -104,6 +113,8 @@ impl LogConfig {
                 rotation,
             },
             max_content_length: None,
+            retention_days: None,
+            compress_rotated: false,
         }
     }
 
@@ -123,6 +134,20 @@ impl LogConfig {
             "maximum content length must be greater than zero"
         );
         self.max_content_length = Some(length);
+        self
+    }
+
+    /// Retains only the most recent `days` UTC daily files. This setting has no effect on
+    /// console or size-rotated targets.
+    pub fn with_retention_days(mut self, days: u64) -> Self {
+        assert!(days > 0, "log retention must be at least one day");
+        self.retention_days = Some(days);
+        self
+    }
+
+    /// Enables gzip compression after a file is rotated out of the active position.
+    pub fn with_rotated_compression(mut self, enabled: bool) -> Self {
+        self.compress_rotated = enabled;
         self
     }
 }
@@ -220,6 +245,7 @@ impl LogSampler {
 pub struct Logger {
     config: Arc<LogConfig>,
     sink: Arc<Mutex<Sink>>,
+    dropped: Arc<AtomicU64>,
 }
 
 impl fmt::Debug for Logger {
@@ -243,12 +269,38 @@ impl Logger {
                 directory,
                 &config.service_name,
                 *rotation,
+                config.retention_days,
+                config.compress_rotated,
             )?),
         };
         Ok(Self {
             config: Arc::new(config),
             sink: Arc::new(Mutex::new(sink)),
+            dropped: Arc::new(AtomicU64::new(0)),
         })
+    }
+
+    /// Creates a logger whose bounded writer thread keeps file or console I/O off callers.
+    ///
+    /// When the queue is full, records are discarded instead of blocking application work and
+    /// are reflected by [`Logger::dropped_records`].
+    pub fn new_non_blocking(config: LogConfig, capacity: usize) -> Result<Self, LogError> {
+        validate_capacity(capacity)?;
+        validate_config(&config)?;
+        let sink = match &config.target {
+            LogTarget::Console => Sink::Writer(Box::new(io::stdout())),
+            LogTarget::File {
+                directory,
+                rotation,
+            } => Sink::Rotating(RotatingFile::new(
+                directory,
+                &config.service_name,
+                *rotation,
+                config.retention_days,
+                config.compress_rotated,
+            )?),
+        };
+        Self::from_non_blocking_sink(config, sink, capacity)
     }
 
     /// Creates a logger backed by an application-provided writer.
@@ -260,7 +312,39 @@ impl Logger {
         Ok(Self {
             config: Arc::new(config),
             sink: Arc::new(Mutex::new(Sink::Writer(Box::new(writer)))),
+            dropped: Arc::new(AtomicU64::new(0)),
         })
+    }
+
+    /// Creates a bounded non-blocking logger backed by an application-provided local or remote
+    /// writer. Writer failures are accounted as dropped records because they happen off-thread.
+    pub fn to_non_blocking_writer(
+        config: LogConfig,
+        writer: impl Write + Send + 'static,
+        capacity: usize,
+    ) -> Result<Self, LogError> {
+        validate_capacity(capacity)?;
+        validate_config(&config)?;
+        Self::from_non_blocking_sink(config, Sink::Writer(Box::new(writer)), capacity)
+    }
+
+    fn from_non_blocking_sink(
+        config: LogConfig,
+        sink: Sink,
+        capacity: usize,
+    ) -> Result<Self, LogError> {
+        let dropped = Arc::new(AtomicU64::new(0));
+        let async_sink = AsyncSink::spawn(sink, capacity, Arc::clone(&dropped))?;
+        Ok(Self {
+            config: Arc::new(config),
+            sink: Arc::new(Mutex::new(Sink::Async(async_sink))),
+            dropped,
+        })
+    }
+
+    /// Returns records discarded because the non-blocking queue was full or its writer failed.
+    pub fn dropped_records(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
     }
 
     pub fn enabled(&self, level: LogLevel) -> bool {
@@ -293,11 +377,12 @@ impl Logger {
             LogEncoding::Plain => encode_plain(&record),
         };
         encoded.push(b'\n');
-        self.sink
+        let written = self
+            .sink
             .lock()
             .map_err(|_| LogError::Poisoned)?
             .write_all(&encoded)?;
-        Ok(true)
+        Ok(written)
     }
 
     pub fn log_sampled(
@@ -354,16 +439,54 @@ impl Logger {
 enum Sink {
     Writer(Box<dyn Write + Send>),
     Rotating(RotatingFile),
+    Async(AsyncSink),
 }
 
 impl Sink {
-    fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
+    fn write_all(&mut self, bytes: &[u8]) -> io::Result<bool> {
         match self {
             Self::Writer(writer) => {
                 writer.write_all(bytes)?;
-                writer.flush()
+                writer.flush()?;
+                Ok(true)
             }
-            Self::Rotating(file) => file.write_all(bytes),
+            Self::Rotating(file) => {
+                file.write_all(bytes)?;
+                Ok(true)
+            }
+            Self::Async(sink) => Ok(sink.try_write(bytes)),
+        }
+    }
+}
+
+struct AsyncSink {
+    sender: mpsc::SyncSender<Vec<u8>>,
+    dropped: Arc<AtomicU64>,
+}
+
+impl AsyncSink {
+    fn spawn(mut sink: Sink, capacity: usize, dropped: Arc<AtomicU64>) -> io::Result<Self> {
+        let (sender, receiver) = mpsc::sync_channel::<Vec<u8>>(capacity);
+        let worker_dropped = Arc::clone(&dropped);
+        std::thread::Builder::new()
+            .name("rust-zero-log-writer".to_owned())
+            .spawn(move || {
+                while let Ok(record) = receiver.recv() {
+                    if !matches!(sink.write_all(&record), Ok(true)) {
+                        worker_dropped.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            })?;
+        Ok(Self { sender, dropped })
+    }
+
+    fn try_write(&self, bytes: &[u8]) -> bool {
+        match self.sender.try_send(bytes.to_vec()) {
+            Ok(()) => true,
+            Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+                false
+            }
         }
     }
 }
@@ -376,17 +499,25 @@ struct RotatingFile {
     active_path: PathBuf,
     active_day: i64,
     bytes_written: u64,
+    retention_days: Option<u64>,
+    compress_rotated: bool,
 }
 
 impl RotatingFile {
-    fn new(directory: &Path, service_name: &str, rotation: RotationPolicy) -> io::Result<Self> {
+    fn new(
+        directory: &Path,
+        service_name: &str,
+        rotation: RotationPolicy,
+        retention_days: Option<u64>,
+        compress_rotated: bool,
+    ) -> io::Result<Self> {
         fs::create_dir_all(directory)?;
         let service_name = safe_file_name(service_name);
         let active_day = unix_day();
         let active_path = log_path(directory, &service_name, rotation, active_day);
         let file = append_file(&active_path)?;
         let bytes_written = file.metadata()?.len();
-        Ok(Self {
+        let rotating = Self {
             directory: directory.to_owned(),
             service_name,
             rotation,
@@ -394,7 +525,13 @@ impl RotatingFile {
             active_path,
             active_day,
             bytes_written,
-        })
+            retention_days,
+            compress_rotated,
+        };
+        if matches!(rotation, RotationPolicy::Daily) {
+            rotating.maintain_daily_files(active_day)?;
+        }
+        Ok(rotating)
     }
 
     fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
@@ -427,6 +564,7 @@ impl RotatingFile {
 
     fn rotate_daily(&mut self) -> io::Result<()> {
         self.file.take();
+        let previous_path = self.active_path.clone();
         self.active_day = unix_day();
         self.active_path = log_path(
             &self.directory,
@@ -437,6 +575,10 @@ impl RotatingFile {
         let file = append_file(&self.active_path)?;
         self.bytes_written = file.metadata()?.len();
         self.file = Some(file);
+        if self.compress_rotated && previous_path != self.active_path && previous_path.exists() {
+            compress_file(&previous_path)?;
+        }
+        self.maintain_daily_files(self.active_day)?;
         Ok(())
     }
 
@@ -450,20 +592,29 @@ impl RotatingFile {
             let backup = self
                 .directory
                 .join(format!("{}.{}.log", self.service_name, unix_nanos()));
-            fs::rename(&self.active_path, backup)?;
+            fs::rename(&self.active_path, &backup)?;
+            if self.compress_rotated {
+                compress_file(&backup)?;
+            }
         } else {
             let oldest = backup_path(&self.active_path, max_backups);
-            if oldest.exists() {
-                fs::remove_file(oldest)?;
-            }
+            remove_backup(&oldest)?;
             for index in (1..max_backups).rev() {
                 let from = backup_path(&self.active_path, index);
-                if from.exists() {
-                    fs::rename(from, backup_path(&self.active_path, index + 1))?;
+                if let Some(from) = existing_backup(&from) {
+                    let mut to = backup_path(&self.active_path, index + 1);
+                    if is_gzip(&from) {
+                        to = gzip_path(&to);
+                    }
+                    fs::rename(from, to)?;
                 }
             }
             if self.active_path.exists() {
-                fs::rename(&self.active_path, backup_path(&self.active_path, 1))?;
+                let backup = backup_path(&self.active_path, 1);
+                fs::rename(&self.active_path, &backup)?;
+                if self.compress_rotated {
+                    compress_file(&backup)?;
+                }
             }
         }
 
@@ -477,6 +628,92 @@ impl RotatingFile {
             self.file = append_file(&self.active_path).ok();
         }
     }
+
+    fn maintain_daily_files(&self, active_day: i64) -> io::Result<()> {
+        let prefix = format!("{}.", self.service_name);
+        let active_date = date_from_unix_day(active_day);
+        let cutoff = self
+            .retention_days
+            .map(|days| date_from_unix_day(active_day - days.saturating_sub(1) as i64));
+
+        for entry in fs::read_dir(&self.directory)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let Some(date) = daily_file_date(&name, &prefix) else {
+                continue;
+            };
+            if date < active_date.as_str() && self.compress_rotated && !name.ends_with(".gz") {
+                compress_file(&entry.path())?;
+            }
+            if cutoff.as_deref().is_some_and(|cutoff| date < cutoff) {
+                let path = entry.path();
+                if path.exists() {
+                    fs::remove_file(path)?;
+                }
+                let compressed = gzip_path(&entry.path());
+                if compressed.exists() {
+                    fs::remove_file(compressed)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn daily_file_date<'a>(name: &'a str, prefix: &str) -> Option<&'a str> {
+    let remainder = name.strip_prefix(prefix)?;
+    let date = remainder
+        .strip_suffix(".log")
+        .or_else(|| remainder.strip_suffix(".log.gz"))?;
+    (date.len() == 10
+        && date.as_bytes().get(4) == Some(&b'-')
+        && date.as_bytes().get(7) == Some(&b'-')
+        && date
+            .chars()
+            .all(|value| value.is_ascii_digit() || value == '-'))
+    .then_some(date)
+}
+
+fn gzip_path(path: &Path) -> PathBuf {
+    let mut compressed = path.as_os_str().to_owned();
+    compressed.push(".gz");
+    PathBuf::from(compressed)
+}
+
+fn is_gzip(path: &Path) -> bool {
+    path.extension().is_some_and(|extension| extension == "gz")
+}
+
+fn existing_backup(path: &Path) -> Option<PathBuf> {
+    path.exists()
+        .then(|| path.to_owned())
+        .or_else(|| gzip_path(path).exists().then(|| gzip_path(path)))
+}
+
+fn remove_backup(path: &Path) -> io::Result<()> {
+    if path.exists() {
+        fs::remove_file(path)?;
+    }
+    let compressed = gzip_path(path);
+    if compressed.exists() {
+        fs::remove_file(compressed)?;
+    }
+    Ok(())
+}
+
+fn compress_file(path: &Path) -> io::Result<PathBuf> {
+    let compressed = gzip_path(path);
+    let mut input = File::open(path)?;
+    let output = File::create(&compressed)?;
+    let mut encoder = GzEncoder::new(output, Compression::default());
+    io::copy(&mut input, &mut encoder)?;
+    encoder.finish()?.sync_all()?;
+    fs::remove_file(path)?;
+    Ok(compressed)
 }
 
 fn validate_config(config: &LogConfig) -> Result<(), LogError> {
@@ -493,6 +730,14 @@ fn validate_config(config: &LogConfig) -> Result<(), LogError> {
         }
     }
     Ok(())
+}
+
+fn validate_capacity(capacity: usize) -> Result<(), LogError> {
+    if capacity == 0 {
+        Err(LogError::InvalidBufferCapacity)
+    } else {
+        Ok(())
+    }
 }
 
 fn append_file(path: &Path) -> io::Result<File> {
@@ -604,6 +849,7 @@ fn date_from_unix_day(day: i64) -> String {
 pub enum LogError {
     EmptyServiceName,
     InvalidMaxSize,
+    InvalidBufferCapacity,
     Io(io::Error),
     Serialize(serde_json::Error),
     Poisoned,
@@ -615,6 +861,9 @@ impl fmt::Display for LogError {
             Self::EmptyServiceName => formatter.write_str("log service name cannot be empty"),
             Self::InvalidMaxSize => {
                 formatter.write_str("log rotation maximum size must be greater than zero")
+            }
+            Self::InvalidBufferCapacity => {
+                formatter.write_str("log buffer capacity must be greater than zero")
             }
             Self::Io(error) => write!(formatter, "log I/O error: {error}"),
             Self::Serialize(error) => write!(formatter, "log serialization error: {error}"),
@@ -648,6 +897,9 @@ impl From<serde_json::Error> for LogError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flate2::read::GzDecoder;
+    use std::io::Read;
+    use std::sync::{Condvar, MutexGuard};
 
     #[derive(Clone, Default)]
     struct SharedWriter(Arc<Mutex<Vec<u8>>>);
@@ -655,6 +907,34 @@ mod tests {
     impl Write for SharedWriter {
         fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
             self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct BlockingWriter {
+        state: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    impl BlockingWriter {
+        fn release(&self) {
+            let (lock, ready) = &*self.state;
+            *lock.lock().unwrap() = true;
+            ready.notify_all();
+        }
+    }
+
+    impl Write for BlockingWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            let (lock, ready) = &*self.state;
+            let mut released: MutexGuard<'_, bool> = lock.lock().unwrap();
+            while !*released {
+                released = ready.wait(released).unwrap();
+            }
             Ok(bytes.len())
         }
 
@@ -729,6 +1009,34 @@ mod tests {
     }
 
     #[test]
+    fn bounded_writer_drops_without_blocking_and_accounts_records() {
+        let writer = BlockingWriter::default();
+        let logger =
+            Logger::to_non_blocking_writer(LogConfig::console("orders"), writer.clone(), 1)
+                .unwrap();
+
+        // The worker blocks on one record, the queue holds one, and subsequent calls shed.
+        assert!(logger.log(LogLevel::Info, "one", []).unwrap());
+        std::thread::yield_now();
+        let _ = logger.log(LogLevel::Info, "two", []).unwrap();
+        for index in 0..10 {
+            let _ = logger
+                .log(LogLevel::Info, "overflow", [LogField::new("index", index)])
+                .unwrap();
+        }
+        assert!(logger.dropped_records() > 0);
+        writer.release();
+    }
+
+    #[test]
+    fn rejects_an_empty_non_blocking_queue() {
+        assert!(matches!(
+            Logger::to_non_blocking_writer(LogConfig::console("api"), io::sink(), 0),
+            Err(LogError::InvalidBufferCapacity)
+        ));
+    }
+
+    #[test]
     fn rotates_size_limited_files() {
         let directory = std::env::temp_dir().join(format!("rust-zero-log-{}", unix_nanos()));
         let config = LogConfig::file(
@@ -753,6 +1061,77 @@ mod tests {
 
         assert!(directory.join("gateway.log").exists());
         assert!(directory.join("gateway.log.1").exists());
+        drop(logger);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn compresses_and_limits_size_rotated_files() {
+        let directory = std::env::temp_dir().join(format!("rust-zero-log-gzip-{}", unix_nanos()));
+        let config = LogConfig::file(
+            "gateway",
+            &directory,
+            RotationPolicy::Size {
+                max_bytes: 80,
+                max_backups: 2,
+            },
+        )
+        .with_rotated_compression(true);
+        let logger = Logger::new(config).unwrap();
+
+        for index in 0..8 {
+            logger
+                .log(
+                    LogLevel::Info,
+                    "a record long enough to rotate",
+                    [LogField::new("index", index)],
+                )
+                .unwrap();
+        }
+
+        let newest = directory.join("gateway.log.1.gz");
+        assert!(newest.exists());
+        assert!(directory.join("gateway.log.2.gz").exists());
+        assert!(!directory.join("gateway.log.3.gz").exists());
+        let mut decoded = String::new();
+        GzDecoder::new(File::open(newest).unwrap())
+            .read_to_string(&mut decoded)
+            .unwrap();
+        assert!(decoded.contains("a record long enough to rotate"));
+        drop(logger);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn compresses_and_expires_daily_files_on_startup() {
+        let directory = std::env::temp_dir().join(format!("rust-zero-log-daily-{}", unix_nanos()));
+        fs::create_dir_all(&directory).unwrap();
+        let today = unix_day();
+        let expired = directory.join(format!(
+            "api.{}.log",
+            date_from_unix_day(today.saturating_sub(3))
+        ));
+        let retained = directory.join(format!(
+            "api.{}.log",
+            date_from_unix_day(today.saturating_sub(1))
+        ));
+        fs::write(&expired, b"expired").unwrap();
+        fs::write(&retained, b"retained").unwrap();
+
+        let logger = Logger::new(
+            LogConfig::file("api", &directory, RotationPolicy::Daily)
+                .with_retention_days(2)
+                .with_rotated_compression(true),
+        )
+        .unwrap();
+
+        assert!(!expired.exists());
+        assert!(!gzip_path(&expired).exists());
+        assert!(!retained.exists());
+        assert!(gzip_path(&retained).exists());
+        assert!(directory
+            .join(format!("api.{}.log", date_from_unix_day(today)))
+            .exists());
         drop(logger);
         fs::remove_dir_all(directory).unwrap();
     }

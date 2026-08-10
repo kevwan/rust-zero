@@ -1,6 +1,9 @@
 use crate::HttpClientMetrics;
 use reqwest::{Client, Method, Request, RequestBuilder, Response, StatusCode};
-use rust_zero_core::{CircuitBreaker, CircuitBreakerConfig, CircuitBreakerError, TraceContext};
+use rust_zero_core::{
+    BreakerState, CircuitBreaker, CircuitBreakerConfig, CircuitBreakerError,
+    CircuitBreakerSnapshot, TraceContext,
+};
 use serde::{de::DeserializeOwned, Serialize};
 use std::{
     fmt,
@@ -83,6 +86,14 @@ impl HttpClient {
 
     pub fn service(&self) -> &str {
         &self.service
+    }
+
+    pub fn breaker_state(&self) -> BreakerState {
+        self.breaker.state()
+    }
+
+    pub fn breaker_snapshot(&self) -> CircuitBreakerSnapshot {
+        self.breaker.snapshot()
     }
 
     pub fn request(&self, method: Method, url: impl reqwest::IntoUrl) -> RequestBuilder {

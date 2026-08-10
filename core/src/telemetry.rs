@@ -1,3 +1,14 @@
+//! OpenTelemetry tracing and OTLP export.
+//!
+//! ```no_run
+//! use rust_zero_core::{OtlpTransport, Telemetry, TelemetryConfig};
+//! let telemetry = Telemetry::init(TelemetryConfig::new(
+//!     "users-api", "http://127.0.0.1:4317", OtlpTransport::Grpc,
+//! ))?;
+//! telemetry.force_flush()?;
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! ```
+
 use std::{fmt, time::Duration};
 
 use opentelemetry::{

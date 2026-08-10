@@ -1,7 +1,22 @@
 [package]
+name = "rust-zero-mapreduce"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Bounded asynchronous MapReduce execution for rust-zero services"
+documentation = "https://docs.rs/rust-zero-mapreduce"
+
+[lib]
 name = "mapreduce"
-version = "0.1.0"
-edition = "2021"
+
+[package.metadata.docs.rs]
+all-features = true
 
 [dependencies]
 tokio = { version = "1.0", features = ["full", "sync"] }

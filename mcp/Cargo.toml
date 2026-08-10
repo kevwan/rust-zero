@@ -1,0 +1,29 @@
+[package]
+name = "rust-zero-mcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Streamable HTTP Model Context Protocol server runtime for rust-zero"
+documentation = "https://docs.rs/rust-zero-mcp"
+
+[package.metadata.docs.rs]
+all-features = true
+
+[dependencies]
+actix-web = "4"
+futures = "0.3.30"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["sync"] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+actix-http = "3"
+reqwest = { version = "=0.11.16", features = ["json"] }
+rust-zero-core = { path = "../core", version = "0.1.0-alpha.1" }

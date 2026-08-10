@@ -8,6 +8,7 @@ use actix_web::{
 };
 use futures::future::{ok, LocalBoxFuture, Ready};
 use futures::{Stream, StreamExt};
+use rust_zero_core::{AdaptiveShedder, ShedPermit};
 use std::{
     io::Read,
     pin::Pin,
@@ -188,6 +189,121 @@ pub struct ConcurrencyLimitMiddleware<S> {
     semaphore: Arc<Semaphore>,
     priority_reserve: Arc<Semaphore>,
     metrics: Option<HttpMetrics>,
+}
+
+/// Applies rust-zero's CPU- and throughput-aware admission control to HTTP requests.
+#[derive(Clone)]
+pub struct AdaptiveLoadShed {
+    shedder: AdaptiveShedder,
+    metrics: Option<HttpMetrics>,
+}
+
+impl AdaptiveLoadShed {
+    pub fn new(shedder: AdaptiveShedder) -> Self {
+        Self {
+            shedder,
+            metrics: None,
+        }
+    }
+
+    pub fn with_metrics(mut self, metrics: HttpMetrics) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+}
+
+impl<S, B> Transform<S, ServiceRequest> for AdaptiveLoadShed
+where
+    S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = Error> + 'static,
+    S::Future: 'static,
+    B: MessageBody + 'static,
+{
+    type Response = ServiceResponse<EitherBody<PermitBody<B>>>;
+    type Error = Error;
+    type Transform = AdaptiveLoadShedMiddleware<S>;
+    type InitError = ();
+    type Future = Ready<Result<Self::Transform, Self::InitError>>;
+
+    fn new_transform(&self, service: S) -> Self::Future {
+        ok(AdaptiveLoadShedMiddleware {
+            service,
+            shedder: self.shedder.clone(),
+            metrics: self.metrics.clone(),
+        })
+    }
+}
+
+pub struct AdaptiveLoadShedMiddleware<S> {
+    service: S,
+    shedder: AdaptiveShedder,
+    metrics: Option<HttpMetrics>,
+}
+
+impl<S, B> Service<ServiceRequest> for AdaptiveLoadShedMiddleware<S>
+where
+    S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = Error> + 'static,
+    S::Future: 'static,
+    B: MessageBody + 'static,
+{
+    type Response = ServiceResponse<EitherBody<PermitBody<B>>>;
+    type Error = Error;
+    type Future = LocalBoxFuture<'static, Result<Self::Response, Self::Error>>;
+
+    fn poll_ready(&self, context: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.service.poll_ready(context)
+    }
+
+    fn call(&self, request: ServiceRequest) -> Self::Future {
+        let Some(permit) = self.shedder.try_acquire() else {
+            if let Some(metrics) = &self.metrics {
+                metrics.record_protection("load_shedder", "rejected");
+            }
+            return Box::pin(async move {
+                Ok(request.into_response(
+                    HttpResponse::build(StatusCode::SERVICE_UNAVAILABLE)
+                        .body("server is overloaded")
+                        .map_into_right_body(),
+                ))
+            });
+        };
+        let future = self.service.call(request);
+        Box::pin(async move {
+            let response = future
+                .await?
+                .map_body(move |_, body| PermitBody::new(body, permit))
+                .map_into_left_body();
+            Ok(response)
+        })
+    }
+}
+
+pub struct PermitBody<B> {
+    inner: Pin<Box<B>>,
+    _permit: ShedPermit,
+}
+
+impl<B> PermitBody<B> {
+    fn new(body: B, permit: ShedPermit) -> Self {
+        Self {
+            inner: Box::pin(body),
+            _permit: permit,
+        }
+    }
+}
+
+impl<B: MessageBody> MessageBody for PermitBody<B> {
+    type Error = B::Error;
+
+    fn size(&self) -> actix_web::body::BodySize {
+        self.inner.as_ref().get_ref().size()
+    }
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Option<Result<actix_web::web::Bytes, Self::Error>>> {
+        self.inner.as_mut().poll_next(context)
+    }
 }
 
 impl<S, B> Service<ServiceRequest> for ConcurrencyLimitMiddleware<S>
@@ -628,6 +744,60 @@ mod tests {
 
         release.notify_waiters();
         assert_eq!(first.await.status(), StatusCode::OK);
+    }
+
+    #[actix_rt::test]
+    async fn adaptive_load_shed_is_installed_as_http_middleware() {
+        let release = Arc::new(Notify::new());
+        let metrics = Metrics::new();
+        let http_metrics = HttpMetrics::new(&metrics, "adaptive").unwrap();
+        let shedder = AdaptiveShedder::new(rust_zero_core::LoadShedderConfig::new(
+            1,
+            Duration::from_secs(1),
+        ));
+        let app = test::init_service(
+            App::new()
+                .app_data(Data::from(Arc::clone(&release)))
+                .wrap(AdaptiveLoadShed::new(shedder).with_metrics(http_metrics))
+                .route(
+                    "/",
+                    web::get().to(|release: Data<Notify>| async move {
+                        release.notified().await;
+                        HttpResponse::Ok().finish()
+                    }),
+                ),
+        )
+        .await;
+
+        let first = test::call_service(&app, test::TestRequest::get().uri("/").to_request());
+        futures::pin_mut!(first);
+        poll_fn(|context| {
+            assert!(first.as_mut().poll(context).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+
+        let rejected =
+            test::call_service(&app, test::TestRequest::get().uri("/").to_request()).await;
+        assert_eq!(rejected.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(metrics.render().contains(
+            "adaptive_http_protection_decisions_total{mechanism=\"load_shedder\",decision=\"rejected\"} 1"
+        ));
+
+        release.notify_waiters();
+        assert_eq!(first.await.status(), StatusCode::OK);
+    }
+
+    #[actix_rt::test]
+    async fn adaptive_permit_lives_until_the_response_body_is_dropped() {
+        let shedder = AdaptiveShedder::new(rust_zero_core::LoadShedderConfig::new(
+            1,
+            Duration::from_secs(1),
+        ));
+        let body = PermitBody::new((), shedder.try_acquire().unwrap());
+        assert!(shedder.try_acquire().is_none());
+        drop(body);
+        assert!(shedder.try_acquire().is_some());
     }
 
     #[actix_rt::test]

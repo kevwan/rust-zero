@@ -1,0 +1,11 @@
+version = 1
+warmup_iterations = 100
+measured_iterations = 2000
+concurrency = 16
+payload_bytes = 256
+breaker_failure_percent = 40
+discovery_endpoints = 10000
+queue_capacity = 64
+queue_messages = 2000
+queue_consumer_delay_us = 100
+overload_concurrency = 64

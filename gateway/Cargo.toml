@@ -1,9 +1,26 @@
 [package]
-name = "gateway"
-version = "0.1.0"
-edition = "2021"
+name = "rust-zero-gateway"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Configuration-driven HTTP and gRPC transcoding gateway for rust-zero"
+documentation = "https://docs.rs/rust-zero-gateway"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lib]
+name = "gateway"
+
+[[bin]]
+name = "gateway"
+path = "src/main.rs"
+
+[package.metadata.docs.rs]
+all-features = true
 
 [dependencies]
 actix-web = "4"
@@ -14,6 +31,7 @@ prost = "0.13"
 prost-reflect = { version = "0.14", features = ["serde"] }
 prost-types = "0.13"
 reqwest = { version = "=0.11.16", features = ["stream"] }
+rust-zero-core = { path = "../core", version = "0.1.0-alpha.1" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tonic = { version = "0.12", features = ["transport"] }

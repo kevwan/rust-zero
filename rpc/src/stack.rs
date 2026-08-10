@@ -6,7 +6,8 @@ use http::{Request, Response};
 use http_body::{Body, Frame};
 use pin_project_lite::pin_project;
 use rust_zero_core::{
-    AdaptiveShedder, CircuitBreaker, CircuitBreakerConfig, CircuitBreakerPermit, LoadShedderConfig,
+    AdaptiveShedder, AuthFailure, CircuitBreaker, CircuitBreakerConfig, CircuitBreakerPermit,
+    CircuitOutcome, LoadShedderConfig, LogContext, LogField, LogLevel, Logger, ShedPermit,
     TraceContext, TraceFlags,
 };
 use std::{
@@ -15,12 +16,18 @@ use std::{
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tonic::{body::BoxBody, Code, Status};
 use tower::{Layer, Service};
 
 type Validator<T> = dyn Fn(&str) -> Option<T> + Send + Sync;
+
+#[derive(Clone)]
+struct RpcSlowLogConfig {
+    logger: Logger,
+    threshold: Duration,
+}
 
 /// Creates the common server layer once and applies it to every generated Tonic service.
 ///
@@ -31,6 +38,7 @@ pub struct RpcServerStackBuilder<T = ()> {
     metrics: RpcMetrics,
     auth: Option<Arc<Validator<T>>>,
     shedder: Option<AdaptiveShedder>,
+    slow_log: Option<RpcSlowLogConfig>,
 }
 
 impl RpcServerStackBuilder<()> {
@@ -39,6 +47,7 @@ impl RpcServerStackBuilder<()> {
             metrics,
             auth: None,
             shedder: None,
+            slow_log: None,
         }
     }
 }
@@ -58,6 +67,7 @@ where
             metrics: self.metrics,
             auth: Some(Arc::new(validator)),
             shedder: self.shedder,
+            slow_log: self.slow_log,
         }
     }
 
@@ -66,11 +76,23 @@ where
         self
     }
 
+    /// Logs every completed gRPC call and classifies calls at or above `threshold` as slow.
+    /// Streaming calls are finalized from their trailers so the record contains the final status.
+    pub fn with_slow_call_logging(mut self, logger: Logger, threshold: Duration) -> Self {
+        assert!(
+            !threshold.is_zero(),
+            "gRPC slow-call threshold must be positive"
+        );
+        self.slow_log = Some(RpcSlowLogConfig { logger, threshold });
+        self
+    }
+
     pub fn build(self) -> RpcServerStack<T> {
         RpcServerStack {
             metrics: RpcMetricsLayer::new(self.metrics),
             auth: self.auth,
             shedder: self.shedder,
+            slow_log: self.slow_log,
         }
     }
 }
@@ -79,6 +101,7 @@ pub struct RpcServerStack<T> {
     metrics: RpcMetricsLayer,
     auth: Option<Arc<Validator<T>>>,
     shedder: Option<AdaptiveShedder>,
+    slow_log: Option<RpcSlowLogConfig>,
 }
 
 impl<T> Clone for RpcServerStack<T> {
@@ -87,6 +110,7 @@ impl<T> Clone for RpcServerStack<T> {
             metrics: self.metrics.clone(),
             auth: self.auth.clone(),
             shedder: self.shedder.clone(),
+            slow_log: self.slow_log.clone(),
         }
     }
 }
@@ -102,6 +126,7 @@ where
             inner: self.metrics.layer(inner),
             auth: self.auth.clone(),
             shedder: self.shedder.clone(),
+            slow_log: self.slow_log.clone(),
         }
     }
 }
@@ -111,6 +136,7 @@ pub struct RpcServerStackService<S, T> {
     inner: S,
     auth: Option<Arc<Validator<T>>>,
     shedder: Option<AdaptiveShedder>,
+    slow_log: Option<RpcSlowLogConfig>,
 }
 
 impl<S, T, RequestBody, ResponseBody> Service<Request<RequestBody>> for RpcServerStackService<S, T>
@@ -132,6 +158,27 @@ where
     }
 
     fn call(&mut self, mut request: Request<RequestBody>) -> Self::Future {
+        let trace = request
+            .headers()
+            .get("traceparent")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| TraceContext::parse(value).ok())
+            .map(|parent| parent.child())
+            .unwrap_or_else(|| TraceContext::root(TraceFlags::SAMPLED));
+        let mut slow_call = self.slow_log.as_ref().map(|config| {
+            RpcSlowCall::new(
+                config.clone(),
+                request.uri().path().to_owned(),
+                request
+                    .headers()
+                    .get("grpc-timeout")
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(parse_grpc_timeout),
+                trace.clone(),
+            )
+        });
+        request.extensions_mut().insert(trace);
+
         if let Some(auth) = &self.auth {
             let identity = request
                 .headers()
@@ -140,29 +187,28 @@ where
                 .and_then(bearer_token)
                 .and_then(|token| auth(token));
             let Some(identity) = identity else {
+                if let Some(call) = slow_call.take() {
+                    call.finish(Code::Unauthenticated);
+                }
                 return Box::pin(async {
-                    Ok(
-                        Status::unauthenticated("valid bearer credentials are required")
-                            .into_http(),
-                    )
+                    Ok(Status::unauthenticated(format!(
+                        "{}: {}",
+                        AuthFailure::InvalidCredentials.code(),
+                        AuthFailure::InvalidCredentials.message()
+                    ))
+                    .into_http())
                 });
             };
             request.extensions_mut().insert(identity);
         }
 
-        let trace = request
-            .headers()
-            .get("traceparent")
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| TraceContext::parse(value).ok())
-            .map(|parent| parent.child())
-            .unwrap_or_else(|| TraceContext::root(TraceFlags::SAMPLED));
-        request.extensions_mut().insert(trace);
-
         let permit = match &self.shedder {
             Some(shedder) => match shedder.try_acquire() {
                 Some(permit) => Some(permit),
                 None => {
+                    if let Some(call) = slow_call.take() {
+                        call.finish(Code::ResourceExhausted);
+                    }
                     return Box::pin(async {
                         Ok(Status::resource_exhausted("gRPC server is overloaded").into_http())
                     });
@@ -174,16 +220,174 @@ where
         let future = self.inner.call(request);
         Box::pin(async move {
             let result = AssertUnwindSafe(future).catch_unwind().await;
-            drop(permit);
             match result {
                 Ok(Ok(response)) => {
+                    let header_code = grpc_status(response.headers());
                     let (parts, body) = response.into_parts();
+                    let mut body = RpcServerLogBody {
+                        inner: body,
+                        slow_call,
+                        _shed_permit: permit,
+                    };
+                    if let Some(code) = header_code {
+                        body.finish(code);
+                    } else if !parts.status.is_success() {
+                        body.finish_transport_error();
+                    }
                     Ok(Response::from_parts(parts, tonic::body::boxed(body)))
                 }
-                Ok(Err(error)) => Err(error),
-                Err(_) => Ok(Status::internal("gRPC handler panicked").into_http()),
+                Ok(Err(error)) => {
+                    if let Some(call) = slow_call.take() {
+                        call.finish_transport_error();
+                    }
+                    Err(error)
+                }
+                Err(_) => {
+                    if let Some(call) = slow_call.take() {
+                        call.finish(Code::Internal);
+                    }
+                    Ok(Status::internal("gRPC handler panicked").into_http())
+                }
             }
         })
+    }
+}
+
+struct RpcSlowCall {
+    config: RpcSlowLogConfig,
+    method: String,
+    deadline: Option<Duration>,
+    trace: TraceContext,
+    started: Instant,
+}
+
+impl RpcSlowCall {
+    fn new(
+        config: RpcSlowLogConfig,
+        method: String,
+        deadline: Option<Duration>,
+        trace: TraceContext,
+    ) -> Self {
+        Self {
+            config,
+            method,
+            deadline,
+            trace,
+            started: Instant::now(),
+        }
+    }
+
+    fn finish(self, code: Code) {
+        self.emit(code_name(code), code == Code::DeadlineExceeded);
+    }
+
+    fn finish_transport_error(self) {
+        self.emit("transport_error", false);
+    }
+
+    fn emit(self, status: &'static str, status_deadline_exceeded: bool) {
+        let elapsed = self.started.elapsed();
+        let slow = elapsed >= self.config.threshold;
+        let deadline_exceeded =
+            status_deadline_exceeded || self.deadline.is_some_and(|deadline| elapsed >= deadline);
+        let mut fields = vec![
+            LogField::new("transport", "grpc"),
+            LogField::new("rpc_role", "server"),
+            LogField::new("method", self.method),
+            LogField::new("status", status),
+            LogField::new("elapsed_ms", duration_millis(elapsed)),
+            LogField::new("slow_threshold_ms", duration_millis(self.config.threshold)),
+            LogField::new("slow", slow),
+            LogField::new("deadline_exceeded", deadline_exceeded),
+        ];
+        if let Some(deadline) = self.deadline {
+            fields.push(LogField::new("deadline_ms", duration_millis(deadline)));
+        }
+        let context = LogContext::new().with_trace(self.trace);
+        let _ = self.config.logger.log_with_context(
+            if slow { LogLevel::Slow } else { LogLevel::Info },
+            "grpc request completed",
+            Some(&context),
+            fields,
+        );
+    }
+}
+
+pin_project! {
+    struct RpcServerLogBody<B> {
+        #[pin]
+        inner: B,
+        slow_call: Option<RpcSlowCall>,
+        _shed_permit: Option<ShedPermit>,
+    }
+
+    impl<B> PinnedDrop for RpcServerLogBody<B> {
+        fn drop(this: Pin<&mut Self>) {
+            let this = this.project();
+            if let Some(call) = this.slow_call.take() {
+                call.finish(Code::Cancelled);
+            }
+        }
+    }
+}
+
+impl<B> RpcServerLogBody<B> {
+    fn finish(&mut self, code: Code) {
+        if let Some(call) = self.slow_call.take() {
+            call.finish(code);
+        }
+    }
+
+    fn finish_transport_error(&mut self) {
+        if let Some(call) = self.slow_call.take() {
+            call.finish_transport_error();
+        }
+    }
+}
+
+impl<B> Body for RpcServerLogBody<B>
+where
+    B: Body,
+{
+    type Data = B::Data;
+    type Error = B::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let mut this = self.project();
+        match this.inner.as_mut().poll_frame(context) {
+            Poll::Ready(Some(Ok(frame))) => {
+                if let Some(code) = frame.trailers_ref().and_then(grpc_status) {
+                    if let Some(call) = this.slow_call.take() {
+                        call.finish(code);
+                    }
+                }
+                Poll::Ready(Some(Ok(frame)))
+            }
+            Poll::Ready(Some(Err(error))) => {
+                if let Some(call) = this.slow_call.take() {
+                    call.finish_transport_error();
+                }
+                Poll::Ready(Some(Err(error)))
+            }
+            Poll::Ready(None) => {
+                if let Some(call) = this.slow_call.take() {
+                    call.finish(Code::Ok);
+                }
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
     }
 }
 
@@ -357,9 +561,9 @@ where
                         permit,
                     };
                     if let Some(code) = header_code {
-                        wrapped.finish(status_is_acceptable(code));
+                        wrapped.finish(status_outcome(code));
                     } else if !parts.status.is_success() {
-                        wrapped.finish(false);
+                        wrapped.finish(CircuitOutcome::Failure);
                     }
                     Ok(Response::from_parts(parts, tonic::body::boxed(wrapped)))
                 }
@@ -383,9 +587,9 @@ pin_project! {
 }
 
 impl<B> RpcCircuitBody<B> {
-    fn finish(&mut self, acceptable: bool) {
+    fn finish(&mut self, outcome: CircuitOutcome) {
         if let Some(permit) = self.permit.take() {
-            permit.finish(acceptable);
+            permit.finish_with_outcome(outcome);
         }
     }
 }
@@ -406,7 +610,7 @@ where
             Poll::Ready(Some(Ok(frame))) => {
                 if let Some(code) = frame.trailers_ref().and_then(grpc_status) {
                     if let Some(permit) = this.permit.take() {
-                        permit.finish(status_is_acceptable(code));
+                        permit.finish_with_outcome(status_outcome(code));
                     }
                 }
                 Poll::Ready(Some(Ok(frame)))
@@ -444,8 +648,54 @@ fn grpc_status(headers: &http::HeaderMap) -> Option<Code> {
         .map(Code::from_i32)
 }
 
-fn status_is_acceptable(code: Code) -> bool {
-    !matches!(
+fn parse_grpc_timeout(value: &str) -> Option<Duration> {
+    let (amount, unit) = value.split_at(value.len().checked_sub(1)?);
+    if amount.is_empty() || amount.len() > 8 {
+        return None;
+    }
+    let amount = amount.parse::<u64>().ok()?;
+    match unit {
+        "n" => Some(Duration::from_nanos(amount)),
+        "u" => Some(Duration::from_micros(amount)),
+        "m" => Some(Duration::from_millis(amount)),
+        "S" => Some(Duration::from_secs(amount)),
+        "M" => Some(Duration::from_secs(amount.saturating_mul(60))),
+        "H" => Some(Duration::from_secs(amount.saturating_mul(3_600))),
+        _ => None,
+    }
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+fn code_name(code: Code) -> &'static str {
+    match code {
+        Code::Ok => "ok",
+        Code::Cancelled => "cancelled",
+        Code::Unknown => "unknown",
+        Code::InvalidArgument => "invalid_argument",
+        Code::DeadlineExceeded => "deadline_exceeded",
+        Code::NotFound => "not_found",
+        Code::AlreadyExists => "already_exists",
+        Code::PermissionDenied => "permission_denied",
+        Code::ResourceExhausted => "resource_exhausted",
+        Code::FailedPrecondition => "failed_precondition",
+        Code::Aborted => "aborted",
+        Code::OutOfRange => "out_of_range",
+        Code::Unimplemented => "unimplemented",
+        Code::Internal => "internal",
+        Code::Unavailable => "unavailable",
+        Code::DataLoss => "data_loss",
+        Code::Unauthenticated => "unauthenticated",
+    }
+}
+
+fn status_outcome(code: Code) -> CircuitOutcome {
+    if code == Code::Cancelled {
+        return CircuitOutcome::Cancellation;
+    }
+    if matches!(
         code,
         Code::DeadlineExceeded
             | Code::Internal
@@ -453,7 +703,11 @@ fn status_is_acceptable(code: Code) -> bool {
             | Code::DataLoss
             | Code::Unimplemented
             | Code::ResourceExhausted
-    )
+    ) {
+        CircuitOutcome::Failure
+    } else {
+        CircuitOutcome::Success
+    }
 }
 
 fn grpc_timeout(timeout: Duration) -> String {
@@ -480,7 +734,11 @@ mod client_tests {
     use crate::RpcMetricMode;
     use std::{
         convert::Infallible,
-        sync::atomic::{AtomicUsize, Ordering},
+        io::{self, Write},
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Mutex,
+        },
     };
     use tower::ServiceExt;
 
@@ -539,6 +797,41 @@ mod client_tests {
         }
     }
 
+    #[derive(Clone, Default)]
+    struct SharedWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for SharedWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[derive(Clone)]
+    struct SlowServerTransport;
+
+    impl Service<Request<()>> for SlowServerTransport {
+        type Response = Response<TrailerBody>;
+        type Error = Infallible;
+        type Future =
+            Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + 'static>>;
+
+        fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _: Request<()>) -> Self::Future {
+            Box::pin(async {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                Ok(Response::new(TrailerBody(true)))
+            })
+        }
+    }
+
     #[tokio::test]
     async fn client_stack_composes_headers_metrics_deadline_and_trailer_breaking() {
         let registry = rust_zero_core::Metrics::new();
@@ -581,6 +874,105 @@ mod client_tests {
         assert!(registry.render().contains(
             "stacked_rpc_client_requests_total{method=\"/echo.Echo/Call\",code=\"14\"} 1"
         ));
+    }
+
+    #[tokio::test]
+    async fn server_stack_logs_final_status_deadline_and_slow_classification() {
+        let registry = rust_zero_core::Metrics::new();
+        let metrics = RpcMetrics::new(
+            &registry,
+            "server_log",
+            RpcMetricMode::Server,
+            ["/echo.Echo/Call"],
+        )
+        .unwrap();
+        let output = SharedWriter::default();
+        let logger =
+            Logger::to_writer(rust_zero_core::LogConfig::console("rpc"), output.clone()).unwrap();
+        let mut service = RpcServerStackBuilder::new(metrics)
+            .with_slow_call_logging(logger, Duration::from_millis(1))
+            .build()
+            .layer(SlowServerTransport);
+
+        let response = service
+            .ready()
+            .await
+            .unwrap()
+            .call(
+                Request::builder()
+                    .uri("/echo.Echo/Call")
+                    .header("grpc-timeout", "1m")
+                    .body(())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let mut body = Box::pin(response.into_body());
+        std::future::poll_fn(|context| body.as_mut().poll_frame(context)).await;
+
+        let bytes = output.0.lock().unwrap().clone();
+        let record: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(record["level"], "slow");
+        assert_eq!(record["transport"], "grpc");
+        assert_eq!(record["rpc_role"], "server");
+        assert_eq!(record["method"], "/echo.Echo/Call");
+        assert_eq!(record["status"], "unavailable");
+        assert_eq!(record["slow"], true);
+        assert_eq!(record["slow_threshold_ms"], 1);
+        assert_eq!(record["deadline_ms"], 1);
+        assert_eq!(record["deadline_exceeded"], true);
+        assert!(record["trace_id"].as_str().is_some());
+    }
+
+    #[tokio::test]
+    async fn server_shedder_holds_permit_until_stream_completion() {
+        let registry = rust_zero_core::Metrics::new();
+        let metrics = RpcMetrics::new(
+            &registry,
+            "server_shed",
+            RpcMetricMode::Server,
+            ["/echo.Echo/Call"],
+        )
+        .unwrap();
+        let mut service = RpcServerStackBuilder::new(metrics)
+            .with_load_shedder(LoadShedderConfig::production(1))
+            .build()
+            .layer(SlowServerTransport);
+
+        let first = service
+            .ready()
+            .await
+            .unwrap()
+            .call(Request::builder().uri("/echo.Echo/Call").body(()).unwrap())
+            .await
+            .unwrap();
+        let rejected = service
+            .ready()
+            .await
+            .unwrap()
+            .call(Request::builder().uri("/echo.Echo/Call").body(()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(rejected.headers().get("grpc-status").unwrap(), "8");
+
+        let mut body = Box::pin(first.into_body());
+        std::future::poll_fn(|context| body.as_mut().poll_frame(context)).await;
+        drop(body);
+
+        let admitted = service
+            .ready()
+            .await
+            .unwrap()
+            .call(Request::builder().uri("/echo.Echo/Call").body(()).unwrap())
+            .await
+            .unwrap();
+        assert_ne!(
+            admitted
+                .headers()
+                .get("grpc-status")
+                .map(|value| value.as_bytes()),
+            Some(b"8".as_slice())
+        );
     }
 
     #[test]

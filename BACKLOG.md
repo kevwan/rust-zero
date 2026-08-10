@@ -2,7 +2,9 @@
 
 This backlog tracks production capabilities still needed after the
 [go-zero v1.10.3](https://github.com/zeromicro/go-zero/tree/v1.10.3) runtime audit on
-2026-08-08. Equivalent Rust/Actix/Tonic behavior is the goal; identical Go APIs are not.
+2026-08-09. The follow-up check also covered upstream `master` through `f7805d5e`; changes after
+v1.10.3 were dependency, CI, Go-toolchain, and `goctl` maintenance only, with no new runtime
+capability to port. Equivalent Rust/Actix/Tonic behavior is the goal; identical Go APIs are not.
 `goctl`, API/protobuf code generation, and language-client generation remain out of scope.
 
 ## P0 — framework-level parity
@@ -54,81 +56,236 @@ This backlog tracks production capabilities still needed after the
   application-configurable success/error envelopes, stable typed errors, go-zero-compatible
   gRPC-status translation, pre-commit JSON serialization failure handling, and chunked
   anti-buffered streaming helpers.
-- [ ] **Static/serverless serving and custom route middleware.** Add embedded/static file fallback,
+- [x] **Static/serverless serving and custom route middleware.** Add embedded/static file fallback,
   a prebuilt serverless handler, and application-defined middleware lists on declarative route
   groups. Prefixes and per-route JWT/timeout/body-limit/priority/SSE settings are present.
+  - [x] Add ordered named application middleware on declarative groups, including async
+    short-circuiting, response wrapping, duplicate/missing-name validation, and route isolation.
+  - [x] Add a traversal-safe static-directory and embedded-asset fallback.
+  - [x] Add a prebuilt serverless request handler that reuses the standard REST stack.
 - [x] **Automatic RPC transport metrics.** Reusable gRPC client/server layers cover request counts,
   latency, in-flight calls, final trailer status, transport/body errors, cancellation, and bounded
   method cardinality for unary and streaming calls. REST server/client request and in-flight
   metrics plus timeout, concurrency-shed, rate-limit, and client-circuit rejection outcomes are
   present. The standard generated-service-independent client and server stacks install them.
-- [ ] **Model-cache semantics.** Add multi-key index-to-primary mappings, randomized expirations,
+- [x] **Model-cache semantics.** Add multi-key index-to-primary mappings, randomized expirations,
   cache-not-found policy, shared invalidation after mutations, cache statistics, and Redis cluster
-  cache nodes matching go-zero's `sqlc`/`cache` behavior. The current SQL/Mongo cache wrappers are
-  single-key read-through helpers.
+  cache nodes matching go-zero's `sqlc`/`cache` behavior.
   - [x] Support separate positive/not-found TTLs, optional negative caching, bounded TTL jitter,
     cache statistics, and race-safe invalidation in both SQL and Mongo wrappers.
-  - [ ] Add secondary-index-to-primary mappings and invalidate every related key atomically after
+  - [x] Add secondary-index-to-primary mappings and invalidate every related key atomically after
     insert, update, or delete.
-  - [ ] Add Redis-backed cache nodes with standalone/cluster routing, serialization errors,
+  - [x] Add Redis-backed cache nodes with standalone/cluster routing, serialization errors,
     not-found sentinels, and cross-process invalidation tests.
-- [ ] **Store helper depth.** Add Redis subscription, remaining streams/consumer-group helpers,
-  pipelines and script helpers; SQL bulk insert, typed
-  query/execute instrumentation, and standardized not-found errors; Mongo bulk insertion,
-  cached-model mutation helpers, and tracing/metrics hooks.
+- [x] **Store helper depth.** Complete the remaining SQL, Mongo, and Redis operational helpers.
+  - [x] Add timeout-aware Redis pipelines and Lua scripts plus stream append/read,
+    consumer-group create/destroy/read/cursor, pending/claim, acknowledgement, and deletion helpers.
+  - [x] Add reconnecting Redis channel/pattern subscriptions with bounded delivery and explicit
+    lag/closure behavior.
+  - [x] Add SQL bulk insert, typed query/execute instrumentation, and standardized not-found
+    errors.
+  - [x] Add Mongo native bounded bulk insertion, standardized not-found errors, cache-aware
+    insert/update/replace/delete helpers, cardinality-bounded metrics, and opt-in tracing.
+  - [x] Add equivalent operation metrics and tracing hooks to the Redis adapter so all three
+    external-store families share the same observability baseline.
 - [x] **Queue runtime.** Supervised bounded queues provide configurable worker pools,
   pause/resume, bounded shutdown, surfaced worker panics, per-message lifecycle/failure events,
   balanced failover pushing, fan-out pushing, and Prometheus processing metrics.
-- [ ] **MCP server runtime.** Add Streamable HTTP transport, tool/resource/prompt registration,
+- [x] **MCP server runtime.** Add Streamable HTTP transport, tool/resource/prompt registration,
   session lifecycle, protocol-compliant errors, graceful shutdown, and an opt-in bridge that makes
   HTTP headers, query values, and path parameters available to handlers. Cover initialization,
   stateless/stateful sessions, notifications, cancellation, and reconnect behavior in integration
   tests.
+  - [x] Add the protocol core and stateless 2025-03-26 Streamable HTTP endpoint with validated
+    configuration, JSON/SSE responses, tool/resource/prompt registration and dispatch,
+    protocol-compliant errors, request timeouts, notifications, origin protection, and HTTP
+    header/query/path metadata projection.
+  - [x] Add stateful session IDs, GET event streams, resumable event cursors, explicit DELETE
+    termination, request cancellation, and reconnect integration tests.
+  - [x] Integrate MCP startup and bounded graceful draining with the standard service lifecycle
+    and add an end-to-end example covering tools, resources, and prompts.
 - [x] **Executor family.** Byte-weighted chunk batching, coalesced delayed execution, and
   threshold/"less" execution are present. Chunk and delay executors provide explicit shutdown;
   delayed and periodic jobs surface worker failures and support bounded shutdown.
-- [ ] **Authentication parity.** Add configurable JWT claim projection, request-signature
-  authentication, and consistent REST/gRPC auth failure responses. HS256 validation and previous-
-  secret rotation are already supported.
-- [ ] **Logging operations.** Add non-blocking buffered output, retention and compression of rotated
-  files, remote writer hooks, dropped-log accounting, and transport-aware slow-call fields.
+- [x] **Authentication parity.** Configurable dot-path JWT claim projection, time-window-bounded HMAC
+  request signatures, current/previous signing keys, and stable `auth_*` failures are shared by
+  REST and gRPC.
+- [x] **Logging operations.** Bounded non-blocking output, application-provided local/remote writer
+  hooks, dropped-record accounting, rotated-file retention/compression, and transport-aware REST
+  and gRPC slow-call classification are present.
+  - [x] Add bounded non-blocking writer threads that shed instead of stalling callers, expose a
+    dropped-record count, and accept application-provided remote writers.
+  - [x] Add stable HTTP slow-call fields covering the transport, route template, elapsed time,
+    configured threshold, and slow classification.
+  - [x] Add retention and optional compression for daily and size-rotated files.
+  - [x] Add equivalent method/status/deadline-aware slow-call fields to the gRPC stack.
 
 ## P2 — completeness and operational polish
 
-- [ ] Add weighted endpoint metadata, active health checking, resolver backoff/jitter, and explicit
-  degraded/ready states to discovery and balancing.
-- [ ] Expand the dev server with sampling profiles/flamegraphs, task and allocator diagnostics,
-  authenticated access, and an option to bind diagnostics only to a private interface.
-- [ ] Add REST content encryption/decryption middleware with a pluggable key provider if real users
-  require parity with go-zero's cryption handler.
-- [ ] Add gateway configuration loading, per-upstream middleware, connection draining, streaming
-  proxy tests, and end-to-end examples for mixed HTTP and gRPC upstreams.
-- [ ] Publish compatibility policy, MSRV, feature-combination CI, rustdoc examples, and runnable
-  deployment examples for etcd, Kubernetes, telemetry, and external stores.
+- [x] **Discovery readiness and balancing.** Weighted endpoint metadata, active transport probes,
+  and observable empty/ready/degraded channel states are present.
+  - [x] Add bounded endpoint weights and arbitrary metadata to the backend-neutral subscription
+    API while keeping string-only discovery implementations source-compatible.
+  - [x] Make dynamic gRPC balancing honor relative weights, actively remove failed probes, restore
+    recovered endpoints, and expose discovered/available/rejected counts.
+  - [x] Add configurable exponential reconnect backoff with jitter to the etcd and Kubernetes
+    resolver loops, including deterministic reconnect tests.
+  - [x] Feed discovery channel status into the standard gRPC health service and dev-server health
+    aggregation without requiring application polling.
+- [x] **Production dev diagnostics.** The dev server provides feature-gated sampling flamegraphs,
+  Tokio task/runtime and process allocator-memory diagnostics, constant-time bearer protection,
+  secret-redacted configuration, bounded sampling settings, and validated private-only binds.
+- [x] **REST content encryption.** Opt-in request decryption and response encryption use a
+  versioned, authenticated AES-256-GCM envelope, bounded buffering, explicit key IDs, a pluggable
+  current/retained-key provider, rotation coverage, and fail-closed handling for malformed input
+  and incompatible streaming responses.
+- [x] **Gateway operations.** Configuration-driven startup, named upstream policy chains,
+  streaming-safe graceful draining, and a runnable mixed-protocol deployment are present.
+  - [x] Add validated JSON/JSON5/TOML/YAML configuration loading for listener, timeout, body-limit,
+    worker, route, and upstream settings, plus a signal-aware runnable binary.
+  - [x] Add named per-upstream middleware/policies.
+  - [x] Add bounded Actix connection draining and prove an in-flight proxy call completes.
+  - [x] Stream upstream response bodies without whole-response buffering and cover delayed chunks.
+  - [x] Add an end-to-end deployment example for mixed HTTP and gRPC upstreams.
+- [x] **Release operations.** Publish a compatibility policy and Rust 1.89 MSRV, enforce locked
+  minimal/adapter/telemetry/all-feature and rustdoc CI, and provide compiled runnable deployment
+  examples for etcd, Kubernetes, OTLP telemetry, and Redis/SQL/MongoDB stores.
 
 ## Recommended execution order
 
-These are the next independently shippable slices, ordered by parity impact and dependency:
+Implement the P0 items in order: distributed limiting, rolling adaptive breaking, then
+CPU/throughput-aware shedding. After their transport integrations and fault tests are stable, add
+the benchmark suite before changing crate names or cutting a prerelease. Durable brokers remain an
+intentional ecosystem boundary; applications select clients that match their delivery semantics.
 
-1. **REST extension points:** named application middleware registry for declarative groups, then a
-   safe static-directory/embedded fallback and a prebuilt serverless handler.
-2. **Model cache indexes:** secondary-to-primary key mapping and mutation-wide invalidation, then a
-   Redis-backed implementation tested against standalone and clustered Redis.
-3. **Store depth:** Redis pub/sub, streams, pipelines, and scripts; standardized SQL not-found and
-   bulk helpers; Mongo bulk/mutation helpers; shared tracing and metrics hooks.
-4. **Authentication:** JWT claim projection and request-signature verification shared by REST and
-   gRPC, with one stable error taxonomy.
-5. **Logging operations:** bounded non-blocking writer, dropped-record metric, rotated-file
-   retention/compression, remote sink hooks, and slow-call fields.
-6. **MCP runtime:** protocol core and stateless Streamable HTTP first; stateful sessions,
-   reconnect/cancellation, metadata bridging, and graceful drain second.
-7. **Discovery readiness:** weighted metadata, active probes, jittered reconnect backoff, and
-   explicit ready/degraded states consumed by balancers and health endpoints.
-8. **Operational polish:** gateway configuration/draining, authenticated richer diagnostics,
-   feature-matrix CI, MSRV policy, and deployment examples.
+## Remaining catch-up items
+
+`goctl`, all other code generation, and MCP remain outside this catch-up scope.
+
+### P0 — runtime semantics
+
+- [x] **Redis-backed distributed rate limiting.** Atomic Redis/Lua token and keyed-period
+  limiters so quotas are shared across service instances, while retaining a bounded process-local
+  rescue limiter when Redis is unavailable. Async cancellation-safe operations, Redis-server-time
+  aligned period boundaries, stable allowed/hit/over-quota outcomes, request-driven single-probe
+  recovery monitoring, and real standalone and clustered Redis tests are present.
+- [x] **Rolling adaptive circuit breaker.** Add a go-zero-equivalent rolling-window breaker mode
+  that derives a probabilistic drop ratio from recent accepted and total requests, guarantees
+  occasional probe traffic, and records success, failure, rejection, cancellation, and protocol
+  outcomes correctly under concurrency. Preserve the existing consecutive-failure breaker as an
+  explicitly selectable policy and add deterministic fault-pattern tests for both modes.
+- [x] **CPU- and throughput-aware load shedding.** A production shedder mode combines
+  process CPU pressure, rolling maximum throughput, minimum response time, current and smoothed
+  in-flight work, and a post-overload cooldown window. It is integrated into the standard REST and
+  gRPC server stacks, retains permits through response-stream completion, and covers saturation,
+  recovery, sparse traffic, and concurrent permit completion.
+
+### P1 — production confidence and adoption
+
+- [x] **Reproducible performance and fault benchmarks.** Versioned, configurable workloads cover
+  REST and gRPC throughput and tail latency, allocation/memory behavior, circuit breaking under
+  partial dependency failure, overload recovery, large discovery snapshots, and queue saturation.
+  The runner emits raw JSON with configuration and build identity, while the benchmark guide
+  documents hardware capture, commands, result retention, and regression comparison methodology.
+- [ ] **Publishable, versioned crates.** Give every public crate a stable rust-zero-prefixed package
+  name and complete license, repository, documentation, and description metadata; add registry
+  versions to workspace path dependencies; verify independent `cargo package` builds; publish API
+  documentation and a changelog; and cut the first tagged prerelease without weakening the stated
+  Rust 1.89 MSRV policy.
+  - [x] Assign the six public crates `rust-zero-*` package names and a shared `0.1.0-alpha.1`
+    version while preserving the existing short Rust library import names.
+  - [x] Add SPDX license, repository, homepage, README, description, category, keyword, and
+    docs.rs metadata, registry versions on every path dependency, and explicit non-publishable
+    demo/benchmark packages.
+  - [x] Build and verify every normalized package archive independently in CI, including the
+    unpublished-core bootstrap used only before the first registry release.
+  - [x] Add the public crate/documentation index, changelog, and repeatable release checklist.
+  - [ ] Publish the six crates in dependency order, verify their live docs.rs builds, and create
+    the signed `v0.1.0-alpha.1` tag from the release commit.
+- [x] **Durable broker ecosystem boundary.** External messaging is not a rust-zero parity claim.
+  Applications select Kafka, RabbitMQ, or another client according to the required delivery and
+  operational semantics, and may hand decoded work to rust-zero's supervised in-process queue.
+  This avoids a lowest-common-denominator broker abstraction and keeps broker-specific retry,
+  acknowledgement, offset, topology, and transaction behavior visible to applications.
 
 ## Recently completed
 
+- [x] A versioned benchmark runner covering live REST/gRPC throughput and tail latency, allocator
+  behavior and peak RSS, partial-failure circuit breaking, overload recovery, 10,000-endpoint
+  discovery snapshots, and saturated supervised queues, with raw JSON output and a reproducibility
+  guide.
+- [x] Process-CPU and rolling-throughput-aware production shedding with learned minimum-latency
+  capacity, smoothed and current in-flight checks, bounded cooldown recovery, shared REST worker
+  state, gRPC stack integration, stream-lifetime permits, and deterministic saturation, sparse-
+  traffic, recovery, and concurrency tests.
+- [x] Selectable consecutive and rolling adaptive circuit breakers with configurable bucketed
+  histories, go-zero-compatible accepted/total drop ratios, probabilistic rejection, bounded
+  recovery probes, deterministic fault patterns, concurrent outcome snapshots, and cancellation-
+  aware HTTP/gRPC transport feedback.
+- [x] Atomic standalone/clustered Redis token and aligned keyed-period limiters with stable quota
+  outcomes, bounded local outage rescue, single-caller recovery probing, observable failure and
+  recovery counters, concurrent quota tests, and real-backend CI coverage.
+- [x] Opt-in authenticated REST body encryption with a documented AES-256-GCM/base64 envelope,
+  method/URI/status-bound authentication, bounded request/response buffering, explicit key IDs,
+  current/previous key rotation, pluggable providers, standard-server integration, and tamper tests.
+- [x] Rust 1.89 MSRV and compatibility policy, locked minimal/adapter/telemetry/all-feature CI,
+  warning-free rustdoc with six compiled feature examples, and runnable etcd, Kubernetes, OTLP,
+  and external-store deployment examples.
+- [x] A self-contained mixed-protocol gateway deployment with an HTTP reverse-proxy route,
+  descriptor-driven JSON-to-gRPC unary and streaming routes, configurable listener addresses, and
+  coordinated signal-driven shutdown of the gateway and both sample upstreams.
+- [x] Ordered named gateway middleware on configured upstream pools, with outbound request
+  mutation, short-circuiting, response wrapping, route isolation, and pre-serve validation for
+  blank, duplicate, or unregistered policy names.
+- [x] Validated file-backed gateway configuration and runnable signal-aware startup, true streamed
+  HTTP proxy responses with cumulative limits, and bounded graceful draining proven with an
+  in-flight request.
+- [x] Authenticated internal diagnostics with private-interface enforcement, Tokio task/runtime
+  metrics, process allocator-memory high-water reporting, and bounded opt-in sampling flamegraphs.
+- [x] Configurable capped exponential resolver reconnect with bounded jitter for etcd and
+  Kubernetes, etcd relisting after broken or compacted watches, and direct discovery-readiness
+  projection into Tonic health and the shared dev-server health aggregate.
+- [x] Backward-compatible structured discovery endpoints with bounded relative weights and
+  arbitrary metadata, weighted dynamic gRPC channel entries, opt-in active HTTP/2 probes that
+  remove and restore peers, and watchable empty/ready/degraded counts.
+- [x] Stateful MCP sessions with idle expiry, resumable event IDs and bounded replay, long-lived GET
+  streams, explicit DELETE termination, cancellation of in-flight requests, reconnect coverage,
+  standalone startup, graceful draining, shared service supervision, and a runnable example.
+- [x] Stateless MCP Streamable HTTP protocol core with validated configuration, deterministic
+  tool/resource/prompt registries, initialization and notification handling, JSON-RPC errors,
+  JSON/SSE responses, origin checks, deadlines, and request metadata projection.
+- [x] Daily log retention and opt-in gzip compression for daily and size-rotated files, plus final-
+  trailer-aware gRPC server logs with stable method, status, deadline, elapsed, slow, and trace
+  fields.
+- [x] Shared REST/gRPC authentication primitives with configurable JWT claim projection,
+  current/previous HS256 secrets, method/target-bound HMAC signatures with bounded clock skew,
+  caller key propagation, and stable machine-readable failure codes.
+- [x] Cardinality-bounded Redis command metrics and opt-in OpenTelemetry spans, including distinct
+  timeout outcomes and bounded labels for application-supplied raw commands.
+- [x] MongoDB typed query/execute helpers with stable not-found errors, native bounded bulk
+  insertion, Prometheus operation metrics, opt-in OpenTelemetry spans, and cache-aware
+  insert/update/replace/delete helpers that invalidate primary and secondary keys after success.
+- [x] Typed SQL query/execute helpers with standardized database and not-found errors,
+  cardinality-bounded Prometheus metrics, opt-in OpenTelemetry spans, and database-neutral bounded
+  bulk insertion across caller-supplied SQLx statements.
+- [x] Namespace-aware Redis channel and pattern subscriptions with bounded delivery, explicit lag,
+  disconnect/reconnect/closure events, exponential reconnect backoff across seed endpoints, and
+  deterministic shutdown.
+- [x] Timeout-aware Redis pipeline and Lua execution plus namespaced stream append/read,
+  consumer-group lifecycle/read/cursor, pending/claim, acknowledgement, and deletion helpers.
+- [x] Redis-backed model caching over standalone or clustered stores, with tagged positive and
+  not-found JSON entries, separate jittered TTLs, per-process single-flight loading, statistics,
+  explicit serialization failures, and cluster-safe cross-process invalidation.
+- [x] Bounded SQL/Mongo secondary-to-primary cache mappings with distinct key types, negative
+  index caching, single-flight loads, shared primary records/statistics, and atomic mutation-wide
+  invalidation of learned and newly introduced index keys.
+- [x] A reusable socket-free REST handler that runs platform-neutral requests through the same
+  routes, extractors, application middleware, protection, observability, response policy, and
+  static fallback as the listener-based server.
+- [x] Opt-in REST static fallback with embedded assets, canonicalized directory roots, index-file
+  handling, MIME types, `GET`/`HEAD` semantics, and traversal/symlink-escape protection.
+- [x] Ordered, named application middleware for declarative REST route groups, with full async
+  wrapping/short-circuit behavior and validation of duplicate or unregistered names.
 - [x] Generated-service-independent gRPC lifecycle coverage for unary, client-streaming,
   server-streaming, and bidirectional calls, including auth/trace ordering, health transitions,
   final status mapping, client/server cancellation metrics, circuit feedback, successful graceful

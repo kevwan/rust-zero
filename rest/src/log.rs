@@ -6,7 +6,7 @@ use futures::future::{ok, LocalBoxFuture, Ready};
 use rust_zero_core::{LogContext, LogField, LogLevel, Logger, TraceContext};
 use std::{
     task::{Context, Poll},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use crate::RequestIdValue;
@@ -85,11 +85,23 @@ where
 #[derive(Debug, Clone)]
 pub struct StructuredLogging {
     logger: Logger,
+    slow_threshold: Option<Duration>,
 }
 
 impl StructuredLogging {
     pub fn new(logger: Logger) -> Self {
-        Self { logger }
+        Self {
+            logger,
+            slow_threshold: None,
+        }
+    }
+
+    /// Classifies completed calls at or above `threshold` as slow and adds stable transport-aware
+    /// fields suitable for log queries and alerts.
+    pub fn with_slow_threshold(mut self, threshold: Duration) -> Self {
+        assert!(!threshold.is_zero(), "slow-call threshold must be positive");
+        self.slow_threshold = Some(threshold);
+        self
     }
 }
 
@@ -109,6 +121,7 @@ where
         ok(StructuredLoggingService {
             service,
             logger: self.logger.clone(),
+            slow_threshold: self.slow_threshold,
         })
     }
 }
@@ -116,6 +129,7 @@ where
 pub struct StructuredLoggingService<S> {
     service: S,
     logger: Logger,
+    slow_threshold: Option<Duration>,
 }
 
 impl<S, B> Service<ServiceRequest> for StructuredLoggingService<S>
@@ -142,35 +156,61 @@ where
         let started_at = Instant::now();
         let future = self.service.call(request);
         let logger = self.logger.clone();
+        let slow_threshold = self.slow_threshold;
 
         Box::pin(async move {
             let context = request_context(request_id, trace);
             match future.await {
                 Ok(response) => {
+                    let elapsed = started_at.elapsed();
+                    let slow = slow_threshold.is_some_and(|threshold| elapsed >= threshold);
+                    let mut fields = vec![
+                        LogField::new("transport", "http"),
+                        LogField::new("method", method),
+                        LogField::new("path", path),
+                        LogField::new("status", response.status().as_u16()),
+                        LogField::new("elapsed_ms", elapsed.as_millis() as u64),
+                        LogField::new("slow", slow),
+                    ];
+                    if let Some(route) = response.request().match_pattern() {
+                        fields.push(LogField::new("route", route));
+                    }
+                    if let Some(threshold) = slow_threshold {
+                        fields.push(LogField::new(
+                            "slow_threshold_ms",
+                            threshold.as_millis() as u64,
+                        ));
+                    }
                     let _ = logger.log_with_context(
-                        LogLevel::Info,
+                        if slow { LogLevel::Slow } else { LogLevel::Info },
                         "HTTP request completed",
                         Some(&context),
-                        [
-                            LogField::new("method", method),
-                            LogField::new("path", path),
-                            LogField::new("status", response.status().as_u16()),
-                            LogField::new("elapsed_ms", started_at.elapsed().as_millis() as u64),
-                        ],
+                        fields,
                     );
                     Ok(response)
                 }
                 Err(error) => {
+                    let elapsed = started_at.elapsed();
+                    let slow = slow_threshold.is_some_and(|threshold| elapsed >= threshold);
+                    let mut fields = vec![
+                        LogField::new("transport", "http"),
+                        LogField::new("method", method),
+                        LogField::new("path", path),
+                        LogField::new("elapsed_ms", elapsed.as_millis() as u64),
+                        LogField::new("slow", slow),
+                        LogField::new("error", error.to_string()),
+                    ];
+                    if let Some(threshold) = slow_threshold {
+                        fields.push(LogField::new(
+                            "slow_threshold_ms",
+                            threshold.as_millis() as u64,
+                        ));
+                    }
                     let _ = logger.log_with_context(
                         LogLevel::Error,
                         "HTTP request failed",
                         Some(&context),
-                        [
-                            LogField::new("method", method),
-                            LogField::new("path", path),
-                            LogField::new("elapsed_ms", started_at.elapsed().as_millis() as u64),
-                            LogField::new("error", error.to_string()),
-                        ],
+                        fields,
                     );
                     Err(error)
                 }
@@ -251,5 +291,40 @@ mod tests {
         assert_eq!(record["trace_id"], "4bf92f3577b34da6a3ce929d0e0e4736");
         assert_eq!(record["method"], "GET");
         assert_eq!(record["status"], 204);
+        assert_eq!(record["transport"], "http");
+        assert_eq!(record["route"], "/");
+        assert_eq!(record["slow"], false);
+    }
+
+    #[actix_rt::test]
+    async fn classifies_slow_requests_with_queryable_fields() {
+        let output = SharedWriter::default();
+        let logger = Logger::to_writer(LogConfig::console("api"), output.clone()).unwrap();
+        let app = test::init_service(
+            App::new()
+                .wrap(
+                    StructuredLogging::new(logger)
+                        .with_slow_threshold(std::time::Duration::from_millis(1)),
+                )
+                .route(
+                    "/users/{id}",
+                    web::get().to(|| async {
+                        actix_rt::time::sleep(std::time::Duration::from_millis(5)).await;
+                        HttpResponse::NoContent().finish()
+                    }),
+                ),
+        )
+        .await;
+
+        let response =
+            test::call_service(&app, test::TestRequest::get().uri("/users/42").to_request()).await;
+        assert_eq!(response.status(), 204);
+
+        let bytes = output.0.lock().unwrap().clone();
+        let record: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(record["level"], "slow");
+        assert_eq!(record["route"], "/users/{id}");
+        assert_eq!(record["slow"], true);
+        assert_eq!(record["slow_threshold_ms"], 1);
     }
 }

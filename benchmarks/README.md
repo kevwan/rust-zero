@@ -1,0 +1,45 @@
+# Reproducible benchmarks
+
+This package contains the versioned `v1` workload used to track rust-zero throughput, tail
+latency, allocation/memory behavior, and failure recovery. It intentionally uses a standalone
+binary instead of a micro-benchmark harness: the REST and gRPC cases traverse real loopback
+transports, and every workload emits the same machine-readable schema.
+
+## Run
+
+Use an otherwise idle machine, performance power mode, and a release build. Record the exact
+revision and compiler in the output:
+
+```sh
+RUST_ZERO_GIT_REVISION="$(git rev-parse HEAD)" \
+RUST_ZERO_RUSTC="$(rustc -Vv | tr '\n' ' ')" \
+cargo run --release --locked -p rust-zero-benchmarks -- benchmarks/config/v1.toml \
+  > benchmarks/results/v1-$(uname -m)-$(uname -s | tr A-Z a-z).json
+```
+
+Run at least five times after one discarded warm-up run. Keep every raw JSON file; compare the
+median `operations_per_second`, `p95_us`, `p99_us`, `allocations`, and `allocated_bytes`. Treat a
+change as a regression candidate when it repeats in three runs and exceeds both 5% and ordinary
+run-to-run variation. Transport results are loopback-only and should only be compared on the same
+machine and OS configuration.
+
+The workloads are:
+
+- `rest_transport` and `grpc_transport`: concurrent echo traffic over TCP;
+- `circuit_breaker_partial_failure`: deterministic partial dependency failure and rejection;
+- `overload_recovery`: admission rejection at capacity followed by immediate recovery;
+- `large_discovery_snapshot`: cloning a 10,000-endpoint complete snapshot;
+- `queue_saturation`: producer latency while a bounded supervised queue remains saturated.
+
+The counting global allocator reports total allocation calls and requested bytes during each
+measured interval. `peak_rss_kib` comes from `getrusage`; because it is a process high-water mark,
+it is cumulative across workloads. The JSON configuration is embedded in every result.
+
+## Hardware record
+
+Alongside raw output, record CPU model/core count, RAM, OS/kernel, power mode, compiler, target,
+and whether the machine was virtualized. Useful commands are `uname -a`, `rustc -Vv`, and, on
+Linux, `lscpu` plus `free -h`; on macOS use `system_profiler SPHardwareDataType` and `sw_vers`.
+
+Commit representative raw runs under `results/` only when the hardware record is complete. Do not
+compare absolute numbers across different hosts.

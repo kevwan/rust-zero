@@ -4,11 +4,17 @@
 //! centralize the transport safeguards that should be applied consistently across services.
 
 use std::{
-    collections::BTreeSet, error::Error as StdError, fmt, future::Future, net::SocketAddr,
+    collections::{BTreeMap, BTreeSet},
+    error::Error as StdError,
+    fmt,
+    future::Future,
+    net::SocketAddr,
     time::Duration,
 };
 
-use rust_zero_core::{DiscoveryError, EndpointSubscription, ServiceRegistry};
+use rust_zero_core::{
+    DiscoveredEndpoint, DiscoveryError, EndpointSubscription, HealthRegistry, ServiceRegistry,
+};
 use serde::{Deserialize, Serialize};
 use tonic::transport::{Channel, Endpoint, Server};
 use tower::discover::Change;
@@ -23,9 +29,10 @@ pub mod echo {
     tonic::include_proto!("rust_zero.echo");
 }
 
-pub use auth::{BearerToken, RpcBearerAuth};
+pub use auth::{BearerToken, RpcBearerAuth, RpcJwtAuth, RpcRequestSignatureAuth, RpcRequestSigner};
 pub use metrics::{RpcMetricMode, RpcMetrics, RpcMetricsLayer};
-pub use resilience::{acceptable_status, RpcCircuitBreaker, RpcLoadShedder};
+pub use resilience::{acceptable_status, circuit_outcome, RpcCircuitBreaker, RpcLoadShedder};
+pub use rust_zero_core::{AuthFailure, JwtClaimProjection, RequestSignatureVerifier};
 pub use stack::{
     RpcClientStack, RpcClientStackBuilder, RpcClientStackService, RpcServerStack,
     RpcServerStackBuilder,
@@ -254,6 +261,16 @@ pub struct RpcClientConfig {
     #[serde(rename = "keepalive_timeout_ms", with = "optional_duration_millis")]
     keepalive_timeout: Option<Duration>,
     keepalive_while_idle: bool,
+    #[serde(
+        rename = "discovery_health_interval_ms",
+        with = "optional_duration_millis"
+    )]
+    discovery_health_interval: Option<Duration>,
+    #[serde(
+        rename = "discovery_health_timeout_ms",
+        with = "optional_duration_millis"
+    )]
+    discovery_health_timeout: Option<Duration>,
 }
 
 impl Default for RpcClientConfig {
@@ -273,6 +290,8 @@ impl RpcClientConfig {
             http2_keepalive_interval: None,
             keepalive_timeout: None,
             keepalive_while_idle: false,
+            discovery_health_interval: None,
+            discovery_health_timeout: None,
         }
     }
 
@@ -328,6 +347,21 @@ impl RpcClientConfig {
         self
     }
 
+    /// Enables periodic HTTP/2 connection probes for discovered endpoints.
+    pub fn with_discovery_health_check(mut self, interval: Duration, timeout: Duration) -> Self {
+        assert!(
+            !interval.is_zero(),
+            "discovery health interval must be positive"
+        );
+        assert!(
+            !timeout.is_zero(),
+            "discovery health timeout must be positive"
+        );
+        self.discovery_health_interval = Some(interval);
+        self.discovery_health_timeout = Some(timeout);
+        self
+    }
+
     pub fn validate(&self) -> Result<(), RpcConfigError> {
         if self.uri.trim().is_empty() {
             return Err(RpcConfigError::Invalid("client URI must not be empty"));
@@ -338,6 +372,8 @@ impl RpcClientConfig {
             ("TCP keepalive interval", self.tcp_keepalive),
             ("HTTP/2 keepalive interval", self.http2_keepalive_interval),
             ("HTTP/2 keepalive timeout", self.keepalive_timeout),
+            ("discovery health interval", self.discovery_health_interval),
+            ("discovery health timeout", self.discovery_health_timeout),
         ] {
             if duration.is_some_and(|duration| duration.is_zero()) {
                 return Err(RpcConfigError::Invalid(match name {
@@ -346,6 +382,12 @@ impl RpcClientConfig {
                     "TCP keepalive interval" => "TCP keepalive interval must be greater than zero",
                     "HTTP/2 keepalive interval" => {
                         "HTTP/2 keepalive interval must be greater than zero"
+                    }
+                    "discovery health interval" => {
+                        "discovery health interval must be greater than zero"
+                    }
+                    "discovery health timeout" => {
+                        "discovery health timeout must be greater than zero"
                     }
                     _ => "HTTP/2 keepalive timeout must be greater than zero",
                 }));
@@ -361,7 +403,94 @@ impl RpcClientConfig {
                 "HTTP/2 keepalive interval and timeout must be configured together",
             ));
         }
+        if self.discovery_health_interval.is_some() != self.discovery_health_timeout.is_some() {
+            return Err(RpcConfigError::Invalid(
+                "discovery health interval and timeout must be configured together",
+            ));
+        }
         Ok(())
+    }
+}
+
+/// Aggregate availability exposed by a discovered RPC channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiscoveryReadiness {
+    Empty,
+    Ready,
+    Degraded,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiscoveryStatusSnapshot {
+    pub readiness: DiscoveryReadiness,
+    pub discovered: usize,
+    pub available: usize,
+    pub rejected: usize,
+}
+
+impl DiscoveryStatusSnapshot {
+    pub fn is_ready(self) -> bool {
+        self.readiness == DiscoveryReadiness::Ready
+    }
+}
+
+/// Watchable readiness for a channel created from service discovery.
+#[derive(Debug, Clone)]
+pub struct DiscoveryStatus {
+    receiver: tokio::sync::watch::Receiver<DiscoveryStatusSnapshot>,
+}
+
+impl DiscoveryStatus {
+    pub fn snapshot(&self) -> DiscoveryStatusSnapshot {
+        *self.receiver.borrow()
+    }
+
+    pub async fn changed(
+        &mut self,
+    ) -> Result<DiscoveryStatusSnapshot, tokio::sync::watch::error::RecvError> {
+        self.receiver.changed().await?;
+        Ok(self.snapshot())
+    }
+
+    /// Projects channel readiness into the shared HTTP/dev-server health aggregate.
+    pub fn project_to_health(
+        mut self,
+        registry: HealthRegistry,
+        dependency: impl Into<String>,
+    ) -> tokio::task::JoinHandle<()> {
+        let dependency = dependency.into();
+        tokio::spawn(async move {
+            registry.set(&dependency, self.snapshot().is_ready());
+            while self.receiver.changed().await.is_ok() {
+                registry.set(&dependency, self.snapshot().is_ready());
+            }
+            registry.set(dependency, false);
+        })
+    }
+
+    /// Projects channel readiness into a standard gRPC health service entry.
+    pub fn project_to_grpc_health(
+        mut self,
+        mut reporter: HealthReporter,
+        service_name: impl Into<String>,
+    ) -> tokio::task::JoinHandle<()> {
+        let service_name = service_name.into();
+        tokio::spawn(async move {
+            loop {
+                let serving = if self.snapshot().is_ready() {
+                    tonic_health::ServingStatus::Serving
+                } else {
+                    tonic_health::ServingStatus::NotServing
+                };
+                reporter.set_service_status(&service_name, serving).await;
+                if self.receiver.changed().await.is_err() {
+                    reporter
+                        .set_service_status(&service_name, tonic_health::ServingStatus::NotServing)
+                        .await;
+                    return;
+                }
+            }
+        })
     }
 }
 
@@ -414,66 +543,169 @@ impl RpcClient {
     /// Empty snapshots are supported and recover when endpoints appear. Malformed endpoints are
     /// ignored without poisoning the rest of a snapshot. The watcher exits when the discovery
     /// stream closes or all clones of the returned channel have been dropped.
-    pub fn connect_discovered<S>(&self, mut subscription: S) -> Channel
+    pub fn connect_discovered<S>(&self, subscription: S) -> Channel
     where
         S: EndpointSubscription,
     {
-        let initial = subscription.endpoints();
-        let mut configured = Vec::with_capacity(initial.len());
-        for uri in initial {
-            if let Ok(endpoint) = self.endpoint(uri.clone()) {
-                configured.push((uri, endpoint));
+        self.connect_discovered_with_status(subscription).0
+    }
+
+    /// Creates a weighted discovery channel and a watchable readiness handle.
+    ///
+    /// Invalid endpoint URIs are excluded and make the snapshot degraded. When active health
+    /// checking is configured, failed probes are removed until a later probe succeeds.
+    pub fn connect_discovered_with_status<S>(
+        &self,
+        mut subscription: S,
+    ) -> (Channel, DiscoveryStatus)
+    where
+        S: EndpointSubscription,
+    {
+        let initial = subscription.discovered_endpoints();
+        let (configured, rejected) = self.configure_discovered(initial);
+
+        let capacity = configured
+            .values()
+            .map(|(_, endpoint)| endpoint.weight() as usize)
+            .sum::<usize>()
+            .max(128);
+        let (channel, changes) = Channel::balance_channel(capacity);
+        let mut installed = BTreeSet::new();
+        for (uri, (endpoint, discovered)) in &configured {
+            for slot in 0..discovered.weight() {
+                let key = weighted_key(uri, slot);
+                installed.insert(key.clone());
+                changes
+                    .try_send(Change::Insert(key, endpoint.clone()))
+                    .expect(
+                        "discovery channel is sized for its weighted initial endpoint snapshot",
+                    );
             }
         }
-
-        let capacity = configured.len().max(128);
-        let (channel, changes) = Channel::balance_channel(capacity);
-        let mut known = BTreeSet::new();
-        for (uri, endpoint) in configured {
-            known.insert(uri.clone());
-            changes
-                .try_send(Change::Insert(uri, endpoint))
-                .expect("discovery channel is sized for its initial endpoint snapshot");
-        }
+        let initial_status = discovery_status(configured.len(), configured.len(), rejected);
+        let (status_updates, status_receiver) = tokio::sync::watch::channel(initial_status);
 
         let client = self.clone();
         tokio::spawn(async move {
+            let mut configured = configured;
+            let mut available: BTreeSet<String> = configured.keys().cloned().collect();
+            let mut rejected = rejected;
+            let mut health_ticks = client.discovery_health_ticks();
             loop {
-                let snapshot = tokio::select! {
+                tokio::select! {
                     _ = changes.closed() => return,
-                    snapshot = subscription.changed() => snapshot,
-                };
-                let Ok(snapshot) = snapshot else {
-                    return;
-                };
-                let current: BTreeSet<_> = snapshot
-                    .into_iter()
-                    .filter(|uri| client.endpoint(uri.clone()).is_ok())
-                    .collect();
+                    snapshot = subscription.changed() => {
+                        if snapshot.is_err() {
+                            let mut closed = discovery_status(
+                                configured.len(),
+                                0,
+                                rejected,
+                            );
+                            closed.readiness = DiscoveryReadiness::Degraded;
+                            status_updates.send_replace(closed);
+                            return;
+                        }
+                        let (next, next_rejected) =
+                            client.configure_discovered(subscription.discovered_endpoints());
+                        configured = next;
+                        rejected = next_rejected;
+                        available.retain(|uri| configured.contains_key(uri));
+                        available.extend(configured.keys().cloned());
+                    }
+                    _ = health_ticks.tick(), if client.config.discovery_health_interval.is_some() => {
+                        available = client.probe_discovered(&configured).await;
+                    }
+                }
 
-                for uri in known.difference(&current).cloned().collect::<Vec<_>>() {
-                    if changes.send(Change::Remove(uri.clone())).await.is_err() {
+                let desired = weighted_keys(&configured, &available);
+                for key in installed.difference(&desired).cloned().collect::<Vec<_>>() {
+                    if changes.send(Change::Remove(key.clone())).await.is_err() {
                         return;
                     }
-                    known.remove(&uri);
+                    installed.remove(&key);
                 }
-                for uri in current.difference(&known).cloned().collect::<Vec<_>>() {
-                    let Ok(endpoint) = client.endpoint(uri.clone()) else {
+                for key in desired.difference(&installed).cloned().collect::<Vec<_>>() {
+                    let Some((uri, _)) = key.rsplit_once('\0') else {
+                        continue;
+                    };
+                    let Some((endpoint, _)) = configured.get(uri) else {
                         continue;
                     };
                     if changes
-                        .send(Change::Insert(uri.clone(), endpoint))
+                        .send(Change::Insert(key.clone(), endpoint.clone()))
                         .await
                         .is_err()
                     {
                         return;
                     }
-                    known.insert(uri);
+                    installed.insert(key);
                 }
+                status_updates.send_replace(discovery_status(
+                    configured.len(),
+                    available.len(),
+                    rejected,
+                ));
             }
         });
 
-        channel
+        (
+            channel,
+            DiscoveryStatus {
+                receiver: status_receiver,
+            },
+        )
+    }
+
+    fn configure_discovered(
+        &self,
+        endpoints: Vec<DiscoveredEndpoint>,
+    ) -> (BTreeMap<String, (Endpoint, DiscoveredEndpoint)>, usize) {
+        let discovered = endpoints.len();
+        let configured: BTreeMap<_, _> = endpoints
+            .into_iter()
+            .filter_map(|discovered| {
+                self.endpoint(discovered.uri().to_owned())
+                    .ok()
+                    .map(|endpoint| (discovered.uri().to_owned(), (endpoint, discovered)))
+            })
+            .collect();
+        let rejected = discovered.saturating_sub(configured.len());
+        (configured, rejected)
+    }
+
+    fn discovery_health_ticks(&self) -> tokio::time::Interval {
+        let interval = self
+            .config
+            .discovery_health_interval
+            .unwrap_or(Duration::from_secs(86_400));
+        let mut ticks = tokio::time::interval(interval);
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        ticks
+    }
+
+    async fn probe_discovered(
+        &self,
+        configured: &BTreeMap<String, (Endpoint, DiscoveredEndpoint)>,
+    ) -> BTreeSet<String> {
+        let timeout = self
+            .config
+            .discovery_health_timeout
+            .expect("probe timeout configured");
+        let probes = configured.iter().map(|(uri, (endpoint, _))| {
+            let uri = uri.clone();
+            let endpoint = endpoint.clone();
+            async move {
+                let healthy = tokio::time::timeout(timeout, endpoint.connect())
+                    .await
+                    .is_ok_and(|result| result.is_ok());
+                (uri, healthy)
+            }
+        });
+        futures::future::join_all(probes)
+            .await
+            .into_iter()
+            .filter_map(|(uri, healthy)| healthy.then_some(uri))
+            .collect()
     }
 
     fn endpoint(&self, uri: String) -> Result<Endpoint, RpcClientError> {
@@ -500,6 +732,44 @@ impl RpcClient {
         endpoint = endpoint.keep_alive_while_idle(self.config.keepalive_while_idle);
 
         Ok(endpoint)
+    }
+}
+
+fn weighted_key(uri: &str, slot: u32) -> String {
+    format!("{uri}\0{slot}")
+}
+
+fn weighted_keys(
+    configured: &BTreeMap<String, (Endpoint, DiscoveredEndpoint)>,
+    available: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    configured
+        .iter()
+        .filter(|(uri, _)| available.contains(*uri))
+        .flat_map(|(uri, (_, endpoint))| {
+            (0..endpoint.weight()).map(move |slot| weighted_key(uri, slot))
+        })
+        .collect()
+}
+
+fn discovery_status(
+    discovered: usize,
+    available: usize,
+    rejected: usize,
+) -> DiscoveryStatusSnapshot {
+    let total = discovered + rejected;
+    let readiness = if total == 0 {
+        DiscoveryReadiness::Empty
+    } else if available == discovered && rejected == 0 {
+        DiscoveryReadiness::Ready
+    } else {
+        DiscoveryReadiness::Degraded
+    };
+    DiscoveryStatusSnapshot {
+        readiness,
+        discovered: total,
+        available,
+        rejected,
     }
 }
 
@@ -1422,6 +1692,98 @@ mod tests {
             .expect("drop notification should be delivered");
     }
 
+    #[tokio::test]
+    async fn active_discovery_health_marks_failed_endpoints_degraded() {
+        let healthy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let healthy_address = healthy_listener.local_addr().unwrap();
+        let healthy_server = tokio::spawn(async move {
+            Server::builder()
+                .add_service(EchoServer::new(EchoService))
+                .serve_with_incoming(TcpListenerStream::new(healthy_listener))
+                .await
+                .unwrap();
+        });
+        let unavailable_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let unavailable_address = unavailable_listener.local_addr().unwrap();
+        drop(unavailable_listener);
+
+        let (_updates, receiver) = watch::channel(vec![
+            format!("http://{healthy_address}"),
+            format!("http://{unavailable_address}"),
+        ]);
+        let config = RpcClientConfig::new("http://unused")
+            .with_discovery_health_check(Duration::from_millis(20), Duration::from_millis(100));
+        let (channel, mut status) =
+            RpcClient::new(config).connect_discovered_with_status(TestSubscription {
+                receiver,
+                dropped: None,
+            });
+
+        let snapshot = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let snapshot = status.changed().await.unwrap();
+                if snapshot.readiness == DiscoveryReadiness::Degraded {
+                    break snapshot;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(snapshot.discovered, 2);
+        assert_eq!(snapshot.available, 1);
+
+        let recovered_listener = TcpListener::bind(unavailable_address).await.unwrap();
+        let recovered_server = tokio::spawn(async move {
+            Server::builder()
+                .add_service(EchoServer::new(EchoService))
+                .serve_with_incoming(TcpListenerStream::new(recovered_listener))
+                .await
+                .unwrap();
+        });
+        let recovered = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let snapshot = status.changed().await.unwrap();
+                if snapshot.readiness == DiscoveryReadiness::Ready {
+                    break snapshot;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(recovered.available, 2);
+
+        drop(channel);
+        healthy_server.abort();
+        recovered_server.abort();
+    }
+
+    #[tokio::test]
+    async fn discovery_status_projects_into_shared_health() {
+        let (updates, receiver) = watch::channel(DiscoveryStatusSnapshot {
+            readiness: DiscoveryReadiness::Empty,
+            discovered: 0,
+            available: 0,
+            rejected: 0,
+        });
+        let registry = HealthRegistry::new();
+        let mut health_updates = registry.subscribe();
+        let task = DiscoveryStatus { receiver }.project_to_health(registry.clone(), "users-rpc");
+        health_updates.changed().await.unwrap();
+        assert_eq!(registry.snapshot().unhealthy(), vec!["users-rpc"]);
+
+        updates
+            .send(DiscoveryStatusSnapshot {
+                readiness: DiscoveryReadiness::Ready,
+                discovered: 1,
+                available: 1,
+                rejected: 0,
+            })
+            .unwrap();
+        health_updates.changed().await.unwrap();
+        assert!(registry.snapshot().is_ready());
+        task.abort();
+    }
+
     #[test]
     fn discovered_client_rejects_invalid_service_names() {
         let registry = ServiceRegistry::new();
@@ -1431,5 +1793,45 @@ mod tests {
             client.connect_service(&registry, ""),
             Err(RpcClientError::Discovery(DiscoveryError::EmptyService))
         ));
+    }
+
+    #[test]
+    fn weighted_discovery_keys_preserve_relative_capacity() {
+        let client = RpcClient::new(RpcClientConfig::new("http://unused"));
+        let (configured, rejected) = client.configure_discovered(vec![
+            DiscoveredEndpoint::weighted("http://one:8080", 3).unwrap(),
+            DiscoveredEndpoint::weighted("http://two:8080", 1).unwrap(),
+            DiscoveredEndpoint::new("not a URI").unwrap(),
+        ]);
+        let available = configured.keys().cloned().collect();
+        let keys = weighted_keys(&configured, &available);
+
+        assert_eq!(keys.len(), 4);
+        assert_eq!(rejected, 1);
+        assert_eq!(
+            discovery_status(configured.len(), configured.len(), rejected),
+            DiscoveryStatusSnapshot {
+                readiness: DiscoveryReadiness::Degraded,
+                discovered: 3,
+                available: 2,
+                rejected: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn discovery_status_distinguishes_empty_ready_and_degraded() {
+        assert_eq!(
+            discovery_status(0, 0, 0).readiness,
+            DiscoveryReadiness::Empty
+        );
+        assert_eq!(
+            discovery_status(2, 2, 0).readiness,
+            DiscoveryReadiness::Ready
+        );
+        assert_eq!(
+            discovery_status(2, 1, 0).readiness,
+            DiscoveryReadiness::Degraded
+        );
     }
 }

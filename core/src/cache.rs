@@ -13,7 +13,12 @@ use std::{
 ///
 /// Cache adapters use this to avoid a large set of records expiring at exactly the same instant.
 /// The caller owns the sequence so independent cache instances do not contend on a global RNG.
-#[cfg(any(feature = "stores-sql", feature = "stores-mongo", test))]
+#[cfg(any(
+    feature = "stores-sql",
+    feature = "stores-mongo",
+    feature = "stores-redis",
+    test
+))]
 pub(crate) fn jittered_ttl(base: Duration, jitter: Duration, sequence: u64) -> Duration {
     if jitter.is_zero() {
         return base;
@@ -220,6 +225,28 @@ where
         state.entries.remove(key).map(|entry| entry.value)
     }
 
+    /// Removes every entry accepted by `predicate` and returns the number removed.
+    ///
+    /// The predicate and removals run while holding one cache lock, making this useful for
+    /// atomically clearing secondary-index entries that point at a mutated primary key.
+    pub fn remove_where<F>(&self, mut predicate: F) -> usize
+    where
+        F: FnMut(&K, &V) -> bool,
+    {
+        let mut state = self.state.lock().expect("cache lock poisoned");
+        let keys: Vec<_> = state
+            .entries
+            .iter()
+            .filter(|(key, entry)| predicate(key, &entry.value))
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in &keys {
+            state.entries.remove(key);
+            remove_from_recency(&mut state.least_to_most_recent, key);
+        }
+        keys.len()
+    }
+
     pub fn clear(&self) {
         let mut state = self.state.lock().expect("cache lock poisoned");
         state.entries.clear();
@@ -378,6 +405,21 @@ mod tests {
         assert_eq!(cache.get(&"one"), Some(1));
         assert_eq!(cache.get(&"three"), Some(3));
         assert_eq!(cache.stats().evictions, 1);
+    }
+
+    #[test]
+    fn bounded_cache_removes_matching_values_atomically() {
+        let cache = MemoryCache::new(4);
+        cache.insert("email", Some(1), Duration::from_secs(1));
+        cache.insert("phone", Some(1), Duration::from_secs(1));
+        cache.insert("other", Some(2), Duration::from_secs(1));
+        cache.insert("missing", None, Duration::from_secs(1));
+
+        assert_eq!(cache.remove_where(|_, value| *value == Some(1)), 2);
+        assert_eq!(cache.get(&"email"), None);
+        assert_eq!(cache.get(&"phone"), None);
+        assert_eq!(cache.get(&"other"), Some(Some(2)));
+        assert_eq!(cache.get(&"missing"), Some(None));
     }
 
     #[tokio::test]

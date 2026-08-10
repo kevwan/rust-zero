@@ -1,7 +1,33 @@
-use crate::{ConfigFormat, DynamicConfig, EndpointChangeFuture, EndpointSubscription};
+//! Etcd-backed configuration and service discovery.
+//!
+//! ```no_run
+//! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
+//! use rust_zero_core::{EtcdClient, EtcdConfig};
+//! use std::time::Duration;
+//! let client = EtcdClient::connect(EtcdConfig::new(["http://127.0.0.1:2379"])).await?;
+//! let _lease = client
+//!     .publish("users", "users-1", "http://127.0.0.1:8080", Duration::from_secs(10))
+//!     .await?;
+//! let subscription = client.subscribe("users").await?;
+//! assert!(!subscription.endpoints().is_empty());
+//! # Ok(())
+//! # }
+//! ```
+
+use crate::{
+    ConfigFormat, DiscoveryReconnectBackoff, DynamicConfig, EndpointChangeFuture,
+    EndpointSubscription,
+};
 use etcd_client::{Client, ConnectOptions, EventType, GetOptions, PutOptions, WatchOptions};
 use serde::de::DeserializeOwned;
-use std::{collections::BTreeMap, error::Error, fmt, sync::Arc, time::Duration};
+use std::{
+    collections::{hash_map::DefaultHasher, BTreeMap},
+    error::Error,
+    fmt,
+    hash::{Hash, Hasher},
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 use tokio::{
     sync::{oneshot, watch},
     task::JoinHandle,
@@ -15,6 +41,7 @@ pub struct EtcdConfig {
     pub username: Option<String>,
     pub password: Option<String>,
     pub timeout: Duration,
+    pub reconnect_backoff: DiscoveryReconnectBackoff,
 }
 
 impl EtcdConfig {
@@ -25,6 +52,7 @@ impl EtcdConfig {
             username: None,
             password: None,
             timeout: Duration::from_secs(10),
+            reconnect_backoff: DiscoveryReconnectBackoff::default(),
         }
     }
 
@@ -46,6 +74,11 @@ impl EtcdConfig {
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         assert!(!timeout.is_zero(), "etcd timeout must be positive");
         self.timeout = timeout;
+        self
+    }
+
+    pub fn with_reconnect_backoff(mut self, backoff: DiscoveryReconnectBackoff) -> Self {
+        self.reconnect_backoff = backoff;
         self
     }
 }
@@ -104,6 +137,7 @@ impl From<crate::ConfigCenterError> for EtcdError {
 pub struct EtcdClient {
     client: Client,
     namespace: Arc<str>,
+    reconnect_backoff: DiscoveryReconnectBackoff,
 }
 
 impl EtcdClient {
@@ -112,6 +146,7 @@ impl EtcdClient {
             return Err(EtcdError::EmptyEndpoints);
         }
         let namespace = normalize_namespace(&config.namespace)?;
+        let reconnect_backoff = config.reconnect_backoff;
         let mut options = ConnectOptions::new().with_timeout(config.timeout);
         if let Some(username) = config.username {
             options = options.with_user(username, config.password.unwrap_or_default());
@@ -120,6 +155,7 @@ impl EtcdClient {
         Ok(Self {
             client,
             namespace: Arc::from(namespace),
+            reconnect_backoff,
         })
     }
 
@@ -127,7 +163,13 @@ impl EtcdClient {
         Ok(Self {
             client,
             namespace: Arc::from(normalize_namespace(namespace.as_ref())?),
+            reconnect_backoff: DiscoveryReconnectBackoff::default(),
         })
+    }
+
+    pub fn with_reconnect_backoff(mut self, backoff: DiscoveryReconnectBackoff) -> Self {
+        self.reconnect_backoff = backoff;
+        self
     }
 
     /// Loads a typed configuration value and watches future valid updates.
@@ -237,32 +279,73 @@ impl EtcdClient {
         }
         let initial = sorted_endpoints(&entries);
         let (updates, receiver) = watch::channel(initial);
+        let backoff = self.reconnect_backoff;
         let task = tokio::spawn(async move {
-            let options = WatchOptions::new()
-                .with_prefix()
-                .with_start_revision(revision + 1);
-            let mut stream = client.watch(prefix, Some(options)).await?;
-            while let Some(response) = stream.message().await? {
-                let mut changed = false;
-                for event in response.events() {
-                    let Some(value) = event.kv() else {
-                        continue;
-                    };
-                    match event.event_type() {
-                        EventType::Put => {
-                            entries.insert(value.key().to_vec(), value.value_str()?.to_owned());
+            let seed = reconnect_seed(&prefix);
+            let mut revision = revision;
+            let mut attempt = 0_u32;
+            loop {
+                let options = WatchOptions::new()
+                    .with_prefix()
+                    .with_start_revision(revision.saturating_add(1));
+                let watch_result = client.watch(prefix.clone(), Some(options)).await;
+                if let Ok(mut stream) = watch_result {
+                    while let Ok(Some(response)) = stream.message().await {
+                        if let Some(header) = response.header() {
+                            revision = revision.max(header.revision());
                         }
-                        EventType::Delete => {
-                            entries.remove(value.key());
+                        let mut changed = false;
+                        for event in response.events() {
+                            let Some(value) = event.kv() else {
+                                continue;
+                            };
+                            match event.event_type() {
+                                EventType::Put => {
+                                    entries.insert(
+                                        value.key().to_vec(),
+                                        value.value_str()?.to_owned(),
+                                    );
+                                }
+                                EventType::Delete => {
+                                    entries.remove(value.key());
+                                }
+                            }
+                            changed = true;
                         }
+                        if changed {
+                            updates.send_replace(sorted_endpoints(&entries));
+                        }
+                        attempt = 0;
                     }
-                    changed = true;
                 }
-                if changed {
-                    updates.send_replace(sorted_endpoints(&entries));
+
+                tokio::time::sleep(backoff.delay(attempt, seed.wrapping_add(u64::from(attempt))))
+                    .await;
+                attempt = attempt.saturating_add(1);
+
+                // Always relist after a broken stream. This repairs missed events and recovers
+                // transparently when etcd has compacted the previous watch revision.
+                match client
+                    .get(prefix.clone(), Some(GetOptions::new().with_prefix()))
+                    .await
+                {
+                    Ok(response) => {
+                        revision = response
+                            .header()
+                            .map_or(revision, |header| header.revision());
+                        entries.clear();
+                        for value in response.kvs() {
+                            if let Ok(endpoint) = value.value_str() {
+                                entries.insert(value.key().to_vec(), endpoint.to_owned());
+                            }
+                        }
+                        updates.send_replace(sorted_endpoints(&entries));
+                    }
+                    Err(_) => continue,
                 }
             }
-            Err(EtcdError::Task("service watch closed".to_owned()))
+            #[allow(unreachable_code)]
+            Ok(())
         });
         Ok(EtcdServiceSubscription { receiver, task })
     }
@@ -386,6 +469,17 @@ fn sorted_endpoints(entries: &BTreeMap<Vec<u8>, String>) -> Vec<String> {
     endpoints.sort();
     endpoints.dedup();
     endpoints
+}
+
+fn reconnect_seed(scope: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    scope.hash(&mut hasher);
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+        .hash(&mut hasher);
+    hasher.finish()
 }
 
 #[cfg(test)]

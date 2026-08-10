@@ -4,6 +4,7 @@
 //! consistent hashing, and async retry helpers.  They intentionally do not depend on a
 //! particular HTTP or gRPC framework so REST, RPC, and background services can share them.
 
+pub mod auth;
 pub mod balancer;
 pub mod bloom;
 pub mod breaker;
@@ -16,6 +17,7 @@ pub mod etcd;
 pub mod executor;
 pub mod fx;
 pub mod hash;
+pub mod health;
 #[cfg(feature = "kubernetes")]
 pub mod kubernetes;
 pub mod limit;
@@ -39,17 +41,23 @@ pub mod telemetry;
 pub mod trace;
 pub mod validation;
 
+pub use auth::{
+    decode_jwt_hs256, encode_jwt_hs256, sign_request, AuthFailure, JwtClaimProjection,
+    JwtValidationError, RequestSignature, RequestSignatureVerifier, AUTH_KEY_ID_HEADER,
+    AUTH_SIGNATURE_HEADER, AUTH_TIMESTAMP_HEADER,
+};
 pub use balancer::{BalancerError, NodeSnapshot, P2cBalancer, P2cRequest};
 pub use bloom::{BloomError, BloomFilter};
 pub use breaker::{
     BreakerState, CircuitBreaker, CircuitBreakerConfig, CircuitBreakerError, CircuitBreakerPermit,
+    CircuitBreakerPolicy, CircuitBreakerSnapshot, CircuitOutcome, RollingCircuitBreakerConfig,
 };
 pub use cache::{CacheStats, MemoryCache, ReadThroughCache, TtlCache};
 pub use config::{load_config, parse_config, ConfigError, ConfigFormat, ServiceConfig};
 pub use config_center::{ConfigCenterError, ConfigSnapshot, DynamicConfig};
 pub use discov::{
-    DiscoveryError, EndpointChangeFuture, EndpointSubscription, ServiceEvent, ServiceLease,
-    ServiceRegistry, ServiceSubscription,
+    DiscoveredEndpoint, DiscoveryError, DiscoveryReconnectBackoff, EndpointChangeFuture,
+    EndpointSubscription, ServiceEvent, ServiceLease, ServiceRegistry, ServiceSubscription,
 };
 #[cfg(feature = "etcd")]
 pub use etcd::{
@@ -61,13 +69,18 @@ pub use executor::{
 };
 pub use fx::{retry, timeout, RetryPolicy};
 pub use hash::ConsistentHash;
+pub use health::{HealthRegistry, HealthSnapshot};
 #[cfg(feature = "kubernetes")]
 pub use kubernetes::{
     KubernetesDiscovery, KubernetesDiscoveryConfig, KubernetesDiscoveryError,
     KubernetesServiceSubscription,
 };
 pub use limit::{LimitDecision, PeriodLimiter, TokenLimiter};
-pub use load::{AdaptiveShedder, LoadShedderConfig, ShedPermit};
+#[cfg(feature = "stores-redis")]
+pub use limit::{RedisLimiterSnapshot, RedisPeriodLimiter, RedisTokenLimiter};
+pub use load::{
+    AdaptiveShedder, LoadShedderConfig, LoadShedderMode, LoadShedderSnapshot, ShedPermit,
+};
 pub use log::{
     LogConfig, LogContext, LogEncoding, LogError, LogField, LogLevel, LogSampler, LogTarget,
     Logger, RotationPolicy, Sensitive,
@@ -91,16 +104,19 @@ pub use singleflight::{SingleFlight, SingleFlightError};
 #[cfg(feature = "stores-mongo")]
 pub use stores_mongo::{
     CachedMongoCollection, MongoCacheConfig, MongoStore, MongoStoreConfig, MongoStoreError,
+    MongoStoreMetrics,
 };
 #[cfg(feature = "stores-redis")]
 pub use stores_redis::{
-    RedisCacheError, RedisJsonCache, RedisLock, RedisStore, RedisStoreConfig, RedisStoreError,
+    RedisCacheError, RedisJsonCache, RedisLock, RedisModelCache, RedisModelCacheConfig,
+    RedisModelCacheError, RedisStore, RedisStoreConfig, RedisStoreError, RedisStoreMetrics,
+    RedisSubscription, RedisSubscriptionConfig, RedisSubscriptionEvent, RedisSubscriptionMessage,
     RedisTtl,
 };
 #[cfg(feature = "stores-sql")]
 pub use stores_sql::{
     CachedSqlStore, MySqlStore, PostgresStore, SqlCacheConfig, SqlStore, SqlStoreConfig,
-    SqliteStore,
+    SqlStoreError, SqlStoreMetrics, SqliteStore,
 };
 #[cfg(feature = "telemetry")]
 pub use telemetry::{

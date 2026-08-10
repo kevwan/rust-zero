@@ -1,17 +1,29 @@
-use crate::{EndpointChangeFuture, EndpointSubscription};
+//! Kubernetes EndpointSlice service discovery.
+//!
+//! ```no_run
+//! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
+//! use rust_zero_core::{KubernetesDiscovery, KubernetesDiscoveryConfig};
+//! let discovery = KubernetesDiscovery::infer(
+//!     KubernetesDiscoveryConfig::new("production").with_port_name("grpc"),
+//! ).await?;
+//! let subscription = discovery.subscribe("users").await?;
+//! println!("{:?}", subscription.endpoints());
+//! # Ok(())
+//! # }
+//! ```
+
+use crate::{DiscoveryReconnectBackoff, EndpointChangeFuture, EndpointSubscription};
 use futures::StreamExt;
 use k8s_openapi::api::discovery::v1::EndpointSlice;
-use kube::{
-    runtime::{watcher, WatchStreamExt},
-    Api, Client, ResourceExt,
-};
+use kube::{runtime::watcher, Api, Client, ResourceExt};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{hash_map::DefaultHasher, BTreeMap, BTreeSet},
     error::Error,
     fmt,
+    hash::{Hash, Hasher},
     net::IpAddr,
     sync::Arc,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{sync::watch, task::JoinHandle};
 
@@ -22,6 +34,7 @@ pub struct KubernetesDiscoveryConfig {
     pub port_name: Option<String>,
     pub scheme: String,
     pub startup_timeout: Duration,
+    pub reconnect_backoff: DiscoveryReconnectBackoff,
 }
 
 impl KubernetesDiscoveryConfig {
@@ -31,6 +44,7 @@ impl KubernetesDiscoveryConfig {
             port_name: None,
             scheme: "http".to_owned(),
             startup_timeout: Duration::from_secs(10),
+            reconnect_backoff: DiscoveryReconnectBackoff::default(),
         }
     }
 
@@ -50,6 +64,11 @@ impl KubernetesDiscoveryConfig {
             "Kubernetes discovery startup timeout must be positive"
         );
         self.startup_timeout = timeout;
+        self
+    }
+
+    pub fn with_reconnect_backoff(mut self, backoff: DiscoveryReconnectBackoff) -> Self {
+        self.reconnect_backoff = backoff;
         self
     }
 }
@@ -140,47 +159,60 @@ impl KubernetesDiscovery {
             watcher::Config::default().labels(&format!("kubernetes.io/service-name={service}"));
         let port_name = self.config.port_name.clone();
         let scheme: Arc<str> = Arc::from(self.config.scheme.clone());
+        let backoff = self.config.reconnect_backoff;
+        let reconnect_seed = reconnect_seed(service);
         let (updates, mut receiver) = watch::channel(Vec::new());
 
         let task = tokio::spawn(async move {
             let mut slices = BTreeMap::<String, Vec<String>>::new();
-            let mut pending = BTreeMap::<String, Vec<String>>::new();
-            let mut stream = Box::pin(watcher(api, watcher_config).default_backoff());
-
-            while let Some(result) = stream.next().await {
-                // kube-runtime resumes from the last resource version after transient errors and
-                // performs a fresh Init sequence if that version has expired.
-                let Ok(event) = result else {
-                    continue;
-                };
-                match event {
-                    watcher::Event::Apply(slice) => {
-                        slices.insert(
-                            slice.name_any(),
-                            endpoints_from_slice(&slice, port_name.as_deref(), &scheme),
-                        );
-                        updates.send_replace(combined_endpoints(&slices));
-                    }
-                    watcher::Event::Delete(slice) => {
-                        slices.remove(&slice.name_any());
-                        updates.send_replace(combined_endpoints(&slices));
-                    }
-                    watcher::Event::Init => {
-                        pending.clear();
-                    }
-                    watcher::Event::InitApply(slice) => {
-                        pending.insert(
-                            slice.name_any(),
-                            endpoints_from_slice(&slice, port_name.as_deref(), &scheme),
-                        );
-                    }
-                    watcher::Event::InitDone => {
-                        slices = std::mem::take(&mut pending);
-                        updates.send_replace(combined_endpoints(&slices));
+            let mut attempt = 0_u32;
+            loop {
+                let mut pending = BTreeMap::<String, Vec<String>>::new();
+                let mut stream = Box::pin(watcher(api.clone(), watcher_config.clone()));
+                let mut received_event = false;
+                while let Some(result) = stream.next().await {
+                    let Ok(event) = result else {
+                        break;
+                    };
+                    received_event = true;
+                    match event {
+                        watcher::Event::Apply(slice) => {
+                            slices.insert(
+                                slice.name_any(),
+                                endpoints_from_slice(&slice, port_name.as_deref(), &scheme),
+                            );
+                            updates.send_replace(combined_endpoints(&slices));
+                        }
+                        watcher::Event::Delete(slice) => {
+                            slices.remove(&slice.name_any());
+                            updates.send_replace(combined_endpoints(&slices));
+                        }
+                        watcher::Event::Init => {
+                            pending.clear();
+                        }
+                        watcher::Event::InitApply(slice) => {
+                            pending.insert(
+                                slice.name_any(),
+                                endpoints_from_slice(&slice, port_name.as_deref(), &scheme),
+                            );
+                        }
+                        watcher::Event::InitDone => {
+                            slices = std::mem::take(&mut pending);
+                            updates.send_replace(combined_endpoints(&slices));
+                        }
                     }
                 }
+                if received_event {
+                    attempt = 0;
+                }
+                tokio::time::sleep(
+                    backoff.delay(attempt, reconnect_seed.wrapping_add(u64::from(attempt))),
+                )
+                .await;
+                attempt = attempt.saturating_add(1);
             }
-            Err(KubernetesDiscoveryError::WatchClosed)
+            #[allow(unreachable_code)]
+            Ok(())
         });
 
         match tokio::time::timeout(self.config.startup_timeout, receiver.changed()).await {
@@ -272,6 +304,17 @@ fn valid_dns_label(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+fn reconnect_seed(scope: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    scope.hash(&mut hasher);
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+        .hash(&mut hasher);
+    hasher.finish()
 }
 
 fn endpoints_from_slice(

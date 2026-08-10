@@ -2,7 +2,7 @@ use std::{future::Future, sync::Arc};
 
 use rust_zero_core::{
     AdaptiveShedder, BreakerState, CircuitBreaker, CircuitBreakerConfig, CircuitBreakerError,
-    LoadShedderConfig,
+    CircuitBreakerSnapshot, CircuitOutcome, LoadShedderConfig,
 };
 use tonic::{Code, Status};
 
@@ -22,6 +22,18 @@ pub fn acceptable_status(status: &Status) -> bool {
     )
 }
 
+/// Maps a completed gRPC call to breaker health without treating caller cancellation as either a
+/// dependency success or failure.
+pub fn circuit_outcome(status: &Status) -> CircuitOutcome {
+    if status.code() == Code::Cancelled {
+        CircuitOutcome::Cancellation
+    } else if acceptable_status(status) {
+        CircuitOutcome::Success
+    } else {
+        CircuitOutcome::Failure
+    }
+}
+
 /// Protocol-aware circuit breaking for unary Tonic client calls.
 #[derive(Clone)]
 pub struct RpcCircuitBreaker {
@@ -39,6 +51,10 @@ impl RpcCircuitBreaker {
         self.breaker.state()
     }
 
+    pub fn snapshot(&self) -> CircuitBreakerSnapshot {
+        self.breaker.snapshot()
+    }
+
     /// Runs a unary call when the circuit permits it.
     ///
     /// Infrastructure failures count against the circuit. Statuses such as `InvalidArgument`,
@@ -50,11 +66,10 @@ impl RpcCircuitBreaker {
     {
         match self
             .breaker
-            .execute_async_with_accept(operation, |result| {
+            .execute_async_with_outcome(operation, |result| {
                 result
                     .as_ref()
-                    .map(|_| true)
-                    .unwrap_or_else(acceptable_status)
+                    .map_or_else(circuit_outcome, |_| CircuitOutcome::Success)
             })
             .await
         {
@@ -133,6 +148,11 @@ mod tests {
         ] {
             assert!(acceptable_status(&Status::new(code, "application error")));
         }
+
+        assert_eq!(
+            circuit_outcome(&Status::cancelled("caller left")),
+            CircuitOutcome::Cancellation
+        );
     }
 
     #[tokio::test]
@@ -167,6 +187,39 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.code(), Code::Unavailable);
         assert!(!invoked.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn rolling_breaker_tracks_protocol_outcomes_and_rejects_faulty_traffic() {
+        use rust_zero_core::RollingCircuitBreakerConfig;
+
+        let breaker = RpcCircuitBreaker::new(CircuitBreakerConfig::rolling(
+            RollingCircuitBreakerConfig::new()
+                .with_minimum_requests(1)
+                .with_sensitivity(0.1)
+                .with_random_seed(3),
+        ));
+        let cancelled = breaker
+            .call(|| async { Err::<(), _>(Status::cancelled("caller left")) })
+            .await
+            .unwrap_err();
+        assert_eq!(cancelled.code(), Code::Cancelled);
+
+        for _ in 0..2 {
+            let _ = breaker
+                .call(|| async { Err::<(), _>(Status::unavailable("offline")) })
+                .await;
+        }
+        let snapshot = breaker.snapshot();
+        assert_eq!(snapshot.cancellations, 1);
+        assert_eq!(snapshot.failures, 2);
+        assert_eq!(snapshot.total, 2);
+        assert!(snapshot.drop_ratio > 0.0);
+
+        for _ in 0..20 {
+            let _ = breaker.call(|| async { Ok::<_, Status>(()) }).await;
+        }
+        assert!(breaker.snapshot().rejections > 0);
     }
 
     #[tokio::test]

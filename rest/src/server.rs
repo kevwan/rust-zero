@@ -1,24 +1,159 @@
 use crate::{
-    route::RoutePolicies, ConcurrencyLimit, HttpMetrics, LoggingMiddleware, MetricsMiddleware,
-    MultipartConfig, Recover, RequestBodyLimit, RequestId, ResponsePolicy, RouteGroupConfig,
-    SecurityHeaders, Timeout, TraceContextMiddleware,
+    route::RoutePolicies, AdaptiveLoadShed, ConcurrencyLimit, ContentEncryption, HttpMetrics,
+    LoggingMiddleware, MetricsMiddleware, MultipartConfig, Recover, RequestBodyLimit, RequestId,
+    ResponsePolicy, RouteGroupConfig, RouteMiddleware, SecurityHeaders, StaticAssets, Timeout,
+    TraceContextMiddleware,
 };
 use actix_web::{
+    body::{self, BoxBody},
+    dev::{Service, ServiceResponse},
+    http::{header::HeaderMap, Method, Uri},
     middleware::Condition,
     web::{self, ServiceConfig},
-    App, HttpServer,
+    App, Error, HttpServer,
 };
-use rust_zero_core::Metrics;
+use rust_zero_core::{AdaptiveShedder, LoadShedderConfig, Metrics};
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::HashMap,
     fmt,
     future::Future,
     io,
     net::{SocketAddr, TcpListener},
     path::PathBuf,
+    rc::Rc,
     sync::Arc,
     time::Duration,
 };
+
+macro_rules! standard_app {
+    ($config:expr, $http_metrics:expr, $adaptive_shedder:expr, $route_policies:expr, $response_policy:expr, $content_encryption:expr, $static_assets:expr, $configure:expr) => {{
+        let config = $config;
+        let http_metrics = $http_metrics;
+        let mut multipart_config = MultipartConfig::new(
+            config.max_multipart_field_bytes,
+            config.max_multipart_file_bytes,
+            config.max_multipart_total_bytes,
+        );
+        if let Some(temp_dir) = &config.multipart_temp_dir {
+            multipart_config = multipart_config.with_temp_dir(temp_dir);
+        }
+        let mut timeout = Timeout::new(Duration::from_millis(config.request_timeout_ms));
+        let mut concurrency = ConcurrencyLimit::new(config.max_concurrent_requests)
+            .with_priority_reserve(config.priority_concurrency_reserve);
+        if config.metrics {
+            timeout = timeout.with_metrics(http_metrics.clone());
+            concurrency = concurrency.with_metrics(http_metrics.clone());
+        }
+        let mut adaptive_load = AdaptiveLoadShed::new($adaptive_shedder);
+        if config.metrics {
+            adaptive_load = adaptive_load.with_metrics(http_metrics.clone());
+        }
+        let app = App::new()
+            .app_data(web::JsonConfig::default().limit(config.max_body_bytes))
+            .app_data(web::FormConfig::default().limit(config.max_body_bytes))
+            .app_data(web::Data::new(multipart_config))
+            .app_data(web::Data::new($response_policy))
+            .wrap(Condition::new(config.logging, LoggingMiddleware))
+            .wrap(Condition::new(config.recovery, Recover::new()))
+            .wrap(Condition::new(
+                config.security_headers,
+                SecurityHeaders::new(),
+            ))
+            .wrap(Condition::new(config.request_ids, RequestId::new()))
+            .wrap(Condition::new(
+                config.tracing,
+                TraceContextMiddleware::new(),
+            ))
+            .wrap(Condition::new(
+                config.metrics,
+                MetricsMiddleware::new(http_metrics),
+            ))
+            .wrap(timeout)
+            .wrap(concurrency)
+            .wrap(Condition::new(config.adaptive_load_shedding, adaptive_load))
+            .wrap(
+                RequestBodyLimit::new(config.max_body_bytes)
+                    .decompress_gzip(config.decompress_gzip),
+            )
+            .wrap(
+                $content_encryption
+                    .unwrap_or_else(|| ContentEncryption::disabled(config.max_body_bytes)),
+            )
+            .wrap($route_policies)
+            .configure($configure);
+        if let Some(static_assets) = $static_assets {
+            app.app_data(web::Data::new(static_assets))
+                .default_service(web::to(
+                    |request: actix_web::HttpRequest, assets: web::Data<StaticAssets>| async move {
+                        assets.serve(request).await
+                    },
+                ))
+        } else {
+            app.default_service(web::to(actix_web::HttpResponse::NotFound))
+        }
+    }};
+}
+
+/// Socket-free HTTP request accepted by [`ServerlessHandler`].
+#[derive(Debug, Clone)]
+pub struct ServerlessRequest {
+    pub method: Method,
+    pub uri: Uri,
+    pub headers: HeaderMap,
+    pub body: web::Bytes,
+}
+
+impl ServerlessRequest {
+    pub fn new(method: Method, uri: Uri, body: impl Into<web::Bytes>) -> Self {
+        Self {
+            method,
+            uri,
+            headers: HeaderMap::new(),
+            body: body.into(),
+        }
+    }
+}
+
+/// Fully buffered response returned to a serverless platform adapter.
+#[derive(Debug)]
+pub struct ServerlessResponse {
+    pub status: actix_web::http::StatusCode,
+    pub headers: HeaderMap,
+    pub body: web::Bytes,
+}
+
+/// Prebuilt, socket-free instance of the standard REST middleware and routing stack.
+#[derive(Clone)]
+pub struct ServerlessHandler {
+    service: actix_service::boxed::RcService<actix_http::Request, ServiceResponse<BoxBody>, Error>,
+}
+
+impl ServerlessHandler {
+    /// Dispatches one platform-neutral request through the prebuilt REST stack.
+    pub async fn call(&self, request: ServerlessRequest) -> Result<ServerlessResponse, Error> {
+        let uri = request.uri.to_string();
+        let mut builder = actix_web::test::TestRequest::default()
+            .method(request.method)
+            .uri(&uri)
+            .set_payload(request.body);
+        for (name, value) in request.headers.iter() {
+            builder = builder.append_header((name.clone(), value.clone()));
+        }
+
+        let response = self.service.call(builder.to_request()).await?;
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = body::to_bytes(response.into_body())
+            .await
+            .map_err(actix_web::error::ErrorInternalServerError)?;
+        Ok(ServerlessResponse {
+            status,
+            headers,
+            body,
+        })
+    }
+}
 
 /// Configuration for the standard rust-zero REST server stack.
 ///
@@ -38,6 +173,11 @@ pub struct RestServerConfig {
     pub multipart_temp_dir: Option<PathBuf>,
     pub max_concurrent_requests: usize,
     pub priority_concurrency_reserve: usize,
+    pub adaptive_load_shedding: bool,
+    pub load_shed_cpu_threshold_percent: u8,
+    pub load_shed_bucket_ms: u64,
+    pub load_shed_buckets: usize,
+    pub load_shed_cooldown_ms: u64,
     pub logging: bool,
     pub recovery: bool,
     pub tracing: bool,
@@ -65,6 +205,11 @@ impl Default for RestServerConfig {
             multipart_temp_dir: None,
             max_concurrent_requests: 1_024,
             priority_concurrency_reserve: 256,
+            adaptive_load_shedding: true,
+            load_shed_cpu_threshold_percent: 90,
+            load_shed_bucket_ms: 1_000,
+            load_shed_buckets: 10,
+            load_shed_cooldown_ms: 1_000,
             logging: true,
             recovery: true,
             tracing: true,
@@ -140,6 +285,26 @@ impl RestServerConfig {
                 "priority_concurrency_reserve must be greater than zero",
             ));
         }
+        if !(1..=100).contains(&self.load_shed_cpu_threshold_percent) {
+            return Err(RestServerConfigError::Invalid(
+                "load_shed_cpu_threshold_percent must be between 1 and 100",
+            ));
+        }
+        if self.load_shed_bucket_ms == 0 {
+            return Err(RestServerConfigError::Invalid(
+                "load_shed_bucket_ms must be greater than zero",
+            ));
+        }
+        if self.load_shed_buckets == 0 {
+            return Err(RestServerConfigError::Invalid(
+                "load_shed_buckets must be greater than zero",
+            ));
+        }
+        if self.load_shed_cooldown_ms == 0 {
+            return Err(RestServerConfigError::Invalid(
+                "load_shed_cooldown_ms must be greater than zero",
+            ));
+        }
         if self.metrics && self.metrics_namespace.trim().is_empty() {
             return Err(RestServerConfigError::Invalid(
                 "metrics_namespace must not be empty when metrics are enabled",
@@ -155,6 +320,7 @@ pub enum RestServerConfigError {
     Invalid(&'static str),
     Metrics(rust_zero_core::MetricsError),
     RoutePolicy(String),
+    RouteMiddleware(String),
 }
 
 impl fmt::Display for RestServerConfigError {
@@ -163,6 +329,9 @@ impl fmt::Display for RestServerConfigError {
             Self::Invalid(message) => formatter.write_str(message),
             Self::Metrics(error) => write!(formatter, "failed to configure REST metrics: {error}"),
             Self::RoutePolicy(error) => write!(formatter, "invalid REST route policy: {error}"),
+            Self::RouteMiddleware(error) => {
+                write!(formatter, "invalid REST route middleware: {error}")
+            }
         }
     }
 }
@@ -177,6 +346,10 @@ pub struct RestServer {
     http_metrics: HttpMetrics,
     route_policies: RoutePolicies,
     response_policy: ResponsePolicy,
+    content_encryption: Option<ContentEncryption>,
+    route_middleware: HashMap<String, Arc<dyn RouteMiddleware>>,
+    static_assets: Option<StaticAssets>,
+    adaptive_shedder: AdaptiveShedder,
 }
 
 impl RestServer {
@@ -193,18 +366,73 @@ impl RestServer {
             .map_err(RestServerConfigError::Metrics)?;
         let route_policies = RoutePolicies::compile(&config.route_groups)
             .map_err(RestServerConfigError::RoutePolicy)?;
+        let adaptive_shedder = AdaptiveShedder::new(
+            LoadShedderConfig::production(config.max_concurrent_requests)
+                .with_cpu_threshold(f64::from(config.load_shed_cpu_threshold_percent) / 100.0)
+                .with_rolling_window(
+                    Duration::from_millis(config.load_shed_bucket_ms),
+                    config.load_shed_buckets,
+                )
+                .with_cooldown(Duration::from_millis(config.load_shed_cooldown_ms)),
+        );
         Ok(Self {
             config,
             metrics,
             http_metrics,
             route_policies,
             response_policy: ResponsePolicy::new(),
+            content_encryption: None,
+            route_middleware: HashMap::new(),
+            static_assets: None,
+            adaptive_shedder,
         })
+    }
+
+    /// Installs an opt-in static-directory and/or embedded-asset fallback.
+    pub fn with_static_assets(mut self, static_assets: StaticAssets) -> Self {
+        self.static_assets = Some(static_assets);
+        self
+    }
+
+    /// Registers application middleware referenced by declarative route groups.
+    pub fn with_route_middleware<M>(
+        mut self,
+        name: impl Into<String>,
+        middleware: M,
+    ) -> Result<Self, RestServerConfigError>
+    where
+        M: RouteMiddleware,
+    {
+        let name = name.into();
+        if name.trim().is_empty() {
+            return Err(RestServerConfigError::RouteMiddleware(
+                "middleware name must not be empty".to_owned(),
+            ));
+        }
+        if self
+            .route_middleware
+            .insert(name.clone(), Arc::new(middleware))
+            .is_some()
+        {
+            return Err(RestServerConfigError::RouteMiddleware(format!(
+                "middleware '{name}' is already registered"
+            )));
+        }
+        Ok(self)
     }
 
     /// Installs the response policy as Actix application data for all registered handlers.
     pub fn with_response_policy(mut self, response_policy: ResponsePolicy) -> Self {
         self.response_policy = response_policy;
+        self
+    }
+
+    /// Enables authenticated request decryption and buffered response encryption.
+    ///
+    /// Install this only for APIs whose clients implement the versioned content-encryption wire
+    /// format. Streaming routes such as SSE must remain on a server without this middleware.
+    pub fn with_content_encryption(mut self, content_encryption: ContentEncryption) -> Self {
+        self.content_encryption = Some(content_encryption);
         self
     }
 
@@ -218,6 +446,41 @@ impl RestServer {
 
     pub fn response_policy(&self) -> &ResponsePolicy {
         &self.response_policy
+    }
+
+    /// Builds a reusable socket-free handler with the same routes, policies, middleware, and
+    /// static fallback as [`RestServer::run`].
+    pub async fn serverless_handler<F>(
+        &self,
+        configure: F,
+    ) -> Result<ServerlessHandler, RestServerConfigError>
+    where
+        F: FnOnce(&mut ServiceConfig) + 'static,
+    {
+        let route_policies = self
+            .route_policies
+            .clone()
+            .with_middleware(self.route_middleware.clone())
+            .map_err(RestServerConfigError::RouteMiddleware)?;
+        let app = standard_app!(
+            &self.config,
+            self.http_metrics.clone(),
+            self.adaptive_shedder.clone(),
+            route_policies,
+            self.response_policy.clone(),
+            self.content_encryption.clone(),
+            self.static_assets.clone(),
+            configure
+        );
+        let service = actix_web::test::init_service(app).await;
+        let service = Rc::new(service);
+        let service = actix_web::dev::fn_service(move |request| {
+            let future = service.call(request);
+            async move { future.await.map(ServiceResponse::map_into_boxed_body) }
+        });
+        Ok(ServerlessHandler {
+            service: actix_service::boxed::rc_service(service),
+        })
     }
 
     /// Binds the configured listener and installs the standard stack around application routes.
@@ -246,57 +509,31 @@ impl RestServer {
     {
         let config = self.config.clone();
         let http_metrics = self.http_metrics.clone();
-        let route_policies = self.route_policies.clone();
+        let route_policies = self
+            .route_policies
+            .clone()
+            .with_middleware(self.route_middleware.clone())
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
         let response_policy = self.response_policy.clone();
+        let content_encryption = self.content_encryption.clone();
+        let static_assets = self.static_assets.clone();
+        let adaptive_shedder = self.adaptive_shedder.clone();
         let shutdown_seconds = config.shutdown_timeout_ms.div_ceil(1_000);
+        let workers = config.workers;
 
         HttpServer::new(move || {
-            let mut multipart_config = MultipartConfig::new(
-                config.max_multipart_field_bytes,
-                config.max_multipart_file_bytes,
-                config.max_multipart_total_bytes,
-            );
-            if let Some(temp_dir) = &config.multipart_temp_dir {
-                multipart_config = multipart_config.with_temp_dir(temp_dir);
-            }
-            let mut timeout = Timeout::new(Duration::from_millis(config.request_timeout_ms));
-            let mut concurrency = ConcurrencyLimit::new(config.max_concurrent_requests)
-                .with_priority_reserve(config.priority_concurrency_reserve);
-            if config.metrics {
-                timeout = timeout.with_metrics(http_metrics.clone());
-                concurrency = concurrency.with_metrics(http_metrics.clone());
-            }
-            App::new()
-                .app_data(web::JsonConfig::default().limit(config.max_body_bytes))
-                .app_data(web::FormConfig::default().limit(config.max_body_bytes))
-                .app_data(web::Data::new(multipart_config))
-                .app_data(web::Data::new(response_policy.clone()))
-                .wrap(Condition::new(config.logging, LoggingMiddleware))
-                .wrap(Condition::new(config.recovery, Recover::new()))
-                .wrap(Condition::new(
-                    config.security_headers,
-                    SecurityHeaders::new(),
-                ))
-                .wrap(Condition::new(config.request_ids, RequestId::new()))
-                .wrap(Condition::new(
-                    config.tracing,
-                    TraceContextMiddleware::new(),
-                ))
-                .wrap(Condition::new(
-                    config.metrics,
-                    MetricsMiddleware::new(http_metrics.clone()),
-                ))
-                .wrap(timeout)
-                .wrap(concurrency)
-                .wrap(
-                    RequestBodyLimit::new(config.max_body_bytes)
-                        .decompress_gzip(config.decompress_gzip),
-                )
-                .wrap(route_policies.clone())
-                .configure(configure.clone())
-                .default_service(web::to(actix_web::HttpResponse::NotFound))
+            standard_app!(
+                &config,
+                http_metrics.clone(),
+                adaptive_shedder.clone(),
+                route_policies.clone(),
+                response_policy.clone(),
+                content_encryption.clone(),
+                static_assets.clone(),
+                configure.clone()
+            )
         })
-        .workers(config.workers)
+        .workers(workers)
         .shutdown_timeout(shutdown_seconds)
         .listen(listener)
         .map(HttpServer::run)
@@ -347,7 +584,11 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use actix_web::{http::StatusCode, test as actix_test, web, HttpResponse};
+    use actix_web::{
+        dev::ServiceRequest,
+        http::{header::HeaderValue, StatusCode},
+        test as actix_test, web, HttpResponse,
+    };
     use rust_zero_core::{parse_config, ConfigFormat};
     use std::path::Path;
     use tokio::sync::Notify;
@@ -359,6 +600,11 @@ mod tests {
 address = "127.0.0.1:9000"
 workers = 2
 request_timeout_ms = 250
+adaptive_load_shedding = true
+load_shed_cpu_threshold_percent = 85
+load_shed_bucket_ms = 250
+load_shed_buckets = 8
+load_shed_cooldown_ms = 750
 max_body_bytes = 16777216
 max_multipart_field_bytes = 32768
 max_multipart_file_bytes = 8388608
@@ -368,6 +614,7 @@ multipart_temp_dir = "/tmp/rust-zero-uploads"
 [[route_groups]]
 prefix = "/api"
 timeout_ms = 100
+middleware = ["audit"]
 
 [[route_groups.routes]]
 method = "GET"
@@ -382,6 +629,11 @@ priority = true
         assert_eq!(config.address, "127.0.0.1:9000".parse().unwrap());
         assert_eq!(config.workers, 2);
         assert_eq!(config.request_timeout_ms, 250);
+        assert!(config.adaptive_load_shedding);
+        assert_eq!(config.load_shed_cpu_threshold_percent, 85);
+        assert_eq!(config.load_shed_bucket_ms, 250);
+        assert_eq!(config.load_shed_buckets, 8);
+        assert_eq!(config.load_shed_cooldown_ms, 750);
         assert_eq!(config.max_multipart_field_bytes, 32 * 1024);
         assert_eq!(config.max_multipart_file_bytes, 8 * 1024 * 1024);
         assert_eq!(config.max_multipart_total_bytes, 12 * 1024 * 1024);
@@ -390,6 +642,7 @@ priority = true
             Some(Path::new("/tmp/rust-zero-uploads"))
         );
         assert_eq!(config.route_groups[0].prefix, "/api");
+        assert_eq!(config.route_groups[0].middleware, ["audit"]);
         assert_eq!(config.route_groups[0].routes[0].path, "/users/{id}");
         config.validate().unwrap();
     }
@@ -413,6 +666,16 @@ priority = true
         .err()
         .unwrap();
         assert!(error.to_string().contains("max_multipart_file_bytes"));
+
+        let error = RestServer::new(RestServerConfig {
+            load_shed_cpu_threshold_percent: 0,
+            ..RestServerConfig::default()
+        })
+        .err()
+        .unwrap();
+        assert!(error
+            .to_string()
+            .contains("load_shed_cpu_threshold_percent"));
     }
 
     #[actix_rt::test]
@@ -444,6 +707,82 @@ priority = true
         assert_eq!(response.status(), StatusCode::OK);
         assert!(response.headers().contains_key("x-request-id"));
         assert!(response.headers().contains_key("traceparent"));
+        assert!(metrics.render().contains("http_requests_total"));
+    }
+
+    #[actix_rt::test]
+    async fn serverless_handler_reuses_routes_middleware_metrics_and_static_fallback() {
+        let config = RestServerConfig {
+            route_groups: vec![RouteGroupConfig {
+                prefix: "/api".to_owned(),
+                middleware: vec!["tag".to_owned()],
+                routes: vec![crate::RoutePolicyConfig {
+                    method: "GET".to_owned(),
+                    path: "/value".to_owned(),
+                    public: true,
+                    jwt: None,
+                    timeout_ms: None,
+                    max_body_bytes: None,
+                    priority: None,
+                    sse: None,
+                }],
+                ..RouteGroupConfig::default()
+            }],
+            ..RestServerConfig::default()
+        };
+        let server = RestServer::new(config)
+            .unwrap()
+            .with_route_middleware(
+                "tag",
+                |request: ServiceRequest, next: crate::RouteMiddlewareNext| async move {
+                    let mut response = next.call(request).await?;
+                    response.headers_mut().insert(
+                        "x-route-middleware".parse().unwrap(),
+                        HeaderValue::from_static("yes"),
+                    );
+                    Ok(response)
+                },
+            )
+            .unwrap()
+            .with_static_assets(
+                StaticAssets::embedded([(
+                    "index.html",
+                    crate::EmbeddedAsset::inferred("serverless home"),
+                )])
+                .unwrap(),
+            );
+        let metrics = server.metrics();
+        let handler = server
+            .serverless_handler(|routes| {
+                routes.route("/api/value", web::get().to(|| async { "value" }));
+            })
+            .await
+            .unwrap();
+
+        let api = handler
+            .call(ServerlessRequest::new(
+                Method::GET,
+                Uri::from_static("/api/value"),
+                web::Bytes::new(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(api.status, StatusCode::OK);
+        assert_eq!(api.body, "value");
+        assert_eq!(api.headers.get("x-route-middleware").unwrap(), "yes");
+        assert!(api.headers.contains_key("x-request-id"));
+        assert!(api.headers.contains_key("traceparent"));
+
+        let static_response = handler
+            .call(ServerlessRequest::new(
+                Method::GET,
+                Uri::from_static("/"),
+                web::Bytes::new(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(static_response.status, StatusCode::OK);
+        assert_eq!(static_response.body, "serverless home");
         assert!(metrics.render().contains("http_requests_total"));
     }
 

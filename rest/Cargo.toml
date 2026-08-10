@@ -1,29 +1,50 @@
 [package]
-name = "rest"
-version = "0.1.0"
-edition = "2021"
+name = "rust-zero-rest"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Production Actix Web server, client, middleware, and request utilities for rust-zero"
+documentation = "https://docs.rs/rust-zero-rest"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lib]
+name = "rest"
+
+[package.metadata.docs.rs]
+all-features = true
 
 [features]
 default = []
 telemetry = ["rust-zero-core/telemetry"]
+sampling-profiler = ["dep:pprof"]
 
 [dependencies]
 actix-cors = "0.7"
+actix-http = "3"
 actix-multipart = "0.7"
 actix-rt = "2"
+actix-service = "2"
 actix-web = "4"
 base64 = "0.22"
 flate2 = "1"
 futures = "0.3.30"
 hmac = "0.12"
-rust-zero-core = { path = "../core" }
+libc = "0.2"
+rust-zero-core = { path = "../core", version = "0.1.0-alpha.1" }
 reqwest = { version = "=0.11.16", features = ["json"] }
+ring = "0.17"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 tempfile = "3"
-tokio = { version = "1", features = ["fs", "io-util", "sync"] }
+tokio = { version = "1", features = ["fs", "io-util", "rt", "sync", "time"] }
 tonic = { version = "0.12", default-features = false }
 tracing = "0.1"
+
+[target.'cfg(unix)'.dependencies]
+pprof = { version = "0.15", features = ["flamegraph"], optional = true }
