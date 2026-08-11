@@ -187,7 +187,7 @@ intentional ecosystem boundary; applications select clients that match their del
   partial dependency failure, overload recovery, large discovery snapshots, and queue saturation.
   The runner emits raw JSON with configuration and build identity, while the benchmark guide
   documents hardware capture, commands, result retention, and regression comparison methodology.
-- [ ] **Publishable, versioned crates.** Give every public crate a stable rust-zero-prefixed package
+- [x] **Publishable, versioned crates.** Give every public crate a stable rust-zero-prefixed package
   name and complete license, repository, documentation, and description metadata; add registry
   versions to workspace path dependencies; verify independent `cargo package` builds; publish API
   documentation and a changelog; and cut the first tagged prerelease without weakening the stated
@@ -200,7 +200,7 @@ intentional ecosystem boundary; applications select clients that match their del
   - [x] Build and verify every normalized package archive independently in CI, including the
     unpublished-core bootstrap used only before the first registry release.
   - [x] Add the public crate/documentation index, changelog, and repeatable release checklist.
-  - [ ] Publish the six crates in dependency order, verify their live docs.rs builds, and create
+  - [x] Publish the six crates in dependency order, verify their live docs.rs builds, and create
     the signed `v0.1.0-alpha.1` tag from the release commit.
 - [x] **Durable broker ecosystem boundary.** External messaging is not a rust-zero parity claim.
   Applications select Kafka, RabbitMQ, or another client according to the required delivery and
