@@ -11,10 +11,11 @@ use rust_zero_core::{
     TraceContext, TraceFlags,
 };
 use std::{
+    collections::HashMap,
     future::Future,
     panic::AssertUnwindSafe,
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, Mutex},
     task::{Context, Poll},
     time::{Duration, Instant},
 };
@@ -32,12 +33,14 @@ struct RpcSlowLogConfig {
 /// Creates the common server layer once and applies it to every generated Tonic service.
 ///
 /// The layer installs authentication, W3C trace extraction, panic recovery, adaptive admission
-/// control, and complete unary/streaming metrics. Add it to [`tonic::transport::Server`] before
-/// adding generated services; those services need no per-service interceptors.
+/// control, result-aware per-method circuit breaking, and complete unary/streaming metrics. Add it
+/// to [`tonic::transport::Server`] before adding generated services; those services need no
+/// per-service interceptors.
 pub struct RpcServerStackBuilder<T = ()> {
     metrics: RpcMetrics,
     auth: Option<Arc<Validator<T>>>,
     shedder: Option<AdaptiveShedder>,
+    breaker_config: Option<CircuitBreakerConfig>,
     slow_log: Option<RpcSlowLogConfig>,
 }
 
@@ -47,6 +50,9 @@ impl RpcServerStackBuilder<()> {
             metrics,
             auth: None,
             shedder: None,
+            breaker_config: Some(CircuitBreakerConfig::rolling(
+                rust_zero_core::RollingCircuitBreakerConfig::new(),
+            )),
             slow_log: None,
         }
     }
@@ -67,12 +73,25 @@ where
             metrics: self.metrics,
             auth: Some(Arc::new(validator)),
             shedder: self.shedder,
+            breaker_config: self.breaker_config,
             slow_log: self.slow_log,
         }
     }
 
     pub fn with_load_shedder(mut self, config: LoadShedderConfig) -> Self {
         self.shedder = Some(AdaptiveShedder::new(config));
+        self
+    }
+
+    /// Selects the result-aware circuit-breaker policy installed independently per gRPC method.
+    pub fn with_circuit_breaker(mut self, config: CircuitBreakerConfig) -> Self {
+        self.breaker_config = Some(config);
+        self
+    }
+
+    /// Disables the default per-method rolling circuit breaker.
+    pub fn without_circuit_breaker(mut self) -> Self {
+        self.breaker_config = None;
         self
     }
 
@@ -92,6 +111,12 @@ where
             metrics: RpcMetricsLayer::new(self.metrics),
             auth: self.auth,
             shedder: self.shedder,
+            breakers: self.breaker_config.map(|config| {
+                Arc::new(ServerCircuitBreakers {
+                    config,
+                    by_method: Mutex::new(HashMap::new()),
+                })
+            }),
             slow_log: self.slow_log,
         }
     }
@@ -101,6 +126,7 @@ pub struct RpcServerStack<T> {
     metrics: RpcMetricsLayer,
     auth: Option<Arc<Validator<T>>>,
     shedder: Option<AdaptiveShedder>,
+    breakers: Option<Arc<ServerCircuitBreakers>>,
     slow_log: Option<RpcSlowLogConfig>,
 }
 
@@ -110,6 +136,7 @@ impl<T> Clone for RpcServerStack<T> {
             metrics: self.metrics.clone(),
             auth: self.auth.clone(),
             shedder: self.shedder.clone(),
+            breakers: self.breakers.clone(),
             slow_log: self.slow_log.clone(),
         }
     }
@@ -126,6 +153,7 @@ where
             inner: self.metrics.layer(inner),
             auth: self.auth.clone(),
             shedder: self.shedder.clone(),
+            breakers: self.breakers.clone(),
             slow_log: self.slow_log.clone(),
         }
     }
@@ -136,7 +164,30 @@ pub struct RpcServerStackService<S, T> {
     inner: S,
     auth: Option<Arc<Validator<T>>>,
     shedder: Option<AdaptiveShedder>,
+    breakers: Option<Arc<ServerCircuitBreakers>>,
     slow_log: Option<RpcSlowLogConfig>,
+}
+
+struct ServerCircuitBreakers {
+    config: CircuitBreakerConfig,
+    by_method: Mutex<HashMap<String, Arc<CircuitBreaker>>>,
+}
+
+impl ServerCircuitBreakers {
+    fn acquire(&self, method: &str) -> Option<CircuitBreakerPermit> {
+        let breaker = {
+            let mut breakers = self
+                .by_method
+                .lock()
+                .expect("gRPC server circuit-breaker map lock poisoned");
+            Arc::clone(
+                breakers
+                    .entry(method.to_owned())
+                    .or_insert_with(|| Arc::new(CircuitBreaker::new(self.config))),
+            )
+        };
+        breaker.acquire()
+    }
 }
 
 impl<S, T, RequestBody, ResponseBody> Service<Request<RequestBody>> for RpcServerStackService<S, T>
@@ -158,6 +209,7 @@ where
     }
 
     fn call(&mut self, mut request: Request<RequestBody>) -> Self::Future {
+        let method = request.uri().path().to_owned();
         let trace = request
             .headers()
             .get("traceparent")
@@ -168,7 +220,7 @@ where
         let mut slow_call = self.slow_log.as_ref().map(|config| {
             RpcSlowCall::new(
                 config.clone(),
-                request.uri().path().to_owned(),
+                method.clone(),
                 request
                     .headers()
                     .get("grpc-timeout")
@@ -217,6 +269,21 @@ where
             None => None,
         };
 
+        let breaker_permit = match &self.breakers {
+            Some(breakers) => match breakers.acquire(&method) {
+                Some(permit) => Some(permit),
+                None => {
+                    if let Some(call) = slow_call.take() {
+                        call.finish(Code::Unavailable);
+                    }
+                    return Box::pin(async {
+                        Ok(Status::unavailable("gRPC method circuit breaker is open").into_http())
+                    });
+                }
+            },
+            None => None,
+        };
+
         let future = self.inner.call(request);
         Box::pin(async move {
             let result = AssertUnwindSafe(future).catch_unwind().await;
@@ -228,6 +295,7 @@ where
                         inner: body,
                         slow_call,
                         _shed_permit: permit,
+                        breaker_permit,
                     };
                     if let Some(code) = header_code {
                         body.finish(code);
@@ -237,12 +305,18 @@ where
                     Ok(Response::from_parts(parts, tonic::body::boxed(body)))
                 }
                 Ok(Err(error)) => {
+                    if let Some(permit) = breaker_permit {
+                        permit.finish(false);
+                    }
                     if let Some(call) = slow_call.take() {
                         call.finish_transport_error();
                     }
                     Err(error)
                 }
                 Err(_) => {
+                    if let Some(permit) = breaker_permit {
+                        permit.finish(false);
+                    }
                     if let Some(call) = slow_call.take() {
                         call.finish(Code::Internal);
                     }
@@ -319,6 +393,7 @@ pin_project! {
         inner: B,
         slow_call: Option<RpcSlowCall>,
         _shed_permit: Option<ShedPermit>,
+        breaker_permit: Option<CircuitBreakerPermit>,
     }
 
     impl<B> PinnedDrop for RpcServerLogBody<B> {
@@ -327,18 +402,27 @@ pin_project! {
             if let Some(call) = this.slow_call.take() {
                 call.finish(Code::Cancelled);
             }
+            if let Some(permit) = this.breaker_permit.take() {
+                permit.finish_with_outcome(CircuitOutcome::Cancellation);
+            }
         }
     }
 }
 
 impl<B> RpcServerLogBody<B> {
     fn finish(&mut self, code: Code) {
+        if let Some(permit) = self.breaker_permit.take() {
+            permit.finish_with_outcome(status_outcome(code));
+        }
         if let Some(call) = self.slow_call.take() {
             call.finish(code);
         }
     }
 
     fn finish_transport_error(&mut self) {
+        if let Some(permit) = self.breaker_permit.take() {
+            permit.finish(false);
+        }
         if let Some(call) = self.slow_call.take() {
             call.finish_transport_error();
         }
@@ -360,6 +444,9 @@ where
         match this.inner.as_mut().poll_frame(context) {
             Poll::Ready(Some(Ok(frame))) => {
                 if let Some(code) = frame.trailers_ref().and_then(grpc_status) {
+                    if let Some(permit) = this.breaker_permit.take() {
+                        permit.finish_with_outcome(status_outcome(code));
+                    }
                     if let Some(call) = this.slow_call.take() {
                         call.finish(code);
                     }
@@ -367,12 +454,18 @@ where
                 Poll::Ready(Some(Ok(frame)))
             }
             Poll::Ready(Some(Err(error))) => {
+                if let Some(permit) = this.breaker_permit.take() {
+                    permit.finish(false);
+                }
                 if let Some(call) = this.slow_call.take() {
                     call.finish_transport_error();
                 }
                 Poll::Ready(Some(Err(error)))
             }
             Poll::Ready(None) => {
+                if let Some(permit) = this.breaker_permit.take() {
+                    permit.finish(true);
+                }
                 if let Some(call) = this.slow_call.take() {
                     call.finish(Code::Ok);
                 }
@@ -832,6 +925,26 @@ mod client_tests {
         }
     }
 
+    #[derive(Clone)]
+    struct FailingServerTransport {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl Service<Request<()>> for FailingServerTransport {
+        type Response = Response<TrailerBody>;
+        type Error = Infallible;
+        type Future = std::future::Ready<Result<Self::Response, Self::Error>>;
+
+        fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _: Request<()>) -> Self::Future {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            std::future::ready(Ok(Response::new(TrailerBody(true))))
+        }
+    }
+
     #[tokio::test]
     async fn client_stack_composes_headers_metrics_deadline_and_trailer_breaking() {
         let registry = rust_zero_core::Metrics::new();
@@ -973,6 +1086,56 @@ mod client_tests {
                 .map(|value| value.as_bytes()),
             Some(b"8".as_slice())
         );
+    }
+
+    #[tokio::test]
+    async fn server_breaker_is_result_aware_and_isolated_per_method() {
+        let registry = rust_zero_core::Metrics::new();
+        let metrics = RpcMetrics::new(
+            &registry,
+            "server_breaker",
+            RpcMetricMode::Server,
+            ["/echo.Echo/Call", "/echo.Echo/Other"],
+        )
+        .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut service = RpcServerStackBuilder::new(metrics)
+            .with_circuit_breaker(CircuitBreakerConfig::new(1, Duration::from_secs(60)))
+            .build()
+            .layer(FailingServerTransport {
+                calls: Arc::clone(&calls),
+            });
+
+        let first = service
+            .ready()
+            .await
+            .unwrap()
+            .call(Request::builder().uri("/echo.Echo/Call").body(()).unwrap())
+            .await
+            .unwrap();
+        let mut body = Box::pin(first.into_body());
+        std::future::poll_fn(|context| body.as_mut().poll_frame(context)).await;
+
+        let rejected = service
+            .ready()
+            .await
+            .unwrap()
+            .call(Request::builder().uri("/echo.Echo/Call").body(()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(rejected.headers().get("grpc-status").unwrap(), "14");
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+        let other = service
+            .ready()
+            .await
+            .unwrap()
+            .call(Request::builder().uri("/echo.Echo/Other").body(()).unwrap())
+            .await
+            .unwrap();
+        let mut body = Box::pin(other.into_body());
+        std::future::poll_fn(|context| body.as_mut().poll_frame(context)).await;
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
     }
 
     #[test]

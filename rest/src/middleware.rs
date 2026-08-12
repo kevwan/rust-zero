@@ -8,8 +8,12 @@ use actix_web::{
 };
 use futures::future::{ok, LocalBoxFuture, Ready};
 use futures::{Stream, StreamExt};
-use rust_zero_core::{AdaptiveShedder, ShedPermit};
+use rust_zero_core::{
+    AdaptiveShedder, CircuitBreaker, CircuitBreakerConfig, CircuitBreakerPermit, CircuitOutcome,
+    ShedPermit,
+};
 use std::{
+    collections::HashMap,
     io::Read,
     pin::Pin,
     rc::Rc,
@@ -18,6 +22,183 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::sync::Semaphore;
+
+/// Applies independent, result-aware circuit breakers to stable HTTP route patterns.
+///
+/// Breaker permits live until the response body completes. Dropping a streaming body before its
+/// final frame records cancellation rather than poisoning route health.
+#[derive(Clone)]
+pub struct ServerCircuitBreaker {
+    shared: Arc<ServerCircuitBreakers>,
+    metrics: Option<HttpMetrics>,
+}
+
+struct ServerCircuitBreakers {
+    config: CircuitBreakerConfig,
+    by_route: Mutex<HashMap<String, Arc<CircuitBreaker>>>,
+}
+
+impl ServerCircuitBreaker {
+    pub fn new(config: CircuitBreakerConfig) -> Self {
+        Self {
+            shared: Arc::new(ServerCircuitBreakers {
+                config,
+                by_route: Mutex::new(HashMap::new()),
+            }),
+            metrics: None,
+        }
+    }
+
+    pub fn with_metrics(mut self, metrics: HttpMetrics) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+}
+
+impl<S, B> Transform<S, ServiceRequest> for ServerCircuitBreaker
+where
+    S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = Error> + 'static,
+    S::Future: 'static,
+    B: MessageBody + 'static,
+{
+    type Response = ServiceResponse<EitherBody<ServerCircuitBody<B>>>;
+    type Error = Error;
+    type Transform = ServerCircuitBreakerMiddleware<S>;
+    type InitError = ();
+    type Future = Ready<Result<Self::Transform, Self::InitError>>;
+
+    fn new_transform(&self, service: S) -> Self::Future {
+        ok(ServerCircuitBreakerMiddleware {
+            service,
+            shared: Arc::clone(&self.shared),
+            metrics: self.metrics.clone(),
+        })
+    }
+}
+
+pub struct ServerCircuitBreakerMiddleware<S> {
+    service: S,
+    shared: Arc<ServerCircuitBreakers>,
+    metrics: Option<HttpMetrics>,
+}
+
+impl<S, B> Service<ServiceRequest> for ServerCircuitBreakerMiddleware<S>
+where
+    S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = Error> + 'static,
+    S::Future: 'static,
+    B: MessageBody + 'static,
+{
+    type Response = ServiceResponse<EitherBody<ServerCircuitBody<B>>>;
+    type Error = Error;
+    type Future = LocalBoxFuture<'static, Result<Self::Response, Self::Error>>;
+
+    fn poll_ready(&self, context: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.service.poll_ready(context)
+    }
+
+    fn call(&self, request: ServiceRequest) -> Self::Future {
+        let pattern = request
+            .match_pattern()
+            .unwrap_or_else(|| "<unmatched>".to_owned());
+        let route = format!("{} {pattern}", request.method());
+        let breaker = {
+            let mut breakers = self
+                .shared
+                .by_route
+                .lock()
+                .expect("REST server circuit-breaker map lock poisoned");
+            Arc::clone(
+                breakers
+                    .entry(route)
+                    .or_insert_with(|| Arc::new(CircuitBreaker::new(self.shared.config))),
+            )
+        };
+        let Some(permit) = breaker.acquire() else {
+            if let Some(metrics) = &self.metrics {
+                metrics.record_protection("circuit_breaker", "rejected");
+            }
+            return Box::pin(async move {
+                Ok(request.into_response(
+                    HttpResponse::ServiceUnavailable()
+                        .body("HTTP route circuit breaker is open")
+                        .map_into_right_body(),
+                ))
+            });
+        };
+
+        let future = self.service.call(request);
+        Box::pin(async move {
+            match future.await {
+                Ok(response) => {
+                    let outcome = http_status_outcome(response.status());
+                    Ok(response
+                        .map_body(move |_, body| ServerCircuitBody::new(body, permit, outcome))
+                        .map_into_left_body())
+                }
+                Err(error) => {
+                    permit.finish(false);
+                    Err(error)
+                }
+            }
+        })
+    }
+}
+
+fn http_status_outcome(status: StatusCode) -> CircuitOutcome {
+    if status.is_server_error() {
+        CircuitOutcome::Failure
+    } else {
+        CircuitOutcome::Success
+    }
+}
+
+pub struct ServerCircuitBody<B> {
+    inner: Pin<Box<B>>,
+    permit: Option<CircuitBreakerPermit>,
+    outcome: CircuitOutcome,
+}
+
+impl<B> ServerCircuitBody<B> {
+    fn new(body: B, permit: CircuitBreakerPermit, outcome: CircuitOutcome) -> Self {
+        Self {
+            inner: Box::pin(body),
+            permit: Some(permit),
+            outcome,
+        }
+    }
+
+    fn finish(&mut self, outcome: CircuitOutcome) {
+        if let Some(permit) = self.permit.take() {
+            permit.finish_with_outcome(outcome);
+        }
+    }
+}
+
+impl<B: MessageBody> MessageBody for ServerCircuitBody<B> {
+    type Error = B::Error;
+
+    fn size(&self) -> actix_web::body::BodySize {
+        self.inner.as_ref().get_ref().size()
+    }
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Option<Result<actix_web::web::Bytes, Self::Error>>> {
+        match self.inner.as_mut().poll_next(context) {
+            Poll::Ready(None) => {
+                let outcome = self.outcome;
+                self.finish(outcome);
+                Poll::Ready(None)
+            }
+            Poll::Ready(Some(Err(error))) => {
+                self.finish(CircuitOutcome::Failure);
+                Poll::Ready(Some(Err(error)))
+            }
+            other => other,
+        }
+    }
+}
 
 /// Rejects requests that exceed the configured maximum execution time.
 pub struct Timeout {
@@ -674,7 +855,10 @@ mod tests {
     use rust_zero_core::Metrics;
     use std::{
         future::{poll_fn, Future},
-        sync::Arc,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
         task::Poll,
     };
     use tokio::sync::Notify;
@@ -707,6 +891,71 @@ mod tests {
         assert!(metrics.render().contains(
             "test_http_protection_decisions_total{mechanism=\"timeout\",decision=\"rejected\"} 1"
         ));
+    }
+
+    #[actix_rt::test]
+    async fn server_breaker_is_result_aware_and_isolated_per_route() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let metrics = Metrics::new();
+        let http_metrics = HttpMetrics::new(&metrics, "server_breaker").unwrap();
+        let app = test::init_service(
+            App::new()
+                .app_data(Data::from(Arc::clone(&calls)))
+                .wrap(
+                    ServerCircuitBreaker::new(CircuitBreakerConfig::new(
+                        1,
+                        Duration::from_secs(60),
+                    ))
+                    .with_metrics(http_metrics),
+                )
+                .route(
+                    "/fail/{id}",
+                    web::get().to(|calls: Data<AtomicUsize>| async move {
+                        calls.fetch_add(1, Ordering::Relaxed);
+                        HttpResponse::InternalServerError().body("failed")
+                    }),
+                )
+                .route(
+                    "/other/{id}",
+                    web::get().to(|calls: Data<AtomicUsize>| async move {
+                        calls.fetch_add(1, Ordering::Relaxed);
+                        HttpResponse::InternalServerError().body("failed")
+                    }),
+                ),
+        )
+        .await;
+
+        let first =
+            test::call_service(&app, test::TestRequest::get().uri("/fail/1").to_request()).await;
+        assert_eq!(first.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        test::read_body(first).await;
+
+        let rejected =
+            test::call_service(&app, test::TestRequest::get().uri("/fail/2").to_request()).await;
+        assert_eq!(rejected.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+        let other =
+            test::call_service(&app, test::TestRequest::get().uri("/other/1").to_request()).await;
+        assert_eq!(other.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        test::read_body(other).await;
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        assert!(metrics.render().contains(
+            "server_breaker_http_protection_decisions_total{mechanism=\"circuit_breaker\",decision=\"rejected\"} 1"
+        ));
+    }
+
+    #[actix_rt::test]
+    async fn server_breaker_body_records_early_stream_drop_as_cancellation() {
+        let breaker = Arc::new(CircuitBreaker::new(CircuitBreakerConfig::new(
+            1,
+            Duration::from_secs(60),
+        )));
+        let body = ServerCircuitBody::new((), breaker.acquire().unwrap(), CircuitOutcome::Success);
+        drop(body);
+
+        assert_eq!(breaker.snapshot().cancellations, 1);
+        assert_eq!(breaker.snapshot().failures, 0);
     }
 
     #[actix_rt::test]

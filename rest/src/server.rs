@@ -1,8 +1,8 @@
 use crate::{
     route::RoutePolicies, AdaptiveLoadShed, ConcurrencyLimit, ContentEncryption, HttpMetrics,
     LoggingMiddleware, MetricsMiddleware, MultipartConfig, Recover, RequestBodyLimit, RequestId,
-    ResponsePolicy, RouteGroupConfig, RouteMiddleware, SecurityHeaders, StaticAssets, Timeout,
-    TraceContextMiddleware,
+    ResponsePolicy, RouteGroupConfig, RouteMiddleware, SecurityHeaders, ServerCircuitBreaker,
+    StaticAssets, Timeout, TraceContextMiddleware,
 };
 use actix_web::{
     body::{self, BoxBody},
@@ -12,7 +12,9 @@ use actix_web::{
     web::{self, ServiceConfig},
     App, Error, HttpServer,
 };
-use rust_zero_core::{AdaptiveShedder, LoadShedderConfig, Metrics};
+use rust_zero_core::{
+    AdaptiveShedder, CircuitBreakerConfig, LoadShedderConfig, Metrics, RollingCircuitBreakerConfig,
+};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -27,7 +29,7 @@ use std::{
 };
 
 macro_rules! standard_app {
-    ($config:expr, $http_metrics:expr, $adaptive_shedder:expr, $route_policies:expr, $response_policy:expr, $content_encryption:expr, $static_assets:expr, $configure:expr) => {{
+    ($config:expr, $http_metrics:expr, $adaptive_shedder:expr, $server_breaker:expr, $route_policies:expr, $response_policy:expr, $content_encryption:expr, $static_assets:expr, $configure:expr) => {{
         let config = $config;
         let http_metrics = $http_metrics;
         let mut multipart_config = MultipartConfig::new(
@@ -48,6 +50,10 @@ macro_rules! standard_app {
         let mut adaptive_load = AdaptiveLoadShed::new($adaptive_shedder);
         if config.metrics {
             adaptive_load = adaptive_load.with_metrics(http_metrics.clone());
+        }
+        let mut server_breaker = $server_breaker;
+        if config.metrics {
+            server_breaker = server_breaker.with_metrics(http_metrics.clone());
         }
         let app = App::new()
             .app_data(web::JsonConfig::default().limit(config.max_body_bytes))
@@ -72,6 +78,10 @@ macro_rules! standard_app {
             .wrap(timeout)
             .wrap(concurrency)
             .wrap(Condition::new(config.adaptive_load_shedding, adaptive_load))
+            .wrap(Condition::new(
+                config.server_circuit_breaking,
+                server_breaker,
+            ))
             .wrap(
                 RequestBodyLimit::new(config.max_body_bytes)
                     .decompress_gzip(config.decompress_gzip),
@@ -174,6 +184,7 @@ pub struct RestServerConfig {
     pub max_concurrent_requests: usize,
     pub priority_concurrency_reserve: usize,
     pub adaptive_load_shedding: bool,
+    pub server_circuit_breaking: bool,
     pub load_shed_cpu_threshold_percent: u8,
     pub load_shed_bucket_ms: u64,
     pub load_shed_buckets: usize,
@@ -206,6 +217,7 @@ impl Default for RestServerConfig {
             max_concurrent_requests: 1_024,
             priority_concurrency_reserve: 256,
             adaptive_load_shedding: true,
+            server_circuit_breaking: true,
             load_shed_cpu_threshold_percent: 90,
             load_shed_bucket_ms: 1_000,
             load_shed_buckets: 10,
@@ -350,6 +362,7 @@ pub struct RestServer {
     route_middleware: HashMap<String, Arc<dyn RouteMiddleware>>,
     static_assets: Option<StaticAssets>,
     adaptive_shedder: AdaptiveShedder,
+    server_breaker: ServerCircuitBreaker,
 }
 
 impl RestServer {
@@ -375,6 +388,9 @@ impl RestServer {
                 )
                 .with_cooldown(Duration::from_millis(config.load_shed_cooldown_ms)),
         );
+        let server_breaker = ServerCircuitBreaker::new(CircuitBreakerConfig::rolling(
+            RollingCircuitBreakerConfig::new(),
+        ));
         Ok(Self {
             config,
             metrics,
@@ -385,6 +401,7 @@ impl RestServer {
             route_middleware: HashMap::new(),
             static_assets: None,
             adaptive_shedder,
+            server_breaker,
         })
     }
 
@@ -436,6 +453,19 @@ impl RestServer {
         self
     }
 
+    /// Selects the result-aware policy shared by the standard stack's per-route breakers.
+    pub fn with_server_circuit_breaker(mut self, config: CircuitBreakerConfig) -> Self {
+        self.server_breaker = ServerCircuitBreaker::new(config);
+        self.config.server_circuit_breaking = true;
+        self
+    }
+
+    /// Disables the default per-route rolling circuit breaker.
+    pub fn without_server_circuit_breaker(mut self) -> Self {
+        self.config.server_circuit_breaking = false;
+        self
+    }
+
     pub fn config(&self) -> &RestServerConfig {
         &self.config
     }
@@ -466,6 +496,7 @@ impl RestServer {
             &self.config,
             self.http_metrics.clone(),
             self.adaptive_shedder.clone(),
+            self.server_breaker.clone(),
             route_policies,
             self.response_policy.clone(),
             self.content_encryption.clone(),
@@ -518,6 +549,7 @@ impl RestServer {
         let content_encryption = self.content_encryption.clone();
         let static_assets = self.static_assets.clone();
         let adaptive_shedder = self.adaptive_shedder.clone();
+        let server_breaker = self.server_breaker.clone();
         let shutdown_seconds = config.shutdown_timeout_ms.div_ceil(1_000);
         let workers = config.workers;
 
@@ -526,6 +558,7 @@ impl RestServer {
                 &config,
                 http_metrics.clone(),
                 adaptive_shedder.clone(),
+                server_breaker.clone(),
                 route_policies.clone(),
                 response_policy.clone(),
                 content_encryption.clone(),
@@ -784,6 +817,62 @@ priority = true
         assert_eq!(static_response.status, StatusCode::OK);
         assert_eq!(static_response.body, "serverless home");
         assert!(metrics.render().contains("http_requests_total"));
+    }
+
+    #[actix_rt::test]
+    async fn standard_serverless_stack_installs_per_route_circuit_breaking() {
+        let server = RestServer::new(RestServerConfig::default())
+            .unwrap()
+            .with_server_circuit_breaker(CircuitBreakerConfig::new(1, Duration::from_secs(60)));
+        let metrics = server.metrics();
+        let handler = server
+            .serverless_handler(|routes| {
+                routes
+                    .route(
+                        "/fail/{id}",
+                        web::get()
+                            .to(|| async { HttpResponse::InternalServerError().body("fail") }),
+                    )
+                    .route(
+                        "/healthy/{id}",
+                        web::get().to(|| async { HttpResponse::Ok().body("ok") }),
+                    );
+            })
+            .await
+            .unwrap();
+
+        let first = handler
+            .call(ServerlessRequest::new(
+                Method::GET,
+                Uri::from_static("/fail/1"),
+                web::Bytes::new(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(first.status, StatusCode::INTERNAL_SERVER_ERROR);
+
+        let rejected = handler
+            .call(ServerlessRequest::new(
+                Method::GET,
+                Uri::from_static("/fail/2"),
+                web::Bytes::new(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(rejected.status, StatusCode::SERVICE_UNAVAILABLE);
+
+        let healthy = handler
+            .call(ServerlessRequest::new(
+                Method::GET,
+                Uri::from_static("/healthy/1"),
+                web::Bytes::new(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(healthy.status, StatusCode::OK);
+        assert!(metrics.render().contains(
+            "rust_zero_http_protection_decisions_total{mechanism=\"circuit_breaker\",decision=\"rejected\"} 1"
+        ));
     }
 
     #[actix_rt::test]

@@ -2,15 +2,59 @@
 
 This backlog tracks production capabilities still needed after the
 [go-zero v1.10.3](https://github.com/zeromicro/go-zero/tree/v1.10.3) runtime audit on
-2026-08-09. The follow-up check also covered upstream `master` through `f7805d5e`; changes after
-v1.10.3 were dependency, CI, Go-toolchain, and `goctl` maintenance only, with no new runtime
-capability to port. Equivalent Rust/Actix/Tonic behavior is the goal; identical Go APIs are not.
-`goctl`, API/protobuf code generation, and language-client generation remain out of scope.
+2026-08-09. A [follow-up comparison](https://github.com/zeromicro/go-zero/compare/f7805d5e322361f65561e8f562121b35404593a3...91a4cdbaf4e987f1c44ab14fb639756f213328f0)
+from the recorded audit point through `91a4cdba` found only dependency changes on upstream
+`master`; v1.10.3 remains the runtime baseline. Equivalent
+Rust/Actix/Tonic behavior is the goal; identical Go APIs are not. `goctl`, API/protobuf/model/client
+generation, templates, and deployment scaffolding remain an intentional developer-experience
+boundary rather than a runtime-parity claim.
+
+## Reopened parity gaps
+
+These items were identified after the original matrix was marked covered. Until the P0 items are
+complete, the project claims **broad runtime coverage**, not full runtime parity.
+
+### P0 — runtime parity blockers
+
+- [ ] **End-to-end TLS and mTLS.**
+  - [ ] Add certificate/key and optional client-CA configuration to the standard REST server,
+    including validation and HTTPS lifecycle tests.
+  - [ ] Enable Tonic TLS support and add server identity, client trust roots, client identity, and
+    domain-name configuration to standard gRPC server/client assembly.
+  - [ ] Add CA/certificate/key and server-name support to authenticated etcd connections, with
+    real-backend TLS and mTLS coverage.
+- [x] **Result-aware server-side circuit breaking.** Install independent breaker state per REST
+  route and gRPC method by default, retain permits through streaming completion, and classify
+  protocol results and cancellations without allowing one route/method to poison another.
+  - [x] The standard gRPC server stack installs a configurable rolling breaker per method, observes
+    final trailers and stream cancellation, rejects open methods with `UNAVAILABLE`, and supports
+    explicit opt-out or selection of the consecutive-failure policy.
+  - [x] The standard REST and serverless stacks install configurable rolling breakers per stable
+    method/route pattern, classify 5xx responses and body errors as failures, retain permits through
+    response streaming, record early body drops as cancellation, expose rejection metrics, isolate
+    route state, and support explicit opt-out or the consecutive-failure policy.
+- [ ] **Complete configuration-driven gRPC lifecycle.**
+  - [ ] Support validated per-method server timeouts with exact-method and service-level matching
+    while retaining the global fallback.
+  - [ ] Add optional automatic etcd registration/lease renewal and withdrawal to `RpcServerConfig`,
+    using the existing `EtcdServiceLease` and coordinating it with graceful startup/shutdown.
+
+### P1 — standard assembly
+
+- [ ] **Configuration-driven CORS.** Add validated origin, method, header, credential, max-age, and
+  preflight settings to `RestServerConfig` and install them in the standard REST/serverless stack.
+
+### P2 — compatibility
+
+- [ ] **Legacy MCP SSE transport.** Add the MCP 2024-11-05 SSE transport alongside the implemented
+  2025-03-26 Streamable HTTP transport for older clients, with explicit transport selection and
+  protocol-version tests.
 
 ## P0 — framework-level parity
 
-- [x] **Configuration-driven REST server assembly.** The standard stack, declarative route-policy
-  layer, and end-to-end lifecycle proof are present.
+- [x] **Baseline configuration-driven REST server assembly.** The standard stack, declarative
+  route-policy layer, and end-to-end lifecycle proof from the original audit are present; the
+  reopened TLS, CORS, and server-breaker extensions are tracked above.
   - [x] Add a deserializable, validated `RestServerConfig` with production defaults.
   - [x] Assemble logging, recovery, request IDs, tracing, metrics, security headers, timeout,
     decompression/body limits, concurrency shedding, listener binding, and bounded Actix shutdown.
@@ -18,8 +62,9 @@ capability to port. Equivalent Rust/Actix/Tonic behavior is the goal; identical 
     require manual server or middleware wiring.
   - [x] Add declarative route groups and per-route JWT/timeout/body-limit/priority/SSE overrides.
   - [x] Prove signal-driven graceful draining with an in-flight request integration test.
-- [x] **Configuration-driven gRPC assembly.** Transport configuration and the
-  generated-service-independent interceptor and lifecycle layer are complete.
+- [x] **Baseline configuration-driven gRPC assembly.** Transport configuration and the
+  generated-service-independent interceptor and lifecycle layer from the original audit are
+  present; reopened TLS, per-method timeout, and automatic registration work is tracked above.
   - [x] Deserialize and validate server/client deadlines, concurrency, streaming, connection,
     keepalive, endpoint, and shutdown settings using millisecond config values.
   - [x] Retain configured Tonic server construction and direct/dynamic client channel construction,
@@ -153,14 +198,15 @@ capability to port. Equivalent Rust/Actix/Tonic behavior is the goal; identical 
 
 ## Recommended execution order
 
-Implement the P0 items in order: distributed limiting, rolling adaptive breaking, then
-CPU/throughput-aware shedding. After their transport integrations and fault tests are stable, add
-the benchmark suite before changing crate names or cutting a prerelease. Durable brokers remain an
-intentional ecosystem boundary; applications select clients that match their delivery semantics.
+Finish the reopened P0 items in this order: REST server circuit breaking, end-to-end TLS/mTLS, then
+per-method gRPC timeouts and automatic etcd registration. Add configurable CORS next and legacy MCP
+SSE only where older-client compatibility is required. Durable brokers and the `goctl` developer
+toolchain remain intentional ecosystem boundaries.
 
 ## Remaining catch-up items
 
-`goctl`, all other code generation, and MCP remain outside this catch-up scope.
+`goctl` and all other code generation remain outside this runtime catch-up scope. MCP Streamable
+HTTP is covered; only its legacy SSE compatibility transport remains above.
 
 ### P0 — runtime semantics
 
@@ -210,6 +256,9 @@ intentional ecosystem boundary; applications select clients that match their del
 
 ## Recently completed
 
+- [x] Default result-aware server circuit breaking with isolated REST route and gRPC method state,
+  configurable rolling/consecutive policies, streaming-body/trailer lifetime permits, cancellation
+  handling, stable overload responses, protection metrics, opt-out controls, and isolation tests.
 - [x] A versioned benchmark runner covering live REST/gRPC throughput and tail latency, allocator
   behavior and peak RSS, partial-failure circuit breaking, overload recovery, 10,000-endpoint
   discovery snapshots, and saturated supervised queues, with raw JSON output and a reproducibility

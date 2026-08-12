@@ -30,7 +30,9 @@ pub use extract::{
 };
 pub use log::{LoggingMiddleware, StructuredLogging};
 pub use metrics::{HttpClientMetrics, HttpMetrics, MetricsMiddleware};
-pub use middleware::{AdaptiveLoadShed, ConcurrencyLimit, RateLimit, RequestBodyLimit, Timeout};
+pub use middleware::{
+    AdaptiveLoadShed, ConcurrencyLimit, RateLimit, RequestBodyLimit, ServerCircuitBreaker, Timeout,
+};
 pub use recovery::Recover;
 pub use resilience::{RequestId, RequestIdValue};
 pub use response::{grpc_status_to_http, streaming_response, ApiError, ResponsePolicy};
