@@ -44,7 +44,7 @@ complete, the project claims **broad runtime coverage**, not full runtime parity
 
 ### P1 — standard assembly
 
-- [ ] **Configuration-driven CORS.** Add validated origin, method, header, credential, max-age, and
+- [x] **Configuration-driven CORS.** Add validated origin, method, header, credential, max-age, and
   preflight settings to `RestServerConfig` and install them in the standard REST/serverless stack.
 
 ### P2 — compatibility
@@ -201,9 +201,9 @@ complete, the project claims **broad runtime coverage**, not full runtime parity
 
 ## Recommended execution order
 
-The reopened P0 runtime items are complete. Add configurable CORS next and legacy MCP SSE only
-where older-client compatibility is required. Durable brokers and the `goctl` developer toolchain
-remain intentional ecosystem boundaries.
+The reopened P0 runtime items and standard-stack CORS are complete. Add legacy MCP SSE only where
+older-client compatibility is required. Durable brokers and the `goctl` developer toolchain remain
+intentional ecosystem boundaries.
 
 ## Remaining catch-up items
 

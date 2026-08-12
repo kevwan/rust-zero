@@ -5,6 +5,8 @@ Versioning, with the pre-1.0 compatibility policy described in the README.
 
 ## [Unreleased]
 
+- Added validated configuration-driven CORS to the standard REST and serverless stacks, including
+  explicit origins, methods, request/response headers, credentials, cache age, and preflight mode.
 - Added exact-method and service-level gRPC server timeouts with global fallback, plus optional
   configuration-driven etcd registration, lease renewal, and graceful withdrawal.
 

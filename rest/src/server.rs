@@ -4,10 +4,11 @@ use crate::{
     ResponsePolicy, RouteGroupConfig, RouteMiddleware, SecurityHeaders, ServerCircuitBreaker,
     StaticAssets, Timeout, TraceContextMiddleware,
 };
+use actix_cors::Cors;
 use actix_web::{
     body::{self, BoxBody},
     dev::{Service, ServiceResponse},
-    http::{header::HeaderMap, Method, Uri},
+    http::{header::HeaderMap, header::HeaderName, Method, Uri},
     middleware::Condition,
     web::{self, ServiceConfig},
     App, Error, HttpServer,
@@ -138,6 +139,213 @@ impl RestTlsConfig {
     }
 }
 
+/// Cross-origin policy installed by the standard REST and serverless stacks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RestCorsConfig {
+    /// Exact serialized origins, or a single `*` to reflect any request origin.
+    pub allowed_origins: Vec<String>,
+    /// HTTP methods accepted by preflight, or a single `*` for all standard methods.
+    pub allowed_methods: Vec<String>,
+    /// Request header names accepted by preflight, or a single `*` for any header.
+    pub allowed_headers: Vec<String>,
+    /// Response header names exposed to browser code, or a single `*` for any header.
+    pub exposed_headers: Vec<String>,
+    pub allow_credentials: bool,
+    pub max_age_seconds: Option<usize>,
+    pub automatic_preflight: bool,
+}
+
+impl Default for RestCorsConfig {
+    fn default() -> Self {
+        Self {
+            allowed_origins: Vec::new(),
+            allowed_methods: vec![
+                "GET".to_owned(),
+                "HEAD".to_owned(),
+                "POST".to_owned(),
+                "PUT".to_owned(),
+                "PATCH".to_owned(),
+                "DELETE".to_owned(),
+                "OPTIONS".to_owned(),
+            ],
+            allowed_headers: Vec::new(),
+            exposed_headers: Vec::new(),
+            allow_credentials: false,
+            max_age_seconds: Some(3_600),
+            automatic_preflight: true,
+        }
+    }
+}
+
+impl RestCorsConfig {
+    pub fn new(origins: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        Self {
+            allowed_origins: origins.into_iter().map(Into::into).collect(),
+            ..Self::default()
+        }
+    }
+
+    pub fn with_methods(mut self, methods: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.allowed_methods = methods.into_iter().map(Into::into).collect();
+        self
+    }
+
+    pub fn with_allowed_headers(
+        mut self,
+        headers: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.allowed_headers = headers.into_iter().map(Into::into).collect();
+        self
+    }
+
+    pub fn with_exposed_headers(
+        mut self,
+        headers: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.exposed_headers = headers.into_iter().map(Into::into).collect();
+        self
+    }
+
+    pub fn with_credentials(mut self, allow: bool) -> Self {
+        self.allow_credentials = allow;
+        self
+    }
+
+    pub fn with_max_age(mut self, seconds: Option<usize>) -> Self {
+        self.max_age_seconds = seconds;
+        self
+    }
+
+    pub fn with_automatic_preflight(mut self, enabled: bool) -> Self {
+        self.automatic_preflight = enabled;
+        self
+    }
+
+    fn validate(&self) -> Result<(), RestServerConfigError> {
+        if self.allowed_origins.is_empty() {
+            return Err(RestServerConfigError::Invalid(
+                "CORS allowed_origins must not be empty",
+            ));
+        }
+        validate_wildcard_list(
+            &self.allowed_origins,
+            "CORS allowed_origins must contain either * or explicit origins",
+        )?;
+        for origin in &self.allowed_origins {
+            if origin == "*" || origin == "null" {
+                continue;
+            }
+            let uri = origin.parse::<Uri>().map_err(|_| {
+                RestServerConfigError::Invalid(
+                    "CORS allowed_origins must contain valid serialized origins",
+                )
+            })?;
+            if uri.scheme().is_none()
+                || uri.authority().is_none()
+                || uri.path() != "/"
+                || uri.query().is_some()
+            {
+                return Err(RestServerConfigError::Invalid(
+                    "CORS allowed_origins must contain valid serialized origins",
+                ));
+            }
+        }
+
+        if self.allowed_methods.is_empty() {
+            return Err(RestServerConfigError::Invalid(
+                "CORS allowed_methods must not be empty",
+            ));
+        }
+        validate_wildcard_list(
+            &self.allowed_methods,
+            "CORS allowed_methods must contain either * or explicit methods",
+        )?;
+        for method in &self.allowed_methods {
+            if method != "*"
+                && (method.trim() != method || Method::from_bytes(method.as_bytes()).is_err())
+            {
+                return Err(RestServerConfigError::Invalid(
+                    "CORS allowed_methods contains an invalid HTTP method",
+                ));
+            }
+        }
+
+        validate_header_list(
+            &self.allowed_headers,
+            "CORS allowed_headers contains an invalid HTTP header name",
+        )?;
+        validate_header_list(
+            &self.exposed_headers,
+            "CORS exposed_headers contains an invalid HTTP header name",
+        )?;
+        Ok(())
+    }
+
+    fn middleware(&self) -> Cors {
+        let mut cors = Cors::default();
+        if self.allowed_origins == ["*"] {
+            cors = cors.allow_any_origin();
+        } else {
+            for origin in &self.allowed_origins {
+                cors = cors.allowed_origin(origin);
+            }
+        }
+        if self.allowed_methods == ["*"] {
+            cors = cors.allow_any_method();
+        } else {
+            cors = cors.allowed_methods(self.allowed_methods.iter().map(String::as_str));
+        }
+        if self.allowed_headers == ["*"] {
+            cors = cors.allow_any_header();
+        } else {
+            cors = cors.allowed_headers(self.allowed_headers.iter().map(String::as_str));
+        }
+        if self.exposed_headers == ["*"] {
+            cors = cors.expose_any_header();
+        } else {
+            cors = cors.expose_headers(self.exposed_headers.iter().map(String::as_str));
+        }
+        cors = cors.max_age(self.max_age_seconds);
+        if self.allow_credentials {
+            cors = cors.supports_credentials();
+        }
+        if !self.automatic_preflight {
+            cors = cors.disable_preflight();
+        }
+        cors
+    }
+}
+
+fn validate_wildcard_list(
+    values: &[String],
+    message: &'static str,
+) -> Result<(), RestServerConfigError> {
+    if values.iter().any(|value| value == "*") && values != ["*"] {
+        Err(RestServerConfigError::Invalid(message))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_header_list(
+    headers: &[String],
+    field: &'static str,
+) -> Result<(), RestServerConfigError> {
+    validate_wildcard_list(
+        headers,
+        "CORS header lists must contain either * or explicit header names",
+    )?;
+    for header in headers {
+        if header != "*"
+            && (header.trim() != header || HeaderName::from_bytes(header.as_bytes()).is_err())
+        {
+            return Err(RestServerConfigError::Invalid(field));
+        }
+    }
+    Ok(())
+}
+
 macro_rules! standard_app {
     ($config:expr, $http_metrics:expr, $adaptive_shedder:expr, $server_breaker:expr, $route_policies:expr, $response_policy:expr, $content_encryption:expr, $static_assets:expr, $configure:expr) => {{
         let config = $config;
@@ -165,6 +373,12 @@ macro_rules! standard_app {
         if config.metrics {
             server_breaker = server_breaker.with_metrics(http_metrics.clone());
         }
+        let cors_enabled = config.cors.is_some();
+        let cors = config
+            .cors
+            .as_ref()
+            .map(RestCorsConfig::middleware)
+            .unwrap_or_default();
         let app = App::new()
             .app_data(web::JsonConfig::default().limit(config.max_body_bytes))
             .app_data(web::FormConfig::default().limit(config.max_body_bytes))
@@ -201,6 +415,7 @@ macro_rules! standard_app {
                     .unwrap_or_else(|| ContentEncryption::disabled(config.max_body_bytes)),
             )
             .wrap($route_policies)
+            .wrap(Condition::new(cors_enabled, cors))
             .configure($configure);
         if let Some(static_assets) = $static_assets {
             app.app_data(web::Data::new(static_assets))
@@ -308,6 +523,7 @@ pub struct RestServerConfig {
     pub decompress_gzip: bool,
     pub metrics_namespace: String,
     pub tls: Option<RestTlsConfig>,
+    pub cors: Option<RestCorsConfig>,
     pub route_groups: Vec<RouteGroupConfig>,
 }
 
@@ -342,6 +558,7 @@ impl Default for RestServerConfig {
             decompress_gzip: true,
             metrics_namespace: "rust_zero".to_owned(),
             tls: None,
+            cors: None,
             route_groups: Vec::new(),
         }
     }
@@ -436,6 +653,9 @@ impl RestServerConfig {
         }
         if let Some(tls) = &self.tls {
             tls.validate()?;
+        }
+        if let Some(cors) = &self.cors {
+            cors.validate()?;
         }
         RoutePolicies::compile(&self.route_groups).map_err(RestServerConfigError::RoutePolicy)?;
         Ok(())
@@ -772,6 +992,15 @@ max_multipart_file_bytes = 8388608
 max_multipart_total_bytes = 12582912
 multipart_temp_dir = "/tmp/rust-zero-uploads"
 
+[cors]
+allowed_origins = ["https://console.example"]
+allowed_methods = ["GET", "POST"]
+allowed_headers = ["authorization", "content-type"]
+exposed_headers = ["x-request-id"]
+allow_credentials = true
+max_age_seconds = 600
+automatic_preflight = true
+
 [[route_groups]]
 prefix = "/api"
 timeout_ms = 100
@@ -802,6 +1031,14 @@ priority = true
             config.multipart_temp_dir.as_deref(),
             Some(Path::new("/tmp/rust-zero-uploads"))
         );
+        let cors = config.cors.as_ref().unwrap();
+        assert_eq!(cors.allowed_origins, ["https://console.example"]);
+        assert_eq!(cors.allowed_methods, ["GET", "POST"]);
+        assert_eq!(cors.allowed_headers, ["authorization", "content-type"]);
+        assert_eq!(cors.exposed_headers, ["x-request-id"]);
+        assert!(cors.allow_credentials);
+        assert_eq!(cors.max_age_seconds, Some(600));
+        assert!(cors.automatic_preflight);
         assert_eq!(config.route_groups[0].prefix, "/api");
         assert_eq!(config.route_groups[0].middleware, ["audit"]);
         assert_eq!(config.route_groups[0].routes[0].path, "/users/{id}");
@@ -837,6 +1074,136 @@ priority = true
         assert!(error
             .to_string()
             .contains("load_shed_cpu_threshold_percent"));
+
+        for cors in [
+            RestCorsConfig::new(["https://frontend.example/path"]),
+            RestCorsConfig::new(["https://frontend.example"]).with_methods(["NOT A METHOD"]),
+            RestCorsConfig::new(["https://frontend.example"]).with_allowed_headers(["bad header"]),
+            RestCorsConfig::new(["*", "https://frontend.example"]),
+        ] {
+            let error = RestServer::new(RestServerConfig {
+                cors: Some(cors),
+                ..RestServerConfig::default()
+            })
+            .err()
+            .unwrap();
+            assert!(error.to_string().contains("CORS"));
+        }
+    }
+
+    #[actix_rt::test]
+    async fn configured_serverless_cors_handles_preflight_and_actual_requests() {
+        let cors = RestCorsConfig::new(["https://frontend.example"])
+            .with_methods(["POST"])
+            .with_allowed_headers(["authorization"])
+            .with_exposed_headers(["x-request-id"])
+            .with_credentials(true)
+            .with_max_age(Some(600));
+        let handler = RestServer::new(RestServerConfig {
+            cors: Some(cors),
+            ..RestServerConfig::default()
+        })
+        .unwrap()
+        .serverless_handler(|routes| {
+            routes.route("/cors", web::post().to(HttpResponse::Ok));
+        })
+        .await
+        .unwrap();
+
+        let mut preflight = ServerlessRequest::new(
+            Method::OPTIONS,
+            Uri::from_static("/cors"),
+            web::Bytes::new(),
+        );
+        preflight.headers.insert(
+            actix_web::http::header::ORIGIN,
+            HeaderValue::from_static("https://frontend.example"),
+        );
+        preflight.headers.insert(
+            actix_web::http::header::ACCESS_CONTROL_REQUEST_METHOD,
+            HeaderValue::from_static("POST"),
+        );
+        preflight.headers.insert(
+            actix_web::http::header::ACCESS_CONTROL_REQUEST_HEADERS,
+            HeaderValue::from_static("authorization"),
+        );
+        let preflight = handler.call(preflight).await.unwrap();
+
+        assert_eq!(preflight.status, StatusCode::OK);
+        assert_eq!(
+            preflight
+                .headers
+                .get(actix_web::http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .unwrap(),
+            "https://frontend.example"
+        );
+        assert_eq!(
+            preflight
+                .headers
+                .get(actix_web::http::header::ACCESS_CONTROL_ALLOW_CREDENTIALS)
+                .unwrap(),
+            "true"
+        );
+        assert_eq!(
+            preflight
+                .headers
+                .get(actix_web::http::header::ACCESS_CONTROL_MAX_AGE)
+                .unwrap(),
+            "600"
+        );
+
+        let mut actual =
+            ServerlessRequest::new(Method::POST, Uri::from_static("/cors"), web::Bytes::new());
+        actual.headers.insert(
+            actix_web::http::header::ORIGIN,
+            HeaderValue::from_static("https://frontend.example"),
+        );
+        let actual = handler.call(actual).await.unwrap();
+        assert_eq!(actual.status, StatusCode::OK);
+        assert_eq!(
+            actual
+                .headers
+                .get(actix_web::http::header::ACCESS_CONTROL_EXPOSE_HEADERS)
+                .unwrap(),
+            "x-request-id"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn configured_cors_can_delegate_preflight_to_application_routes() {
+        let cors = RestCorsConfig::new(["*"]).with_automatic_preflight(false);
+        let handler = RestServer::new(RestServerConfig {
+            cors: Some(cors),
+            ..RestServerConfig::default()
+        })
+        .unwrap()
+        .serverless_handler(|routes| {
+            routes.route(
+                "/cors",
+                web::route()
+                    .method(Method::OPTIONS)
+                    .to(|| async { HttpResponse::Accepted().body("application preflight") }),
+            );
+        })
+        .await
+        .unwrap();
+        let mut request = ServerlessRequest::new(
+            Method::OPTIONS,
+            Uri::from_static("/cors"),
+            web::Bytes::new(),
+        );
+        request.headers.insert(
+            actix_web::http::header::ORIGIN,
+            HeaderValue::from_static("https://frontend.example"),
+        );
+        request.headers.insert(
+            actix_web::http::header::ACCESS_CONTROL_REQUEST_METHOD,
+            HeaderValue::from_static("POST"),
+        );
+
+        let response = handler.call(request).await.unwrap();
+        assert_eq!(response.status, StatusCode::ACCEPTED);
+        assert_eq!(response.body, "application preflight");
     }
 
     #[actix_rt::test]

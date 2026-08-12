@@ -340,16 +340,30 @@ For the standard production stack, load `RestServerConfig` and provide only appl
 
 ```rust
 use actix_web::{web, HttpResponse};
-use rest::{RestServer, RestServerConfig};
+use rest::{RestCorsConfig, RestServer, RestServerConfig};
 use rust_zero_core::load_config;
 
-let config: RestServerConfig = load_config("etc/users.toml")?;
+let mut config: RestServerConfig = load_config("etc/users.toml")?;
+config.cors = Some(
+    RestCorsConfig::new(["https://console.example"])
+        .with_methods(["GET", "POST"])
+        .with_allowed_headers(["authorization", "content-type"])
+        .with_exposed_headers(["x-request-id"])
+        .with_credentials(true)
+        .with_max_age(Some(600)),
+);
 let server = RestServer::new(config)?.run(|routes| {
     routes.route("/healthz", web::get().to(HttpResponse::Ok));
 })?;
 server.await?;
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
+
+The same policy can be loaded from a `cors` configuration table. Use a single `"*"` entry to
+allow any origin, standard method, or header; wildcard origins are reflected rather than emitted
+as `*`, so credentialed requests remain standards-compliant. Set `automatic_preflight = false` to
+route `OPTIONS` requests through application handlers. Use `with_max_age(None)` (or JSON/YAML
+`null`) to omit the preflight cache header. CORS is disabled when the `cors` table is absent.
 
 Install a response policy on the standard server and extract it as Actix application data from
 handlers. Mappers receive the current request, so envelopes can include request identity without
