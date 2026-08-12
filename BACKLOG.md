@@ -36,10 +36,10 @@ complete, the project claims **broad runtime coverage**, not full runtime parity
     method/route pattern, classify 5xx responses and body errors as failures, retain permits through
     response streaming, record early body drops as cancellation, expose rejection metrics, isolate
     route state, and support explicit opt-out or the consecutive-failure policy.
-- [ ] **Complete configuration-driven gRPC lifecycle.**
-  - [ ] Support validated per-method server timeouts with exact-method and service-level matching
+- [x] **Complete configuration-driven gRPC lifecycle.**
+  - [x] Support validated per-method server timeouts with exact-method and service-level matching
     while retaining the global fallback.
-  - [ ] Add optional automatic etcd registration/lease renewal and withdrawal to `RpcServerConfig`,
+  - [x] Add optional automatic etcd registration/lease renewal and withdrawal to `RpcServerConfig`,
     using the existing `EtcdServiceLease` and coordinating it with graceful startup/shutdown.
 
 ### P1 — standard assembly
@@ -67,7 +67,7 @@ complete, the project claims **broad runtime coverage**, not full runtime parity
   - [x] Prove signal-driven graceful draining with an in-flight request integration test.
 - [x] **Baseline configuration-driven gRPC assembly.** Transport configuration and the
   generated-service-independent interceptor and lifecycle layer from the original audit are
-  present; reopened TLS, per-method timeout, and automatic registration work is tracked above.
+  present; the reopened TLS, per-method timeout, and automatic registration work is complete.
   - [x] Deserialize and validate server/client deadlines, concurrency, streaming, connection,
     keepalive, endpoint, and shutdown settings using millisecond config values.
   - [x] Retain configured Tonic server construction and direct/dynamic client channel construction,
@@ -201,10 +201,9 @@ complete, the project claims **broad runtime coverage**, not full runtime parity
 
 ## Recommended execution order
 
-Finish the reopened P0 items in this order: REST server circuit breaking, end-to-end TLS/mTLS, then
-per-method gRPC timeouts and automatic etcd registration. Add configurable CORS next and legacy MCP
-SSE only where older-client compatibility is required. Durable brokers and the `goctl` developer
-toolchain remain intentional ecosystem boundaries.
+The reopened P0 runtime items are complete. Add configurable CORS next and legacy MCP SSE only
+where older-client compatibility is required. Durable brokers and the `goctl` developer toolchain
+remain intentional ecosystem boundaries.
 
 ## Remaining catch-up items
 

@@ -5,6 +5,9 @@ Versioning, with the pre-1.0 compatibility policy described in the README.
 
 ## [Unreleased]
 
+- Added exact-method and service-level gRPC server timeouts with global fallback, plus optional
+  configuration-driven etcd registration, lease renewal, and graceful withdrawal.
+
 ## [0.1.0-alpha.1] - 2026-08-10
 
 First public prerelease.

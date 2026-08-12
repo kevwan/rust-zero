@@ -69,7 +69,8 @@ runtime free of external-service adapters.
   tool/resource/prompt registration, JSON or SSE responses, resumable GET event streams, explicit
   termination, cancellation, protocol errors, request deadlines, origin validation, graceful
   draining, and handler access to projected HTTP request metadata.
-- Tonic-based gRPC client and server builders with deadline, connection concurrency, and stream
+- Tonic-based gRPC client and server builders with global, service, and exact-method deadlines,
+  automatic renewable etcd registration and graceful withdrawal, connection concurrency, and stream
   limits plus gRPC health reporting, bearer/JWT/signature interceptors, and backend-neutral dynamic
   weighted endpoint balancing for in-memory, etcd, or Kubernetes discovery, opt-in active endpoint
   probes with observable empty/ready/degraded status, automatic gRPC/dev-server health projection,
@@ -766,6 +767,8 @@ use std::time::Duration;
 let server = RpcServer::new(
     RpcServerConfig::new("127.0.0.1:50051".parse()?)
         .with_request_timeout(Duration::from_secs(10))
+        .with_service_timeout("rust_zero.echo.Echo", Duration::from_secs(5))
+        .with_method_timeout("/rust_zero.echo.Echo/Echo", Duration::from_secs(1))
         .with_concurrency_limit(1_024),
 );
 
@@ -793,6 +796,28 @@ let health_projection = discovery_status.clone().project_to_health(
 let (reporter, _health_service) = health_reporter();
 let grpc_health_projection = discovery_status.project_to_grpc_health(reporter, "users-rpc");
 let client_auth = BearerToken::new("service-token")?;
+```
+
+Exact gRPC method timeouts override service-level timeouts, which override the global request
+timeout. The same settings deserialize from `method_timeouts_ms` and `service_timeouts_ms` maps.
+Servers using `serve_with_shutdown` can also publish themselves under a renewable etcd lease and
+withdraw after graceful draining:
+
+```rust
+use rpc::{RpcEtcdRegistrationConfig, RpcServer, RpcServerConfig};
+use std::time::Duration;
+
+let registration = RpcEtcdRegistrationConfig::new(
+    ["http://127.0.0.1:2379"],
+    "users",
+    "users-1",
+    "http://127.0.0.1:50051",
+)
+.with_lease_ttl(Duration::from_secs(10));
+let server = RpcServer::new(
+    RpcServerConfig::new("127.0.0.1:50051".parse()?)
+        .with_etcd_registration(registration),
+);
 ```
 
 ## Service lifecycle and background batching

@@ -13,18 +13,22 @@ use std::{
 };
 
 use rust_zero_core::{
-    DiscoveredEndpoint, DiscoveryError, EndpointSubscription, HealthRegistry, ServiceRegistry,
+    DiscoveredEndpoint, DiscoveryError, EndpointSubscription, EtcdClient, EtcdConfig, EtcdError,
+    EtcdTlsConfig, HealthRegistry, ServiceRegistry,
 };
 use serde::{Deserialize, Serialize};
 use tonic::transport::{
-    Certificate, Channel, ClientTlsConfig, Endpoint, Identity, Server, ServerTlsConfig,
+    Certificate, Channel, ClientTlsConfig, Endpoint, Identity as TonicIdentity, Server,
+    ServerTlsConfig,
 };
 use tower::discover::Change;
+use tower::layer::util::{Identity as TowerIdentity, Stack};
 
 pub mod auth;
 pub mod metrics;
 pub mod resilience;
 pub mod stack;
+pub mod timeout;
 pub mod trace;
 
 pub mod echo {
@@ -39,6 +43,7 @@ pub use stack::{
     RpcClientStack, RpcClientStackBuilder, RpcClientStackService, RpcServerStack,
     RpcServerStackBuilder,
 };
+pub use timeout::{RpcServerTimeoutLayer, RpcServerTimeoutService};
 pub use tonic_health::server::{health_reporter, HealthReporter};
 pub use trace::RpcTrace;
 #[cfg(feature = "telemetry")]
@@ -97,7 +102,7 @@ impl RpcServerTlsConfig {
     }
 
     fn tonic_config(&self) -> ServerTlsConfig {
-        let mut tls = ServerTlsConfig::new().identity(Identity::from_pem(
+        let mut tls = ServerTlsConfig::new().identity(TonicIdentity::from_pem(
             self.certificate_pem.clone(),
             self.private_key_pem.clone(),
         ));
@@ -198,7 +203,7 @@ impl RpcClientTlsConfig {
             tls = tls.domain_name(domain_name.clone());
         }
         if let (Some(certificate), Some(key)) = (&self.certificate_pem, &self.private_key_pem) {
-            tls = tls.identity(Identity::from_pem(certificate.clone(), key.clone()));
+            tls = tls.identity(TonicIdentity::from_pem(certificate.clone(), key.clone()));
         }
         tls
     }
@@ -212,6 +217,227 @@ fn validate_pem(value: &str, message: &'static str) -> Result<(), RpcConfigError
     }
 }
 
+/// Etcd connection and lease settings used to publish a running gRPC server.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RpcEtcdRegistrationConfig {
+    pub endpoints: Vec<String>,
+    pub namespace: String,
+    pub username: Option<String>,
+    pub password: Option<String>,
+    #[serde(rename = "connect_timeout_ms", with = "duration_millis")]
+    pub connect_timeout: Duration,
+    pub tls: Option<EtcdTlsConfig>,
+    pub service: String,
+    pub instance: String,
+    pub endpoint: String,
+    #[serde(rename = "lease_ttl_ms", with = "duration_millis")]
+    pub lease_ttl: Duration,
+}
+
+impl fmt::Debug for RpcEtcdRegistrationConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RpcEtcdRegistrationConfig")
+            .field("endpoints", &self.endpoints)
+            .field("namespace", &self.namespace)
+            .field("username", &self.username)
+            .field("password", &self.password.as_ref().map(|_| "[REDACTED]"))
+            .field("connect_timeout", &self.connect_timeout)
+            .field("tls", &self.tls)
+            .field("service", &self.service)
+            .field("instance", &self.instance)
+            .field("endpoint", &self.endpoint)
+            .field("lease_ttl", &self.lease_ttl)
+            .finish()
+    }
+}
+
+impl Default for RpcEtcdRegistrationConfig {
+    fn default() -> Self {
+        Self {
+            endpoints: Vec::new(),
+            namespace: "/rust-zero".to_owned(),
+            username: None,
+            password: None,
+            connect_timeout: Duration::from_secs(10),
+            tls: None,
+            service: String::new(),
+            instance: String::new(),
+            endpoint: String::new(),
+            lease_ttl: Duration::from_secs(10),
+        }
+    }
+}
+
+impl RpcEtcdRegistrationConfig {
+    pub fn new(
+        endpoints: impl IntoIterator<Item = impl Into<String>>,
+        service: impl Into<String>,
+        instance: impl Into<String>,
+        endpoint: impl Into<String>,
+    ) -> Self {
+        Self {
+            endpoints: endpoints.into_iter().map(Into::into).collect(),
+            service: service.into(),
+            instance: instance.into(),
+            endpoint: endpoint.into(),
+            ..Self::default()
+        }
+    }
+
+    pub fn with_namespace(mut self, namespace: impl Into<String>) -> Self {
+        self.namespace = namespace.into();
+        self
+    }
+
+    pub fn with_credentials(
+        mut self,
+        username: impl Into<String>,
+        password: impl Into<String>,
+    ) -> Self {
+        self.username = Some(username.into());
+        self.password = Some(password.into());
+        self
+    }
+
+    pub fn with_connect_timeout(mut self, timeout: Duration) -> Self {
+        assert!(!timeout.is_zero(), "etcd connect timeout must be positive");
+        self.connect_timeout = timeout;
+        self
+    }
+
+    pub fn with_tls(mut self, tls: EtcdTlsConfig) -> Self {
+        self.tls = Some(tls);
+        self
+    }
+
+    pub fn with_lease_ttl(mut self, ttl: Duration) -> Self {
+        assert!(
+            !ttl.is_zero(),
+            "etcd registration lease TTL must be positive"
+        );
+        self.lease_ttl = ttl;
+        self
+    }
+
+    fn validate(&self) -> Result<(), RpcConfigError> {
+        if self.endpoints.is_empty()
+            || self
+                .endpoints
+                .iter()
+                .any(|endpoint| endpoint.trim().is_empty())
+        {
+            return Err(RpcConfigError::Invalid(
+                "etcd registration requires non-empty etcd endpoints",
+            ));
+        }
+        validate_rpc_name(
+            &self.service,
+            "etcd registration service must be a non-empty name",
+        )?;
+        validate_rpc_name(
+            &self.instance,
+            "etcd registration instance must be a non-empty name",
+        )?;
+        if self.endpoint.trim().is_empty() {
+            return Err(RpcConfigError::Invalid(
+                "etcd registration endpoint must not be empty",
+            ));
+        }
+        if self.connect_timeout.is_zero() {
+            return Err(RpcConfigError::Invalid(
+                "etcd connect timeout must be greater than zero",
+            ));
+        }
+        if self.lease_ttl.is_zero() {
+            return Err(RpcConfigError::Invalid(
+                "etcd registration lease TTL must be greater than zero",
+            ));
+        }
+        if self.username.is_some() != self.password.is_some() {
+            return Err(RpcConfigError::Invalid(
+                "etcd registration username and password must be configured together",
+            ));
+        }
+        let namespace = self.namespace.trim_matches('/');
+        if namespace.is_empty() || namespace.contains('/') {
+            return Err(RpcConfigError::Invalid(
+                "etcd registration namespace must be a non-empty single path segment",
+            ));
+        }
+        if let Some(tls) = &self.tls {
+            if tls.ca_certificate_pem.trim().is_empty() {
+                return Err(RpcConfigError::Invalid(
+                    "etcd TLS CA certificate must not be empty",
+                ));
+            }
+            if tls.certificate_pem.is_some() != tls.private_key_pem.is_some() {
+                return Err(RpcConfigError::Invalid(
+                    "etcd TLS certificate and private key must be configured together",
+                ));
+            }
+            if tls
+                .certificate_pem
+                .as_ref()
+                .is_some_and(|value| value.trim().is_empty())
+            {
+                return Err(RpcConfigError::Invalid(
+                    "etcd TLS client certificate must not be empty",
+                ));
+            }
+            if tls
+                .private_key_pem
+                .as_ref()
+                .is_some_and(|value| value.trim().is_empty())
+            {
+                return Err(RpcConfigError::Invalid(
+                    "etcd TLS private key must not be empty",
+                ));
+            }
+            if tls
+                .domain_name
+                .as_ref()
+                .is_some_and(|value| value.trim().is_empty())
+            {
+                return Err(RpcConfigError::Invalid(
+                    "etcd TLS domain name must not be empty",
+                ));
+            }
+        }
+        let uri = self.endpoint.parse::<http::Uri>().map_err(|_| {
+            RpcConfigError::Invalid("etcd registration endpoint must be an absolute URI")
+        })?;
+        if uri.scheme().is_none() || uri.authority().is_none() {
+            return Err(RpcConfigError::Invalid(
+                "etcd registration endpoint must be an absolute URI",
+            ));
+        }
+        Ok(())
+    }
+
+    fn etcd_config(&self) -> EtcdConfig {
+        let mut config = EtcdConfig::new(self.endpoints.clone())
+            .with_namespace(&self.namespace)
+            .with_timeout(self.connect_timeout);
+        if let (Some(username), Some(password)) = (&self.username, &self.password) {
+            config = config.with_credentials(username, password);
+        }
+        if let Some(tls) = &self.tls {
+            config = config.with_tls(tls.clone());
+        }
+        config
+    }
+}
+
+fn validate_rpc_name(value: &str, message: &'static str) -> Result<(), RpcConfigError> {
+    if value.trim().is_empty() || value.contains('/') {
+        Err(RpcConfigError::Invalid(message))
+    } else {
+        Ok(())
+    }
+}
+
 /// Transport settings applied to every gRPC service on a server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -219,11 +445,16 @@ pub struct RpcServerConfig {
     address: SocketAddr,
     #[serde(rename = "request_timeout_ms", with = "optional_duration_millis")]
     request_timeout: Option<Duration>,
+    #[serde(rename = "method_timeouts_ms", with = "duration_map_millis")]
+    method_timeouts: BTreeMap<String, Duration>,
+    #[serde(rename = "service_timeouts_ms", with = "duration_map_millis")]
+    service_timeouts: BTreeMap<String, Duration>,
     concurrency_limit: Option<usize>,
     max_concurrent_streams: Option<u32>,
     #[serde(rename = "shutdown_timeout_ms", with = "duration_millis")]
     shutdown_timeout: Duration,
     tls: Option<RpcServerTlsConfig>,
+    etcd_registration: Option<RpcEtcdRegistrationConfig>,
 }
 
 impl Default for RpcServerConfig {
@@ -241,10 +472,13 @@ impl RpcServerConfig {
         Self {
             address,
             request_timeout: None,
+            method_timeouts: BTreeMap::new(),
+            service_timeouts: BTreeMap::new(),
             concurrency_limit: None,
             max_concurrent_streams: None,
             shutdown_timeout: Duration::from_secs(30),
             tls: None,
+            etcd_registration: None,
         }
     }
 
@@ -254,6 +488,30 @@ impl RpcServerConfig {
             "request timeout must be greater than zero"
         );
         self.request_timeout = Some(timeout);
+        self
+    }
+
+    /// Sets the timeout for one canonical gRPC path, such as `/pkg.Service/Method`.
+    pub fn with_method_timeout(mut self, method: impl Into<String>, timeout: Duration) -> Self {
+        assert!(
+            !timeout.is_zero(),
+            "method timeout must be greater than zero"
+        );
+        let method = normalize_method(method.into())
+            .expect("gRPC method must have the form /package.Service/Method");
+        self.method_timeouts.insert(method, timeout);
+        self
+    }
+
+    /// Sets the fallback for every method of a service. Exact method settings take precedence.
+    pub fn with_service_timeout(mut self, service: impl Into<String>, timeout: Duration) -> Self {
+        assert!(
+            !timeout.is_zero(),
+            "service timeout must be greater than zero"
+        );
+        let service = normalize_service(service.into())
+            .expect("gRPC service must have the form package.Service or /package.Service");
+        self.service_timeouts.insert(service, timeout);
         self
     }
 
@@ -286,6 +544,11 @@ impl RpcServerConfig {
         self
     }
 
+    pub fn with_etcd_registration(mut self, registration: RpcEtcdRegistrationConfig) -> Self {
+        self.etcd_registration = Some(registration);
+        self
+    }
+
     pub fn address(&self) -> SocketAddr {
         self.address
     }
@@ -302,6 +565,20 @@ impl RpcServerConfig {
             return Err(RpcConfigError::Invalid(
                 "request timeout must be greater than zero",
             ));
+        }
+        for (method, timeout) in &self.method_timeouts {
+            if timeout.is_zero() || normalize_method(method.clone()).as_deref() != Some(method) {
+                return Err(RpcConfigError::Invalid(
+                    "gRPC method timeout keys must have the form /package.Service/Method and positive values",
+                ));
+            }
+        }
+        for (service, timeout) in &self.service_timeouts {
+            if timeout.is_zero() || normalize_service(service.clone()).as_deref() != Some(service) {
+                return Err(RpcConfigError::Invalid(
+                    "gRPC service timeout keys must have the form /package.Service and positive values",
+                ));
+            }
         }
         if self.concurrency_limit == Some(0) {
             return Err(RpcConfigError::Invalid(
@@ -321,7 +598,38 @@ impl RpcServerConfig {
         if let Some(tls) = &self.tls {
             tls.validate()?;
         }
+        if let Some(registration) = &self.etcd_registration {
+            registration.validate()?;
+        }
         Ok(())
+    }
+}
+
+fn normalize_method(mut method: String) -> Option<String> {
+    if !method.starts_with('/') {
+        method.insert(0, '/');
+    }
+    let mut parts = method.split('/');
+    if parts.next() != Some("") {
+        return None;
+    }
+    let service = parts.next()?;
+    let rpc = parts.next()?;
+    if service.is_empty() || rpc.is_empty() || parts.next().is_some() {
+        None
+    } else {
+        Some(method)
+    }
+}
+
+fn normalize_service(mut service: String) -> Option<String> {
+    if !service.starts_with('/') {
+        service.insert(0, '/');
+    }
+    if service.len() > 1 && !service[1..].contains('/') {
+        Some(service)
+    } else {
+        None
     }
 }
 
@@ -330,6 +638,12 @@ impl RpcServerConfig {
 pub struct RpcServer {
     config: RpcServerConfig,
 }
+
+/// Concrete Tonic builder returned by [`RpcServer::router`].
+pub type RpcRouterBuilder = Server<Stack<RpcServerTimeoutLayer, TowerIdentity>>;
+
+/// Tonic router assembled from [`RpcRouterBuilder`].
+pub type RpcRouter = tonic::transport::server::Router<Stack<RpcServerTimeoutLayer, TowerIdentity>>;
 
 impl RpcServer {
     pub fn new(config: RpcServerConfig) -> Self {
@@ -346,21 +660,18 @@ impl RpcServer {
     }
 
     /// Returns a Tonic server builder with the configured timeout and load limits.
-    pub fn router(&self) -> Server {
+    pub fn router(&self) -> RpcRouterBuilder {
         self.try_router()
             .expect("validated gRPC server TLS configuration")
     }
 
     /// Returns a configured Tonic builder and reports malformed TLS PEM material.
-    pub fn try_router(&self) -> Result<Server, RpcServerError> {
+    pub fn try_router(&self) -> Result<RpcRouterBuilder, RpcServerError> {
         self.config
             .validate()
             .map_err(RpcServerError::Configuration)?;
         let mut server = Server::builder();
 
-        if let Some(timeout) = self.config.request_timeout {
-            server = server.timeout(timeout);
-        }
         if let Some(limit) = self.config.concurrency_limit {
             server = server.concurrency_limit_per_connection(limit);
         }
@@ -374,13 +685,17 @@ impl RpcServer {
                 .map_err(RpcServerError::Transport)?;
         }
 
-        Ok(server)
+        Ok(server.layer(RpcServerTimeoutLayer::new(
+            self.config.request_timeout,
+            self.config.method_timeouts.clone(),
+            self.config.service_timeouts.clone(),
+        )))
     }
 
     /// Serves an assembled Tonic router and bounds draining after the shutdown signal fires.
     pub async fn serve_with_shutdown<F>(
         &self,
-        router: tonic::transport::server::Router,
+        router: RpcRouter,
         signal: F,
     ) -> Result<(), RpcServerError>
     where
@@ -389,6 +704,24 @@ impl RpcServer {
         self.config
             .validate()
             .map_err(RpcServerError::Configuration)?;
+        let mut lease = if let Some(registration) = &self.config.etcd_registration {
+            let client = EtcdClient::connect(registration.etcd_config())
+                .await
+                .map_err(RpcServerError::Registration)?;
+            Some(
+                client
+                    .publish(
+                        &registration.service,
+                        &registration.instance,
+                        registration.endpoint.clone(),
+                        registration.lease_ttl,
+                    )
+                    .await
+                    .map_err(RpcServerError::Registration)?,
+            )
+        } else {
+            None
+        };
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
         let serving = router.serve_with_shutdown(self.config.address, async move {
             let _ = stopped.await;
@@ -396,7 +729,7 @@ impl RpcServer {
         tokio::pin!(serving);
         tokio::pin!(signal);
 
-        tokio::select! {
+        let serving_result = tokio::select! {
             result = &mut serving => result.map_err(RpcServerError::Transport),
             _ = &mut signal => {
                 let _ = stop.send(());
@@ -405,7 +738,12 @@ impl RpcServer {
                     .map_err(|_| RpcServerError::ShutdownTimeout)?
                     .map_err(RpcServerError::Transport)
             }
-        }
+        };
+        let revoke_result = match lease.take() {
+            Some(lease) => lease.revoke().await.map_err(RpcServerError::Registration),
+            None => Ok(()),
+        };
+        serving_result.and(revoke_result)
     }
 }
 
@@ -413,6 +751,7 @@ impl RpcServer {
 pub enum RpcServerError {
     Configuration(RpcConfigError),
     Transport(tonic::transport::Error),
+    Registration(EtcdError),
     ShutdownTimeout,
 }
 
@@ -421,6 +760,9 @@ impl fmt::Display for RpcServerError {
         match self {
             Self::Configuration(error) => write!(formatter, "invalid gRPC configuration: {error}"),
             Self::Transport(error) => write!(formatter, "gRPC server transport error: {error}"),
+            Self::Registration(error) => {
+                write!(formatter, "gRPC etcd registration failed: {error}")
+            }
             Self::ShutdownTimeout => formatter.write_str("gRPC graceful shutdown timed out"),
         }
     }
@@ -431,6 +773,7 @@ impl StdError for RpcServerError {
         match self {
             Self::Configuration(error) => Some(error),
             Self::Transport(error) => Some(error),
+            Self::Registration(error) => Some(error),
             Self::ShutdownTimeout => None,
         }
     }
@@ -1066,6 +1409,42 @@ mod optional_duration_millis {
     }
 }
 
+mod duration_map_millis {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::{collections::BTreeMap, time::Duration};
+
+    pub fn serialize<S>(
+        values: &BTreeMap<String, Duration>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        values
+            .iter()
+            .map(|(key, value)| {
+                (
+                    key.clone(),
+                    value.as_millis().try_into().unwrap_or(u64::MAX),
+                )
+            })
+            .collect::<BTreeMap<_, _>>()
+            .serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<BTreeMap<String, Duration>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        BTreeMap::<String, u64>::deserialize(deserializer).map(|values| {
+            values
+                .into_iter()
+                .map(|(key, value)| (key, Duration::from_millis(value)))
+                .collect()
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1101,6 +1480,64 @@ mod tests {
         .unwrap();
         assert_eq!(client.connect_timeout, Some(Duration::from_millis(250)));
         client.validate().unwrap();
+    }
+
+    #[test]
+    fn server_config_deserializes_and_matches_timeout_scopes() {
+        let config: RpcServerConfig = rust_zero_core::parse_config(
+            r#"
+                address = "127.0.0.1:50052"
+                request_timeout_ms = 30000
+                method_timeouts_ms = { "/rust_zero.echo.Echo/Echo" = 100 }
+                service_timeouts_ms = { "/rust_zero.echo.Echo" = 5000 }
+            "#,
+            rust_zero_core::ConfigFormat::Toml,
+        )
+        .unwrap();
+        config.validate().unwrap();
+        let policy = RpcServerTimeoutLayer::new(
+            config.request_timeout,
+            config.method_timeouts,
+            config.service_timeouts,
+        );
+
+        assert_eq!(
+            policy.timeout("/rust_zero.echo.Echo/Echo"),
+            Some(Duration::from_millis(100))
+        );
+        assert_eq!(
+            policy.timeout("/rust_zero.echo.Echo/ServerStream"),
+            Some(Duration::from_secs(5))
+        );
+        assert_eq!(
+            policy.timeout("/grpc.health.v1.Health/Check"),
+            Some(Duration::from_secs(30))
+        );
+    }
+
+    #[test]
+    fn server_config_validates_etcd_registration_before_startup() {
+        let valid = RpcEtcdRegistrationConfig::new(
+            ["http://127.0.0.1:2379"],
+            "echo",
+            "echo-1",
+            "http://127.0.0.1:50051",
+        );
+        RpcServerConfig::default()
+            .with_etcd_registration(valid)
+            .validate()
+            .unwrap();
+
+        let invalid = RpcEtcdRegistrationConfig::new(
+            ["http://127.0.0.1:2379"],
+            "echo",
+            "echo/1",
+            "not-a-uri",
+        );
+        assert!(RpcServerConfig::default()
+            .with_etcd_registration(invalid)
+            .validate()
+            .is_err());
     }
 
     #[test]
@@ -1575,6 +2012,45 @@ mod tests {
         assert!(rendered.contains(
             "echo_rpc_client_requests_total{method=\"/rust_zero.echo.Echo/Echo\",code=\"0\"} 1"
         ));
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn configured_method_timeout_returns_deadline_exceeded() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let server = RpcServer::new(
+            RpcServerConfig::new(address)
+                .with_request_timeout(Duration::from_secs(1))
+                .with_service_timeout("rust_zero.echo.Echo", Duration::from_millis(100))
+                .with_method_timeout("rust_zero.echo.Echo/Echo", Duration::from_millis(10)),
+        );
+        let server_task = tokio::spawn(async move {
+            server
+                .router()
+                .add_service(EchoServer::new(DrainEchoService { entered, release }))
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        let channel = RpcClient::new(
+            RpcClientConfig::new(format!("http://{address}"))
+                .with_connect_timeout(Duration::from_secs(1)),
+        )
+        .connect()
+        .await
+        .unwrap();
+
+        let error = EchoClient::new(channel)
+            .echo(EchoRequest {
+                message: "slow".to_owned(),
+            })
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code(), tonic::Code::DeadlineExceeded);
         server_task.abort();
     }
 

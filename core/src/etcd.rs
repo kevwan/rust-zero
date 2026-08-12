@@ -22,7 +22,7 @@ use etcd_client::{
     Certificate, Client, ConnectOptions, EventType, GetOptions, Identity, PutOptions, TlsOptions,
     WatchOptions,
 };
-use serde::de::DeserializeOwned;
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::{
     collections::{hash_map::DefaultHasher, BTreeMap},
     error::Error,
@@ -49,7 +49,7 @@ pub struct EtcdConfig {
 }
 
 /// CA trust, optional client identity, and server-name override for etcd TLS/mTLS.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EtcdTlsConfig {
     pub ca_certificate_pem: String,
     pub certificate_pem: Option<String>,
