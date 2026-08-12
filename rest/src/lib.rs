@@ -46,8 +46,8 @@ pub use rust_zero_core::{
 };
 pub use security::SecurityHeaders;
 pub use server::{
-    RestServer, RestServerConfig, RestServerConfigError, ServerlessHandler, ServerlessRequest,
-    ServerlessResponse,
+    RestServer, RestServerConfig, RestServerConfigError, RestTlsConfig, ServerlessHandler,
+    ServerlessRequest, ServerlessResponse,
 };
 pub use sse::{sse_response, SseEvent};
 pub use static_assets::{EmbeddedAsset, StaticAssets, StaticAssetsError};

@@ -16,13 +16,16 @@ complete, the project claims **broad runtime coverage**, not full runtime parity
 
 ### P0 — runtime parity blockers
 
-- [ ] **End-to-end TLS and mTLS.**
-  - [ ] Add certificate/key and optional client-CA configuration to the standard REST server,
-    including validation and HTTPS lifecycle tests.
-  - [ ] Enable Tonic TLS support and add server identity, client trust roots, client identity, and
-    domain-name configuration to standard gRPC server/client assembly.
-  - [ ] Add CA/certificate/key and server-name support to authenticated etcd connections, with
-    real-backend TLS and mTLS coverage.
+- [x] **End-to-end TLS and mTLS.**
+  - [x] The standard REST listener accepts validated PEM certificate/key material and an optional
+    client CA, builds a Rustls 0.23 HTTPS acceptor, redacts private keys from debug output, and
+    completes a CA-signed mutual-TLS handshake test.
+  - [x] Tonic TLS is enabled for standard gRPC server/client assembly with server identity, client
+    trust roots, optional client identity, domain-name verification, redacted configuration, and a
+    live unary mTLS lifecycle test.
+  - [x] Authenticated etcd connections support CA trust, optional client certificate/key, and a
+    server-name override. Validation tests cover incomplete identities, while the real-backend test
+    accepts `RUST_ZERO_ETCD_TLS_ENDPOINT` and PEM environment variables for TLS/mTLS CI coverage.
 - [x] **Result-aware server-side circuit breaking.** Install independent breaker state per REST
   route and gRPC method by default, retain permits through streaming completion, and classify
   protocol results and cancellations without allowing one route/method to poison another.
@@ -256,6 +259,9 @@ HTTP is covered; only its legacy SSE compatibility transport remains above.
 
 ## Recently completed
 
+- [x] End-to-end TLS/mTLS configuration for the standard REST and gRPC server/client transports and
+  authenticated etcd, including private-key redaction, PEM/identity validation, CA and hostname
+  verification, direct REST Rustls and live gRPC mutual handshakes, and opt-in real-etcd TLS CI.
 - [x] Default result-aware server circuit breaking with isolated REST route and gRPC method state,
   configurable rolling/consecutive policies, streaming-body/trailer lifetime permits, cancellation
   handling, stable overload responses, protection metrics, opt-out controls, and isolation tests.

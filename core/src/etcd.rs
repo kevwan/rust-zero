@@ -18,7 +18,10 @@ use crate::{
     ConfigFormat, DiscoveryReconnectBackoff, DynamicConfig, EndpointChangeFuture,
     EndpointSubscription,
 };
-use etcd_client::{Client, ConnectOptions, EventType, GetOptions, PutOptions, WatchOptions};
+use etcd_client::{
+    Certificate, Client, ConnectOptions, EventType, GetOptions, Identity, PutOptions, TlsOptions,
+    WatchOptions,
+};
 use serde::de::DeserializeOwned;
 use std::{
     collections::{hash_map::DefaultHasher, BTreeMap},
@@ -42,6 +45,113 @@ pub struct EtcdConfig {
     pub password: Option<String>,
     pub timeout: Duration,
     pub reconnect_backoff: DiscoveryReconnectBackoff,
+    pub tls: Option<EtcdTlsConfig>,
+}
+
+/// CA trust, optional client identity, and server-name override for etcd TLS/mTLS.
+#[derive(Clone, PartialEq, Eq)]
+pub struct EtcdTlsConfig {
+    pub ca_certificate_pem: String,
+    pub certificate_pem: Option<String>,
+    pub private_key_pem: Option<String>,
+    pub domain_name: Option<String>,
+}
+
+impl fmt::Debug for EtcdTlsConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EtcdTlsConfig")
+            .field("ca_certificate_pem", &"[PEM]")
+            .field(
+                "certificate_pem",
+                &self.certificate_pem.as_ref().map(|_| "[PEM]"),
+            )
+            .field(
+                "private_key_pem",
+                &self.private_key_pem.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("domain_name", &self.domain_name)
+            .finish()
+    }
+}
+
+impl EtcdTlsConfig {
+    pub fn new(ca_certificate_pem: impl Into<String>) -> Self {
+        Self {
+            ca_certificate_pem: ca_certificate_pem.into(),
+            certificate_pem: None,
+            private_key_pem: None,
+            domain_name: None,
+        }
+    }
+
+    pub fn with_identity(
+        mut self,
+        certificate_pem: impl Into<String>,
+        private_key_pem: impl Into<String>,
+    ) -> Self {
+        self.certificate_pem = Some(certificate_pem.into());
+        self.private_key_pem = Some(private_key_pem.into());
+        self
+    }
+
+    pub fn with_domain_name(mut self, domain_name: impl Into<String>) -> Self {
+        self.domain_name = Some(domain_name.into());
+        self
+    }
+
+    fn validate(&self) -> Result<(), EtcdError> {
+        if self.ca_certificate_pem.trim().is_empty() {
+            return Err(EtcdError::InvalidTls(
+                "etcd TLS CA certificate must not be empty",
+            ));
+        }
+        if self.certificate_pem.is_some() != self.private_key_pem.is_some() {
+            return Err(EtcdError::InvalidTls(
+                "etcd TLS certificate and private key must be configured together",
+            ));
+        }
+        if self
+            .certificate_pem
+            .as_ref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            return Err(EtcdError::InvalidTls(
+                "etcd TLS client certificate must not be empty",
+            ));
+        }
+        if self
+            .private_key_pem
+            .as_ref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            return Err(EtcdError::InvalidTls(
+                "etcd TLS private key must not be empty",
+            ));
+        }
+        if self
+            .domain_name
+            .as_ref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            return Err(EtcdError::InvalidTls(
+                "etcd TLS domain name must not be empty",
+            ));
+        }
+        Ok(())
+    }
+
+    fn options(&self) -> TlsOptions {
+        let mut tls = TlsOptions::new()
+            .ca_certificate(Certificate::from_pem(self.ca_certificate_pem.clone()));
+        if let Some(domain_name) = &self.domain_name {
+            tls = tls.domain_name(domain_name.clone());
+        }
+        if let (Some(certificate), Some(key)) = (&self.certificate_pem, &self.private_key_pem) {
+            tls = tls.identity(Identity::from_pem(certificate.clone(), key.clone()));
+        }
+        tls
+    }
 }
 
 impl EtcdConfig {
@@ -53,6 +163,7 @@ impl EtcdConfig {
             password: None,
             timeout: Duration::from_secs(10),
             reconnect_backoff: DiscoveryReconnectBackoff::default(),
+            tls: None,
         }
     }
 
@@ -81,6 +192,11 @@ impl EtcdConfig {
         self.reconnect_backoff = backoff;
         self
     }
+
+    pub fn with_tls(mut self, tls: EtcdTlsConfig) -> Self {
+        self.tls = Some(tls);
+        self
+    }
 }
 
 #[derive(Debug)]
@@ -88,6 +204,7 @@ pub enum EtcdError {
     EmptyEndpoints,
     EmptyName(&'static str),
     InvalidLeaseTtl,
+    InvalidTls(&'static str),
     MissingConfig(String),
     InvalidConfig(crate::ConfigCenterError),
     Client(etcd_client::Error),
@@ -100,6 +217,7 @@ impl fmt::Display for EtcdError {
             Self::EmptyEndpoints => formatter.write_str("at least one etcd endpoint is required"),
             Self::EmptyName(kind) => write!(formatter, "etcd {kind} cannot be empty"),
             Self::InvalidLeaseTtl => formatter.write_str("etcd lease TTL must be positive"),
+            Self::InvalidTls(message) => formatter.write_str(message),
             Self::MissingConfig(key) => {
                 write!(formatter, "etcd configuration key {key:?} is missing")
             }
@@ -145,11 +263,17 @@ impl EtcdClient {
         if config.endpoints.is_empty() {
             return Err(EtcdError::EmptyEndpoints);
         }
+        if let Some(tls) = &config.tls {
+            tls.validate()?;
+        }
         let namespace = normalize_namespace(&config.namespace)?;
         let reconnect_backoff = config.reconnect_backoff;
         let mut options = ConnectOptions::new().with_timeout(config.timeout);
         if let Some(username) = config.username {
             options = options.with_user(username, config.password.unwrap_or_default());
+        }
+        if let Some(tls) = config.tls {
+            options = options.with_tls(tls.options());
         }
         let client = Client::connect(&config.endpoints, Some(options)).await?;
         Ok(Self {
@@ -511,6 +635,45 @@ mod tests {
             sorted_endpoints(&entries),
             vec!["http://a:8080", "http://b:8080"]
         );
+    }
+
+    #[test]
+    fn tls_configuration_requires_complete_client_identity() {
+        let missing_key = EtcdTlsConfig::new("ca");
+        let missing_key = EtcdTlsConfig {
+            certificate_pem: Some("certificate".to_owned()),
+            ..missing_key
+        };
+        assert!(missing_key
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("configured together"));
+        assert!(EtcdTlsConfig::new("").validate().is_err());
+    }
+
+    #[tokio::test]
+    async fn integration_connects_to_tls_etcd_when_configured() {
+        let (Ok(endpoint), Ok(ca)) = (
+            std::env::var("RUST_ZERO_ETCD_TLS_ENDPOINT"),
+            std::env::var("RUST_ZERO_ETCD_CA_PEM"),
+        ) else {
+            return;
+        };
+        let mut tls = EtcdTlsConfig::new(ca);
+        if let Ok(domain_name) = std::env::var("RUST_ZERO_ETCD_DOMAIN_NAME") {
+            tls = tls.with_domain_name(domain_name);
+        }
+        if let (Ok(certificate), Ok(key)) = (
+            std::env::var("RUST_ZERO_ETCD_CLIENT_CERT_PEM"),
+            std::env::var("RUST_ZERO_ETCD_CLIENT_KEY_PEM"),
+        ) {
+            tls = tls.with_identity(certificate, key);
+        }
+        let client = EtcdClient::connect(EtcdConfig::new([endpoint]).with_tls(tls))
+            .await
+            .unwrap();
+        client.subscribe("tls-probe").await.unwrap();
     }
 
     #[tokio::test]

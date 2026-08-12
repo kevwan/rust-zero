@@ -16,7 +16,9 @@ use rust_zero_core::{
     DiscoveredEndpoint, DiscoveryError, EndpointSubscription, HealthRegistry, ServiceRegistry,
 };
 use serde::{Deserialize, Serialize};
-use tonic::transport::{Channel, Endpoint, Server};
+use tonic::transport::{
+    Certificate, Channel, ClientTlsConfig, Endpoint, Identity, Server, ServerTlsConfig,
+};
 use tower::discover::Change;
 
 pub mod auth;
@@ -42,6 +44,174 @@ pub use trace::RpcTrace;
 #[cfg(feature = "telemetry")]
 pub use trace::{RpcTelemetryLayer, RpcTelemetryMode};
 
+/// PEM material used by a gRPC server, with optional client-certificate verification.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct RpcServerTlsConfig {
+    pub certificate_pem: String,
+    pub private_key_pem: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_ca_pem: Option<String>,
+}
+
+impl fmt::Debug for RpcServerTlsConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RpcServerTlsConfig")
+            .field("certificate_pem", &"[PEM]")
+            .field("private_key_pem", &"[REDACTED]")
+            .field(
+                "client_ca_pem",
+                &self.client_ca_pem.as_ref().map(|_| "[PEM]"),
+            )
+            .finish()
+    }
+}
+
+impl RpcServerTlsConfig {
+    pub fn new(certificate_pem: impl Into<String>, private_key_pem: impl Into<String>) -> Self {
+        Self {
+            certificate_pem: certificate_pem.into(),
+            private_key_pem: private_key_pem.into(),
+            client_ca_pem: None,
+        }
+    }
+
+    pub fn with_client_ca(mut self, client_ca_pem: impl Into<String>) -> Self {
+        self.client_ca_pem = Some(client_ca_pem.into());
+        self
+    }
+
+    fn validate(&self) -> Result<(), RpcConfigError> {
+        validate_pem(
+            &self.certificate_pem,
+            "server TLS certificate must not be empty",
+        )?;
+        validate_pem(
+            &self.private_key_pem,
+            "server TLS private key must not be empty",
+        )?;
+        if let Some(ca) = &self.client_ca_pem {
+            validate_pem(ca, "server TLS client CA must not be empty")?;
+        }
+        Ok(())
+    }
+
+    fn tonic_config(&self) -> ServerTlsConfig {
+        let mut tls = ServerTlsConfig::new().identity(Identity::from_pem(
+            self.certificate_pem.clone(),
+            self.private_key_pem.clone(),
+        ));
+        if let Some(ca) = &self.client_ca_pem {
+            tls = tls.client_ca_root(Certificate::from_pem(ca.clone()));
+        }
+        tls
+    }
+}
+
+/// Trust and optional client identity used by direct and discovered gRPC channels.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct RpcClientTlsConfig {
+    pub ca_certificate_pem: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub certificate_pem: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub private_key_pem: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain_name: Option<String>,
+}
+
+impl fmt::Debug for RpcClientTlsConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RpcClientTlsConfig")
+            .field("ca_certificate_pem", &"[PEM]")
+            .field(
+                "certificate_pem",
+                &self.certificate_pem.as_ref().map(|_| "[PEM]"),
+            )
+            .field(
+                "private_key_pem",
+                &self.private_key_pem.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("domain_name", &self.domain_name)
+            .finish()
+    }
+}
+
+impl RpcClientTlsConfig {
+    pub fn new(ca_certificate_pem: impl Into<String>) -> Self {
+        Self {
+            ca_certificate_pem: ca_certificate_pem.into(),
+            certificate_pem: None,
+            private_key_pem: None,
+            domain_name: None,
+        }
+    }
+
+    pub fn with_identity(
+        mut self,
+        certificate_pem: impl Into<String>,
+        private_key_pem: impl Into<String>,
+    ) -> Self {
+        self.certificate_pem = Some(certificate_pem.into());
+        self.private_key_pem = Some(private_key_pem.into());
+        self
+    }
+
+    pub fn with_domain_name(mut self, domain_name: impl Into<String>) -> Self {
+        self.domain_name = Some(domain_name.into());
+        self
+    }
+
+    fn validate(&self) -> Result<(), RpcConfigError> {
+        validate_pem(
+            &self.ca_certificate_pem,
+            "client TLS CA certificate must not be empty",
+        )?;
+        if self.certificate_pem.is_some() != self.private_key_pem.is_some() {
+            return Err(RpcConfigError::Invalid(
+                "client TLS certificate and private key must be configured together",
+            ));
+        }
+        if let Some(certificate) = &self.certificate_pem {
+            validate_pem(certificate, "client TLS certificate must not be empty")?;
+        }
+        if let Some(key) = &self.private_key_pem {
+            validate_pem(key, "client TLS private key must not be empty")?;
+        }
+        if self
+            .domain_name
+            .as_ref()
+            .is_some_and(|name| name.trim().is_empty())
+        {
+            return Err(RpcConfigError::Invalid(
+                "client TLS domain name must not be empty",
+            ));
+        }
+        Ok(())
+    }
+
+    fn tonic_config(&self) -> ClientTlsConfig {
+        let mut tls = ClientTlsConfig::new()
+            .ca_certificate(Certificate::from_pem(self.ca_certificate_pem.clone()));
+        if let Some(domain_name) = &self.domain_name {
+            tls = tls.domain_name(domain_name.clone());
+        }
+        if let (Some(certificate), Some(key)) = (&self.certificate_pem, &self.private_key_pem) {
+            tls = tls.identity(Identity::from_pem(certificate.clone(), key.clone()));
+        }
+        tls
+    }
+}
+
+fn validate_pem(value: &str, message: &'static str) -> Result<(), RpcConfigError> {
+    if value.trim().is_empty() {
+        Err(RpcConfigError::Invalid(message))
+    } else {
+        Ok(())
+    }
+}
+
 /// Transport settings applied to every gRPC service on a server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -53,6 +223,7 @@ pub struct RpcServerConfig {
     max_concurrent_streams: Option<u32>,
     #[serde(rename = "shutdown_timeout_ms", with = "duration_millis")]
     shutdown_timeout: Duration,
+    tls: Option<RpcServerTlsConfig>,
 }
 
 impl Default for RpcServerConfig {
@@ -73,6 +244,7 @@ impl RpcServerConfig {
             concurrency_limit: None,
             max_concurrent_streams: None,
             shutdown_timeout: Duration::from_secs(30),
+            tls: None,
         }
     }
 
@@ -109,6 +281,11 @@ impl RpcServerConfig {
         self
     }
 
+    pub fn with_tls(mut self, tls: RpcServerTlsConfig) -> Self {
+        self.tls = Some(tls);
+        self
+    }
+
     pub fn address(&self) -> SocketAddr {
         self.address
     }
@@ -141,6 +318,9 @@ impl RpcServerConfig {
                 "shutdown timeout must be greater than zero",
             ));
         }
+        if let Some(tls) = &self.tls {
+            tls.validate()?;
+        }
         Ok(())
     }
 }
@@ -167,6 +347,15 @@ impl RpcServer {
 
     /// Returns a Tonic server builder with the configured timeout and load limits.
     pub fn router(&self) -> Server {
+        self.try_router()
+            .expect("validated gRPC server TLS configuration")
+    }
+
+    /// Returns a configured Tonic builder and reports malformed TLS PEM material.
+    pub fn try_router(&self) -> Result<Server, RpcServerError> {
+        self.config
+            .validate()
+            .map_err(RpcServerError::Configuration)?;
         let mut server = Server::builder();
 
         if let Some(timeout) = self.config.request_timeout {
@@ -179,7 +368,13 @@ impl RpcServer {
             server = server.max_concurrent_streams(Some(limit));
         }
 
-        server
+        if let Some(tls) = &self.config.tls {
+            server = server
+                .tls_config(tls.tonic_config())
+                .map_err(RpcServerError::Transport)?;
+        }
+
+        Ok(server)
     }
 
     /// Serves an assembled Tonic router and bounds draining after the shutdown signal fires.
@@ -271,6 +466,7 @@ pub struct RpcClientConfig {
         with = "optional_duration_millis"
     )]
     discovery_health_timeout: Option<Duration>,
+    tls: Option<RpcClientTlsConfig>,
 }
 
 impl Default for RpcClientConfig {
@@ -292,6 +488,7 @@ impl RpcClientConfig {
             keepalive_while_idle: false,
             discovery_health_interval: None,
             discovery_health_timeout: None,
+            tls: None,
         }
     }
 
@@ -362,6 +559,11 @@ impl RpcClientConfig {
         self
     }
 
+    pub fn with_tls(mut self, tls: RpcClientTlsConfig) -> Self {
+        self.tls = Some(tls);
+        self
+    }
+
     pub fn validate(&self) -> Result<(), RpcConfigError> {
         if self.uri.trim().is_empty() {
             return Err(RpcConfigError::Invalid("client URI must not be empty"));
@@ -407,6 +609,9 @@ impl RpcClientConfig {
             return Err(RpcConfigError::Invalid(
                 "discovery health interval and timeout must be configured together",
             ));
+        }
+        if let Some(tls) = &self.tls {
+            tls.validate()?;
         }
         Ok(())
     }
@@ -731,6 +936,12 @@ impl RpcClient {
         }
         endpoint = endpoint.keep_alive_while_idle(self.config.keepalive_while_idle);
 
+        if let Some(tls) = &self.config.tls {
+            endpoint = endpoint
+                .tls_config(tls.tonic_config())
+                .map_err(RpcClientError::Transport)?;
+        }
+
         Ok(endpoint)
     }
 }
@@ -900,6 +1111,109 @@ mod tests {
         )
         .unwrap();
         assert!(client.validate().is_err());
+    }
+
+    #[test]
+    fn tls_configs_reject_incomplete_identity_material() {
+        let server = RpcServerConfig::default().with_tls(RpcServerTlsConfig::new("", "key"));
+        assert!(server
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("certificate"));
+
+        let client = RpcClientConfig::new("https://localhost:50051")
+            .with_tls(RpcClientTlsConfig::new("ca").with_identity("certificate", ""));
+        assert!(client
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("private key"));
+    }
+
+    #[tokio::test]
+    async fn configured_server_and_client_complete_mutual_tls_call() {
+        let (ca, certificate, private_key, client_certificate, client_key) = test_tls_material();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let (shutdown, stopped) = oneshot::channel();
+        let server = RpcServer::new(
+            RpcServerConfig::new(address).with_tls(
+                RpcServerTlsConfig::new(certificate.clone(), private_key.clone())
+                    .with_client_ca(ca.clone()),
+            ),
+        );
+        let router = server
+            .try_router()
+            .unwrap()
+            .add_service(EchoServer::new(EchoService));
+        let task = tokio::spawn(async move {
+            server
+                .serve_with_shutdown(router, async {
+                    let _ = stopped.await;
+                })
+                .await
+        });
+
+        let mut client = loop {
+            let config = RpcClientConfig::new(format!("https://localhost:{}", address.port()))
+                .with_connect_timeout(Duration::from_millis(100))
+                .with_tls(
+                    RpcClientTlsConfig::new(ca.clone())
+                        .with_identity(client_certificate.clone(), client_key.clone())
+                        .with_domain_name("localhost"),
+                );
+            match RpcClient::new(config).connect().await {
+                Ok(channel) => break EchoClient::new(channel),
+                Err(_) => tokio::task::yield_now().await,
+            }
+        };
+        let response = client
+            .echo(EchoRequest {
+                message: "mutual tls".to_owned(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(response.into_inner().message, "mutual tls");
+
+        shutdown.send(()).unwrap();
+        task.await.unwrap().unwrap();
+    }
+
+    fn test_tls_material() -> (String, String, String, String, String) {
+        use rcgen::{
+            BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair,
+            KeyUsagePurpose,
+        };
+
+        let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params.key_usages = vec![
+            KeyUsagePurpose::DigitalSignature,
+            KeyUsagePurpose::KeyCertSign,
+            KeyUsagePurpose::CrlSign,
+        ];
+        let ca_key = KeyPair::generate().unwrap();
+        let ca = ca_params.self_signed(&ca_key).unwrap();
+
+        let server_key = KeyPair::generate().unwrap();
+        let mut server_params = CertificateParams::new(["localhost".to_owned()]).unwrap();
+        server_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        let server = server_params.signed_by(&server_key, &ca, &ca_key).unwrap();
+
+        let client_key = KeyPair::generate().unwrap();
+        let mut client_params = CertificateParams::new(["rust-zero-client".to_owned()]).unwrap();
+        client_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        let client = client_params.signed_by(&client_key, &ca, &ca_key).unwrap();
+
+        (
+            ca.pem(),
+            server.pem(),
+            server_key.serialize_pem(),
+            client.pem(),
+            client_key.serialize_pem(),
+        )
     }
 
     #[derive(Default)]

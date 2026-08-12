@@ -61,7 +61,8 @@ pub use discov::{
 };
 #[cfg(feature = "etcd")]
 pub use etcd::{
-    EtcdClient, EtcdConfig, EtcdConfigWatcher, EtcdError, EtcdServiceLease, EtcdServiceSubscription,
+    EtcdClient, EtcdConfig, EtcdConfigWatcher, EtcdError, EtcdServiceLease,
+    EtcdServiceSubscription, EtcdTlsConfig,
 };
 pub use executor::{
     BatchExecutor, BatchExecutorError, ChunkExecutor, DelayExecutor, DelayExecutorError,

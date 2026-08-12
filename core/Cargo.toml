@@ -47,7 +47,7 @@ required-features = ["stores"]
 
 [dependencies]
 base64 = "0.22"
-etcd-client = { version = "0.19", optional = true }
+etcd-client = { version = "0.19", features = ["tls"], optional = true }
 flate2 = "1"
 futures = { version = "0.3", optional = true }
 hmac = "0.12"

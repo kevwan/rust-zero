@@ -20,13 +20,123 @@ use std::{
     collections::HashMap,
     fmt,
     future::Future,
-    io,
+    io::{self, BufReader, Cursor},
     net::{SocketAddr, TcpListener},
     path::PathBuf,
     rc::Rc,
     sync::Arc,
     time::Duration,
 };
+
+/// PEM identity and optional client CA used by the standard HTTPS listener.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestTlsConfig {
+    pub certificate_pem: String,
+    pub private_key_pem: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_ca_pem: Option<String>,
+}
+
+impl fmt::Debug for RestTlsConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RestTlsConfig")
+            .field("certificate_pem", &"[PEM]")
+            .field("private_key_pem", &"[REDACTED]")
+            .field(
+                "client_ca_pem",
+                &self.client_ca_pem.as_ref().map(|_| "[PEM]"),
+            )
+            .finish()
+    }
+}
+
+impl RestTlsConfig {
+    pub fn new(certificate_pem: impl Into<String>, private_key_pem: impl Into<String>) -> Self {
+        Self {
+            certificate_pem: certificate_pem.into(),
+            private_key_pem: private_key_pem.into(),
+            client_ca_pem: None,
+        }
+    }
+
+    pub fn with_client_ca(mut self, client_ca_pem: impl Into<String>) -> Self {
+        self.client_ca_pem = Some(client_ca_pem.into());
+        self
+    }
+
+    fn validate(&self) -> Result<(), RestServerConfigError> {
+        if self.certificate_pem.trim().is_empty() {
+            return Err(RestServerConfigError::Invalid(
+                "TLS certificate must not be empty",
+            ));
+        }
+        if self.private_key_pem.trim().is_empty() {
+            return Err(RestServerConfigError::Invalid(
+                "TLS private key must not be empty",
+            ));
+        }
+        if self
+            .client_ca_pem
+            .as_ref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            return Err(RestServerConfigError::Invalid(
+                "TLS client CA must not be empty",
+            ));
+        }
+        Ok(())
+    }
+
+    fn rustls_config(&self) -> Result<rustls::ServerConfig, RestServerConfigError> {
+        self.validate()?;
+        let mut certificates = BufReader::new(Cursor::new(self.certificate_pem.as_bytes()));
+        let certificates = rustls_pemfile::certs(&mut certificates)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| RestServerConfigError::Tls(error.to_string()))?;
+        if certificates.is_empty() {
+            return Err(RestServerConfigError::Tls(
+                "TLS certificate PEM contains no certificates".to_owned(),
+            ));
+        }
+        let mut private_key = BufReader::new(Cursor::new(self.private_key_pem.as_bytes()));
+        let private_key = rustls_pemfile::private_key(&mut private_key)
+            .map_err(|error| RestServerConfigError::Tls(error.to_string()))?
+            .ok_or_else(|| {
+                RestServerConfigError::Tls("TLS private key PEM contains no private key".to_owned())
+            })?;
+
+        let builder = rustls::ServerConfig::builder();
+        let config = if let Some(client_ca) = &self.client_ca_pem {
+            let mut roots = rustls::RootCertStore::empty();
+            let mut reader = BufReader::new(Cursor::new(client_ca.as_bytes()));
+            let roots_to_add = rustls_pemfile::certs(&mut reader)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| RestServerConfigError::Tls(error.to_string()))?;
+            if roots_to_add.is_empty() {
+                return Err(RestServerConfigError::Tls(
+                    "TLS client CA PEM contains no certificates".to_owned(),
+                ));
+            }
+            for certificate in roots_to_add {
+                roots
+                    .add(certificate)
+                    .map_err(|error| RestServerConfigError::Tls(error.to_string()))?;
+            }
+            let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
+                .build()
+                .map_err(|error| RestServerConfigError::Tls(error.to_string()))?;
+            builder
+                .with_client_cert_verifier(verifier)
+                .with_single_cert(certificates, private_key)
+        } else {
+            builder
+                .with_no_client_auth()
+                .with_single_cert(certificates, private_key)
+        };
+        config.map_err(|error| RestServerConfigError::Tls(error.to_string()))
+    }
+}
 
 macro_rules! standard_app {
     ($config:expr, $http_metrics:expr, $adaptive_shedder:expr, $server_breaker:expr, $route_policies:expr, $response_policy:expr, $content_encryption:expr, $static_assets:expr, $configure:expr) => {{
@@ -197,6 +307,7 @@ pub struct RestServerConfig {
     pub request_ids: bool,
     pub decompress_gzip: bool,
     pub metrics_namespace: String,
+    pub tls: Option<RestTlsConfig>,
     pub route_groups: Vec<RouteGroupConfig>,
 }
 
@@ -230,6 +341,7 @@ impl Default for RestServerConfig {
             request_ids: true,
             decompress_gzip: true,
             metrics_namespace: "rust_zero".to_owned(),
+            tls: None,
             route_groups: Vec::new(),
         }
     }
@@ -322,6 +434,9 @@ impl RestServerConfig {
                 "metrics_namespace must not be empty when metrics are enabled",
             ));
         }
+        if let Some(tls) = &self.tls {
+            tls.validate()?;
+        }
         RoutePolicies::compile(&self.route_groups).map_err(RestServerConfigError::RoutePolicy)?;
         Ok(())
     }
@@ -333,6 +448,7 @@ pub enum RestServerConfigError {
     Metrics(rust_zero_core::MetricsError),
     RoutePolicy(String),
     RouteMiddleware(String),
+    Tls(String),
 }
 
 impl fmt::Display for RestServerConfigError {
@@ -344,6 +460,7 @@ impl fmt::Display for RestServerConfigError {
             Self::RouteMiddleware(error) => {
                 write!(formatter, "invalid REST route middleware: {error}")
             }
+            Self::Tls(error) => write!(formatter, "invalid REST TLS configuration: {error}"),
         }
     }
 }
@@ -553,7 +670,13 @@ impl RestServer {
         let shutdown_seconds = config.shutdown_timeout_ms.div_ceil(1_000);
         let workers = config.workers;
 
-        HttpServer::new(move || {
+        let tls = config
+            .tls
+            .as_ref()
+            .map(RestTlsConfig::rustls_config)
+            .transpose()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        let server = HttpServer::new(move || {
             standard_app!(
                 &config,
                 http_metrics.clone(),
@@ -567,9 +690,14 @@ impl RestServer {
             )
         })
         .workers(workers)
-        .shutdown_timeout(shutdown_seconds)
-        .listen(listener)
-        .map(HttpServer::run)
+        .shutdown_timeout(shutdown_seconds);
+        if let Some(tls) = tls {
+            server
+                .listen_rustls_0_23(listener, tls)
+                .map(HttpServer::run)
+        } else {
+            server.listen(listener).map(HttpServer::run)
+        }
     }
 
     /// Serves until the supplied shutdown signal resolves, then gracefully drains requests.
@@ -873,6 +1001,95 @@ priority = true
         assert!(metrics.render().contains(
             "rust_zero_http_protection_decisions_total{mechanism=\"circuit_breaker\",decision=\"rejected\"} 1"
         ));
+    }
+
+    #[actix_rt::test]
+    async fn configured_https_acceptor_completes_mutual_tls_handshake() {
+        let (ca, certificate, private_key, client_certificate, client_key) = test_tls_material();
+        let server_config = RestTlsConfig::new(certificate, private_key)
+            .with_client_ca(ca.clone())
+            .rustls_config()
+            .unwrap();
+
+        let mut roots = rustls::RootCertStore::empty();
+        let mut ca_reader = BufReader::new(Cursor::new(ca.as_bytes()));
+        for root in rustls_pemfile::certs(&mut ca_reader) {
+            roots.add(root.unwrap()).unwrap();
+        }
+        let mut certificate_reader = BufReader::new(Cursor::new(client_certificate.as_bytes()));
+        let certificates = rustls_pemfile::certs(&mut certificate_reader)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let mut key_reader = BufReader::new(Cursor::new(client_key.as_bytes()));
+        let key = rustls_pemfile::private_key(&mut key_reader)
+            .unwrap()
+            .unwrap();
+        let client_config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_client_auth_cert(certificates, key)
+            .unwrap();
+        let server_name = rustls::pki_types::ServerName::try_from("localhost")
+            .unwrap()
+            .to_owned();
+        let mut client =
+            rustls::ClientConnection::new(Arc::new(client_config), server_name).unwrap();
+        let mut server = rustls::ServerConnection::new(Arc::new(server_config)).unwrap();
+
+        for _ in 0..20 {
+            let mut client_bytes = Vec::new();
+            client.write_tls(&mut client_bytes).unwrap();
+            if !client_bytes.is_empty() {
+                server.read_tls(&mut Cursor::new(client_bytes)).unwrap();
+                server.process_new_packets().unwrap();
+            }
+            let mut server_bytes = Vec::new();
+            server.write_tls(&mut server_bytes).unwrap();
+            if !server_bytes.is_empty() {
+                client.read_tls(&mut Cursor::new(server_bytes)).unwrap();
+                client.process_new_packets().unwrap();
+            }
+            if !client.is_handshaking() && !server.is_handshaking() {
+                break;
+            }
+        }
+        assert!(!client.is_handshaking());
+        assert!(!server.is_handshaking());
+        assert_eq!(server.peer_certificates().map(<[_]>::len), Some(1));
+    }
+
+    fn test_tls_material() -> (String, String, String, String, String) {
+        use rcgen::{
+            BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair,
+            KeyUsagePurpose,
+        };
+
+        let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params.key_usages = vec![
+            KeyUsagePurpose::DigitalSignature,
+            KeyUsagePurpose::KeyCertSign,
+            KeyUsagePurpose::CrlSign,
+        ];
+        let ca_key = KeyPair::generate().unwrap();
+        let ca = ca_params.self_signed(&ca_key).unwrap();
+
+        let server_key = KeyPair::generate().unwrap();
+        let mut server_params = CertificateParams::new(["localhost".to_owned()]).unwrap();
+        server_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        let server = server_params.signed_by(&server_key, &ca, &ca_key).unwrap();
+
+        let client_key = KeyPair::generate().unwrap();
+        let mut client_params = CertificateParams::new(["rust-zero-client".to_owned()]).unwrap();
+        client_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        let client = client_params.signed_by(&client_key, &ca, &ca_key).unwrap();
+
+        (
+            ca.pem(),
+            server.pem(),
+            server_key.serialize_pem(),
+            client.pem(),
+            client_key.serialize_pem(),
+        )
     }
 
     #[actix_rt::test]
