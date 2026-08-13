@@ -24,16 +24,27 @@ packages=(
 )
 
 core_path="${repository_root}/core"
+rest_path="${repository_root}/rest"
+rpc_path="${repository_root}/rpc"
 
 for package in "${packages[@]}"; do
-  if [[ "${package}" == rust-zero-core || "${package}" == rust-zero-mapreduce ]]; then
-    cargo package "${package_options[@]}" --package "${package}"
-  else
-    # Before the first publish, resolve the normalized registry dependency to the exact local core
-    # source. The CLI patch does not become part of the archive; after core is published the same
-    # package command also succeeds without it.
-    cargo package "${package_options[@]}" \
-      --config "patch.crates-io.rust-zero-core.path='${core_path}'" \
-      --package "${package}"
-  fi
+  case "${package}" in
+    rust-zero-rest|rust-zero-rpc)
+      cargo package "${package_options[@]}" \
+        --config "patch.crates-io.rust-zero-core.path='${core_path}'" \
+        --package "${package}"
+      ;;
+    rust-zero-gateway)
+      # Before the first coordinated publish, resolve normalized registry dependencies to the
+      # exact local workspace sources. These CLI patches do not become part of the archive.
+      cargo package "${package_options[@]}" \
+        --config "patch.crates-io.rust-zero-core.path='${core_path}'" \
+        --config "patch.crates-io.rust-zero-rest.path='${rest_path}'" \
+        --config "patch.crates-io.rust-zero-rpc.path='${rpc_path}'" \
+        --package "${package}"
+      ;;
+    *)
+      cargo package "${package_options[@]}" --package "${package}"
+      ;;
+  esac
 done

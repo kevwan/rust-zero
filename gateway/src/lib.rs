@@ -1816,11 +1816,14 @@ rpc = "acme.greeter.v1.Greeter.Get"
     #[actix_web::test]
     async fn configured_https_gateway_keeps_observability_middleware_enabled() {
         use rcgen::{
-            BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair,
-            KeyUsagePurpose,
+            BasicConstraints, CertificateParams, DistinguishedName, DnType,
+            ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose,
         };
 
         let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        let mut ca_name = DistinguishedName::new();
+        ca_name.push(DnType::CommonName, "rust-zero test CA");
+        ca_params.distinguished_name = ca_name;
         ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
         ca_params.key_usages = vec![
             KeyUsagePurpose::DigitalSignature,
@@ -1831,6 +1834,9 @@ rpc = "acme.greeter.v1.Greeter.Get"
         let ca = ca_params.self_signed(&ca_key).unwrap();
         let server_key = KeyPair::generate().unwrap();
         let mut server_params = CertificateParams::new(["localhost".to_owned()]).unwrap();
+        let mut server_name = DistinguishedName::new();
+        server_name.push(DnType::CommonName, "localhost");
+        server_params.distinguished_name = server_name;
         server_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
         let server_certificate = server_params.signed_by(&server_key, &ca, &ca_key).unwrap();
 
