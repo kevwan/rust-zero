@@ -1,179 +1,147 @@
 # rust-zero
 
-A Rust web and RPC framework inspired by [go-zero](https://github.com/zeromicro/go-zero).
+[![CI](https://github.com/kevwan/rust-zero/actions/workflows/rust.yml/badge.svg)](https://github.com/kevwan/rust-zero/actions/workflows/rust.yml)
+[![Crates.io](https://img.shields.io/crates/v/rust-zero-core.svg)](https://crates.io/crates/rust-zero-core)
+[![Documentation](https://docs.rs/rust-zero-core/badge.svg)](https://docs.rs/rust-zero-core)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-See [FEATURE_PARITY.md](FEATURE_PARITY.md) for runtime coverage against go-zero v1.10.3 and
-[BACKLOG.md](BACKLOG.md) for the current audit status and any remaining work. Release notes live in
-[CHANGELOG.md](CHANGELOG.md), and maintainers can follow [RELEASING.md](RELEASING.md) for the
-package and tag sequence.
+Production building blocks for Rust services, from HTTP and gRPC to discovery, resilience,
+observability, gateways, and MCP. Inspired by [go-zero](https://github.com/zeromicro/go-zero),
+rust-zero combines an opinionated production stack with modular crates, so applications only pay
+for the transports and integrations they use.
 
-## Crates
+> [!IMPORTANT]
+> rust-zero is currently a `0.1.0-alpha` prerelease. It is suitable for evaluation and early
+> adopters, but minor releases may change APIs before 1.0. See the [compatibility policy](#compatibility)
+> before adopting it in production.
 
-The public crates are released together at the same version:
+## Why rust-zero?
 
-- [`rust-zero-core`](https://docs.rs/rust-zero-core) — framework-neutral runtime primitives.
-- [`rust-zero-rest`](https://docs.rs/rust-zero-rest) — Actix Web server, client, and middleware.
-- [`rust-zero-rpc`](https://docs.rs/rust-zero-rpc) — Tonic client/server and discovery integration.
-- [`rust-zero-gateway`](https://docs.rs/rust-zero-gateway) — HTTP proxy and gRPC transcoding.
-- [`rust-zero-mapreduce`](https://docs.rs/rust-zero-mapreduce) — bounded async MapReduce.
-- [`rust-zero-mcp`](https://docs.rs/rust-zero-mcp) — Streamable HTTP and legacy SSE MCP runtime.
+- **Production defaults:** timeouts, recovery, request IDs, metrics, tracing, load shedding, and
+  graceful shutdown are built into the standard server stacks.
+- **One toolkit, multiple transports:** build REST, gRPC, HTTP-to-gRPC gateways, and MCP services
+  with shared configuration, authentication, discovery, and lifecycle primitives.
+- **Use only what you need:** external stores, etcd, Kubernetes, telemetry, and profiling are
+  feature-gated; the core runtime has no default external-service adapters.
+- **Operationally testable:** CI covers the Rust 1.89 MSRV, feature combinations, documentation,
+  publishable packages, benchmark artifacts, and real external backends.
 
-Add only the transports and runtimes an application uses. Package names are rust-zero-prefixed;
-the shorter library names keep imports compact:
+## Quick start
+
+You need [Rust 1.89 or newer](https://www.rust-lang.org/tools/install). Clone the repository and
+run the self-contained REST demo—no database or external service is required:
 
 ```bash
-cargo add rust-zero-core rust-zero-rest rust-zero-rpc
+git clone https://github.com/kevwan/rust-zero.git
+cd rust-zero
+cargo run -p rust-zero-demo
 ```
+
+In another terminal:
+
+```bash
+curl http://127.0.0.1:8080/
+# Hello world!
+```
+
+The demo is a small Actix Web service with structured request logging, a 10-second timeout,
+concurrency control, and token-bucket rate limiting. Its complete source is in
+[`demo/src/main.rs`](demo/src/main.rs).
+
+To use rust-zero in an existing project, add only the crates you need:
+
+```bash
+cargo add rust-zero-core rust-zero-rest
+```
+
+Package names use the `rust-zero-` prefix. Some library names are intentionally shorter, so the
+corresponding imports are:
 
 ```rust
 use rust_zero_core::CircuitBreaker;
 use rest::RestServerConfig;
-use rpc::RpcClientConfig;
 ```
 
-## Compatibility policy
+## Choose a crate
 
-rust-zero supports Rust 1.89 and newer. CI builds the locked dependency graph on 1.89 with every
-feature enabled, and separately checks minimal, adapter, telemetry, and all-feature combinations
-on stable Rust. An MSRV increase is announced in release notes and requires at least a minor
+All public crates are released at the same version.
+
+| Crate | Use it for |
+| --- | --- |
+| [`rust-zero-core`](https://docs.rs/rust-zero-core) | Configuration, resilience, discovery, metrics, logging, caching, stores, and service lifecycle |
+| [`rust-zero-rest`](https://docs.rs/rust-zero-rest) | Actix Web servers, clients, middleware, extractors, SSE, static files, and serverless handlers |
+| [`rust-zero-rpc`](https://docs.rs/rust-zero-rpc) | Tonic gRPC clients and servers, health, balancing, discovery, and transport policies |
+| [`rust-zero-gateway`](https://docs.rs/rust-zero-gateway) | Streaming HTTP proxying and descriptor/reflection-driven gRPC transcoding |
+| [`rust-zero-mcp`](https://docs.rs/rust-zero-mcp) | MCP servers using Streamable HTTP, legacy HTTP+SSE, tools, resources, and prompts |
+| [`rust-zero-mapreduce`](https://docs.rs/rust-zero-mapreduce) | Bounded asynchronous MapReduce execution |
+
+## Explore by task
+
+- Build a production REST stack: [REST services](#rest-services)
+- Run a gRPC service: [RPC](#rpc)
+- Proxy HTTP or transcode JSON to gRPC: [Gateway routing](#gateway-routing)
+- Add runtime primitives: [Core runtime](#core-runtime)
+- Add service discovery: [etcd](#etcd-configuration-and-discovery) or
+  [Kubernetes](#kubernetes-discovery)
+- Connect Redis, SQL, or MongoDB: [External stores](#external-stores)
+- Expose health, metrics, and profiling: [Internal diagnostics](#internal-diagnostics)
+- Compare runtime coverage with go-zero: [Feature parity](FEATURE_PARITY.md)
+
+## Runnable examples
+
+| Example | Command | External dependency |
+| --- | --- | --- |
+| REST middleware demo | `cargo run -p rust-zero-demo` | None |
+| gRPC echo server | `cargo run -p rust-zero-rpc --example echo_server` | None |
+| HTTP + gRPC gateway | `cargo run -p rust-zero-gateway --example mixed_upstreams` | None |
+| MCP server | `cargo run -p rust-zero-mcp --example server` | None |
+| etcd discovery | `cargo run -p rust-zero-core --features etcd --example etcd_discovery` | etcd |
+| Kubernetes discovery | `cargo run -p rust-zero-core --features kubernetes --example kubernetes_discovery` | Cluster or kubeconfig |
+| OpenTelemetry export | `cargo run -p rust-zero-core --features telemetry --example telemetry` | OTLP collector |
+| Redis, SQL, and MongoDB | `cargo run -p rust-zero-core --features stores --example external_stores` | Configured stores |
+
+Examples that use external systems read connection settings from environment variables; open the
+linked [example sources](core/examples) for the accepted names and defaults. The mixed gateway
+example starts its own HTTP and gRPC upstreams, making it the quickest way to try transcoding.
+
+## What is included
+
+rust-zero provides composable production primitives rather than a code generator:
+
+- REST and gRPC authentication, middleware, clients, servers, streaming, and graceful draining.
+- Circuit breaking, bounded retries, deadlines, adaptive shedding, rate limiting, load balancing,
+  single-flight work, queues, batching, and MapReduce.
+- Typed JSON/JSON5/TOML/YAML configuration with environment expansion and dynamic updates.
+- Prometheus metrics, structured logging, W3C trace propagation, optional OpenTelemetry export,
+  health reporting, diagnostics, and profiling.
+- In-memory, etcd, and Kubernetes discovery; optional Redis, SQLite/PostgreSQL/MySQL, and MongoDB
+  adapters; and HTTP/gRPC gateway routing.
+
+The detailed [feature-parity matrix](FEATURE_PARITY.md) defines exact coverage and deliberate
+ecosystem boundaries. [BACKLOG.md](BACKLOG.md) tracks audit status and remaining work.
+
+## Compatibility
+
+rust-zero supports Rust 1.89 and newer. Linux is the primary deployment target; macOS is supported
+for local development. CI checks the locked dependency graph on Rust 1.89 with all features and
+also tests minimal, adapter, telemetry, and all-feature combinations on stable Rust.
+
+An MSRV increase is announced in the [release notes](CHANGELOG.md) and requires at least a minor
 version change. Before 1.0, minor releases may contain API changes; patch releases preserve public
-APIs except where a security or soundness fix makes that impossible. After 1.0, the project follows
-Semantic Versioning.
+APIs except when a security or soundness fix makes that impossible. After 1.0, the project follows
+[Semantic Versioning](https://semver.org/).
 
-Linux is the primary deployment target. macOS is supported for local development. Optional etcd,
-Kubernetes, telemetry, Redis, SQL, MongoDB, and sampling-profiler integrations are covered only
-when their corresponding Cargo feature is enabled; disabling default features keeps the core
-runtime free of external-service adapters.
+## Configuration
 
-## Available features
-
-- Actix Web middleware for structured request logging, request identity propagation, CORS, bearer
-  authentication, configurable JWT claim projection, time-window-bounded request signatures, panic
-  recovery, browser security headers, timeout control, overload shedding, and token-bucket rate
-  limiting.
-- A validated, deserializable REST server configuration that binds Actix and installs the standard
-  logging, recovery, identity, tracing, metrics, security, timeout, request-size, and shedding stack.
-- Per-server REST response policies with request-aware success/error envelopes, typed stable
-  application errors, gRPC-to-HTTP status translation, safe serialization failure handling, and
-  anti-buffered chunk streaming.
-- Declarative REST route groups with inherited and per-route JWT, timeout, body-size, priority, and
-  SSE policies, ordered named application middleware, and signal-driven serving that gracefully
-  drains in-flight requests.
-- Opt-in static fallback for canonicalized directories and embedded assets, with safe index,
-  traversal, symlink, `GET`, and `HEAD` handling.
-- A reusable socket-free handler that dispatches serverless requests through the same REST routes,
-  middleware stack, policies, metrics, and static fallback as the listener-based server.
-- Opt-in authenticated REST body encryption with bounded buffering, a versioned AES-256-GCM
-  envelope, explicit rotation-safe key IDs, and application-provided key providers.
-- An MCP server with explicitly selectable 2025-03-26 Streamable HTTP and legacy 2024-11-05
-  HTTP+SSE transports, validated stateless or expiring stateful sessions, tool/resource/prompt
-  registration, JSON or SSE responses, resumable GET event streams, explicit termination,
-  cancellation, protocol errors, request deadlines, origin validation, graceful draining, and
-  handler access to projected HTTP request metadata.
-- Tonic-based gRPC client and server builders with global, service, and exact-method deadlines,
-  automatic renewable etcd registration and graceful withdrawal, connection concurrency, and stream
-  limits plus gRPC health reporting, bearer/JWT/signature interceptors, and backend-neutral dynamic
-  weighted endpoint balancing for in-memory, etcd, or Kubernetes discovery, opt-in active endpoint
-  probes with observable empty/ready/degraded status, automatic gRPC/dev-server health projection,
-  protocol-aware client circuit breaking,
-  adaptive server load shedding, and reusable
-  client/server layers for cardinality-bounded request, latency, in-flight, final-status, error,
-  and cancellation metrics across unary and streaming calls.
-- A generated-service-independent gRPC server layer that installs bearer authentication, W3C
-  trace extraction, adaptive shedding, panic-to-`Internal` recovery, and transport metrics once
-  for every generated service on a Tonic server.
-- A generated-client-friendly gRPC service stack that installs bearer credentials, W3C trace
-  propagation, default deadlines, transport metrics, and trailer-aware circuit breaking around a
-  direct or discovery-balanced channel.
-- Descriptor-driven HTTP-to-gRPC transcoding with compiled descriptor sets or live gRPC server
-  reflection, explicit and `google.api.http` bindings, protobuf JSON, metadata forwarding,
-  canonical status mapping, and newline-delimited server streaming.
-- Optional OpenTelemetry tracing with parent-based sampling, full REST and gRPC client/server
-  spans, and batched OTLP export over gRPC or HTTP.
-- A Tokio-based MapReduce primitive with bounded parallelism.
-- Framework-neutral runtime primitives in `rust-zero-core`: typed JSON/TOML/YAML configuration
-  loading with environment expansion, atomic dynamic configuration subscriptions, sync/async
-  circuit breaking, adaptive concurrency shedding, consistent hashing, feedback-aware P2C
-  balancing, TTL caching, bounded exponential retry, async deadlines, keyed single-flight work
-  coalescing, and typed validation. It also provides a dependency-free Prometheus text-format
-  metrics registry with labeled counters, gauges, and histograms, a reference-counted service
-  registry for dynamic endpoint publication and subscriptions, Bloom filters, rolling statistics,
-  timed batch execution, fail-fast service groups with graceful shutdown, and a standalone
-  structured logger with trace context, sensitive-field masking, sampling, and file rotation.
-- Signal-aware service supervision that turns SIGINT/SIGTERM into cooperative cancellation and
-  enforces a bounded graceful-shutdown window across all background and transport services.
-- Feature-gated etcd coordination with typed last-known-good configuration watches, renewable
-  service leases, and revision-safe endpoint subscriptions with configurable jittered reconnect
-  and full relisting after interrupted or compacted watches.
-- Feature-gated Kubernetes EndpointSlice discovery with readiness filtering, atomic relists,
-  resource-version recovery, configurable jittered reconnect, stable snapshots, and IPv6-safe
-  endpoint URIs.
-- A resilient named REST client with request deadlines, circuit breaking, response-size limits,
-  JSON helpers, W3C trace propagation, and optional request/duration/in-flight metrics, plus
-  validated JSON, query, path, and form extractors for
-  inbound APIs, including application-typed headers, combined path/query/header/JSON parsing, and
-  stable machine-readable extraction errors. Multipart forms stream uploads to automatically
-  cleaned temporary files with independently configurable text-field, file, and aggregate limits.
-- EventSource-compatible server-sent event responses with multiline events, event IDs, retry hints,
-  heartbeat comments, and proxy anti-buffering headers.
-- Non-overlapping periodic background execution with surfaced job failures and a bounded shutdown
-  deadline, alongside count- and byte-batched execution, coalesced delayed work, and
-  threshold-based execution suppression.
-- Supervised in-process queues with configurable worker pools, pause/resume, bounded shutdown,
-  lifecycle and failure events, Prometheus processing metrics, round-robin failover pushing, and
-  fan-out delivery.
-- Durable brokers are an intentional ecosystem boundary: applications choose a Kafka, RabbitMQ,
-  or other broker client whose delivery guarantees and operational model fit the deployment.
-  Broker consumers can hand decoded work to the in-process queue runtime when they need its bounded
-  worker supervision and backpressure, but rust-zero does not claim external-messaging parity.
-- An opt-in named duration profiler and an internal Actix dev server exposing route discovery,
-  health, Prometheus metrics, profiling reports, and process/runtime diagnostics.
-- Feature-gated external stores: an async standalone/clustered Redis adapter with strings, hashes,
-  lists, sets, sorted sets, JSON values, TTLs, counters, ownership-safe distributed locks,
-  bounded reconnecting channel/pattern subscriptions, timeout-aware pipelines and Lua scripts, and
-  stream/consumer-group operations, plus coalesced model caching with positive/not-found entries,
-  jittered TTLs, statistics, cross-process invalidation, cardinality-bounded command metrics, and
-  opt-in OpenTelemetry spans; and typed SQLx pools for SQLite,
-  PostgreSQL, and MySQL with
-  standardized lifecycle, health checks, transactions, and bounded cache-aside record loading
-  by primary or secondary keys, configurable negative caching, bounded TTL jitter, statistics,
-  and race-safe mutation-wide invalidation; plus typed MongoDB collections with health checks,
-  sessions, transactions, native bounded bulk insertion, instrumented typed operations, stable
-  not-found errors, and cache-aware mutations using the same indexed cached-record policy.
-
-Configuration files may use JSON, JSON5, TOML, YAML, or YML. JSON5 supports comments, trailing
-commas, single-quoted strings, and unquoted object keys while retaining environment expansion.
-
-Run the stateful dual-transport MCP example, which exposes `/mcp`, `/sse`, and `/message`, registers
-a tool, resource, and prompt, and uses the shared signal-aware service supervisor:
-
-```bash
-cargo run -p rust-zero-mcp --example server
-```
-
-The external-service examples are independently compiled by CI and accept their connection
-settings through environment variables:
-
-```bash
-ETCD_ENDPOINT=http://127.0.0.1:2379 \
-  cargo run -p rust-zero-core --features etcd --example etcd_discovery
-
-KUBERNETES_NAMESPACE=production KUBERNETES_SERVICE=users \
-  cargo run -p rust-zero-core --features kubernetes --example kubernetes_discovery
-
-OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4317 \
-  cargo run -p rust-zero-core --features telemetry --example telemetry
-
-REDIS_URL=redis://127.0.0.1/ MONGODB_URI=mongodb://127.0.0.1:27017 \
-  cargo run -p rust-zero-core --features stores --example external_stores
-```
+Configuration files may use JSON, JSON5, TOML, YAML, or YML. Environment variables can be expanded
+with `$VAR` or `${VAR}`. JSON5 additionally supports comments, trailing commas, single-quoted
+strings, and unquoted object keys.
 
 REST and gRPC share `JwtClaimProjection`, `RequestSignatureVerifier`, and the stable `AuthFailure`
-taxonomy. Claim projections map a handler-facing name to a dot-separated JWT path. Request
-signatures use HMAC-SHA256 over the timestamp, uppercase transport method, and canonical target;
-the verifier accepts named rotation keys and rejects timestamps outside its configured clock-skew
-window. REST transports the values in the exported `x-rust-zero-*` headers, while the gRPC signer
-and verifier use the corresponding metadata.
+taxonomy. Request signatures use HMAC-SHA256 with named rotation keys and a configurable clock-skew
+window; REST sends the values in `x-rust-zero-*` headers and gRPC uses corresponding metadata.
+
+---
 
 ## Core runtime
 
@@ -292,6 +260,8 @@ let shedder = RpcLoadShedder::new(LoadShedderConfig::production(1_024));
 let response = shedder.call(|| service.echo(request)).await?;
 # Ok::<(), tonic::Status>(())
 ```
+
+## REST services
 
 The REST middleware is composable and returns standard HTTP responses when protection activates:
 
