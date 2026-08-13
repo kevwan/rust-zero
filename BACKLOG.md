@@ -201,13 +201,67 @@ complete, the project claims **broad runtime coverage**, not full runtime parity
 
 ## Recommended execution order
 
-The reopened runtime items are complete. Legacy MCP SSE is opt-in for older-client compatibility.
-Durable brokers and the `goctl` developer toolchain remain intentional ecosystem boundaries.
+The previously reopened TLS, server-circuit, gRPC-lifecycle, CORS, and legacy MCP items are
+complete. The gateway integration items below are the current runtime priority. Durable brokers
+and the `goctl` developer toolchain remain intentional ecosystem boundaries unless explicitly
+brought into scope.
 
 ## Remaining catch-up items
 
 `goctl` and all other code generation remain outside this runtime catch-up scope. MCP Streamable
 HTTP and its opt-in legacy SSE compatibility transport are covered.
+
+## Reopened gaps from the 2026-08-13 follow-up audit
+
+These items distinguish individually available primitives from the configuration-driven,
+production-ready assembly and operational evidence provided by go-zero. Until the P0 gateway
+items are complete, gateway support should be described as **library capability covered; standard
+assembly partial**.
+
+### P0 — gateway runtime integration
+
+- [x] **Configuration-driven mixed-protocol gateway.** Extend `GatewayConfig` and the shipped
+  `gateway` binary to configure HTTP and gRPC upstreams, descriptor-set or live-reflection loading,
+  explicit and `google.api.http` bindings, upstream TLS/auth/discovery settings, and unary or
+  server-streaming transcoding without requiring callers to assemble a custom Actix application.
+  Prove HTTP proxy and JSON-to-gRPC routes operate together through the stock binary.
+- [ ] **Standard production gateway stack.** Reuse or compose the standard REST listener and
+  middleware configuration in `GatewayServer`, including TLS/mTLS, request identity, recovery,
+  structured logging, tracing, metrics, CORS, security headers, authentication, timeouts, body
+  limits, rate/concurrency limiting, adaptive shedding, and result-aware circuit breaking. Add
+  integration tests showing that configuration enables the same protections for HTTP proxy and
+  transcoded gRPC routes.
+
+### P1 — production confidence and large-scale operation
+
+- [ ] **Cross-framework benchmark baselines.** Check in reproducible rust-zero and go-zero results
+  for equivalent REST, gRPC, partial-failure, overload-recovery, discovery, and queue workloads on
+  recorded hardware. Define regression thresholds and run enough samples to report medians and
+  tail latency rather than leaving the benchmark results directory without a baseline.
+- [ ] **Feature-enabled runtime test matrix.** Run transport and core tests—not only compilation
+  checks—with telemetry and all supported feature combinations. Retain real-backend tests and add
+  coverage for gateway TLS/observability plus opt-in etcd TLS where CI credentials permit.
+- [ ] **Large-fleet discovery subsetting.** Add configurable, randomized, stable-enough client-side
+  endpoint subsetting for very large discovery snapshots, with churn distribution, reconnection,
+  empty-set recovery, and connection-count tests. Preserve an opt-out mode for applications that
+  intentionally connect to every endpoint.
+- [ ] **Stabilization and adoption evidence.** Define measurable criteria for leaving alpha,
+  complete a public-API and upgrade-path review, publish sustained soak/fault-test results, and
+  document at least one real production deployment before claiming production maturity comparable
+  to go-zero. Pre-1.0 API compatibility rules remain in force until these gates are met.
+
+### P2 — adapter and ecosystem breadth
+
+- [ ] **Typed Redis API depth.** Expand the standardized typed wrapper for commonly used go-zero
+  operations that currently require `do_command`, including scans, bitmaps, HyperLogLog, richer
+  sorted-set ranges/mutations, blocking list operations, atomic move/unlink helpers, stream info,
+  and transactional pipelines. Keep `do_command` as the escape hatch and test supported helpers
+  against standalone and clustered Redis.
+- [ ] **Optional durable broker integrations.** If ecosystem parity is brought into scope, provide
+  feature-gated Kafka and RabbitMQ adapters with broker-native acknowledgement, offset/topology,
+  retry, dead-letter, backpressure, shutdown, observability, and real-backend tests. Until then,
+  continue to label durable messaging as an intentional ecosystem boundary rather than a covered
+  parity area.
 
 ### P0 — runtime semantics
 
@@ -257,6 +311,10 @@ HTTP and its opt-in legacy SSE compatibility transport are covered.
 
 ## Recently completed
 
+- [x] Stock configuration-driven mixed-protocol gateway assembly with HTTP proxy routes and
+  descriptor-set or reflection-driven gRPC transcoding routes, explicit/annotated bindings,
+  direct or live etcd-discovered endpoint pools, TLS/mTLS, redacted bearer credentials, unary and
+  server-streaming dispatch, and a live combined-listener integration test.
 - [x] Explicitly selectable MCP 2025-03-26 Streamable HTTP and 2024-11-05 HTTP+SSE transports,
   including separate legacy connection/message endpoints, session-specific endpoint discovery,
   asynchronous SSE responses, origin validation, and protocol-version integration tests.

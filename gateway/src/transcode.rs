@@ -19,7 +19,8 @@ use tonic::{
 };
 
 /// HTTP verbs supported by protobuf HTTP bindings.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum HttpVerb {
     Get,
     Put,
@@ -42,7 +43,8 @@ impl HttpVerb {
 }
 
 /// An explicit HTTP binding for a fully-qualified protobuf method.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct HttpBinding {
     pub verb: HttpVerb,
     pub path: String,
@@ -78,6 +80,7 @@ pub struct TranscoderBuilder {
     pool: DescriptorPool,
     channel: Channel,
     bindings: Vec<HttpBinding>,
+    authorization: Option<AsciiMetadataValue>,
 }
 
 impl TranscoderBuilder {
@@ -90,6 +93,7 @@ impl TranscoderBuilder {
             pool,
             channel,
             bindings: Vec::new(),
+            authorization: None,
         })
     }
 
@@ -162,12 +166,27 @@ impl TranscoderBuilder {
             pool,
             channel,
             bindings: Vec::new(),
+            authorization: None,
         })
     }
 
     pub fn add_binding(mut self, binding: HttpBinding) -> Self {
         self.bindings.push(binding);
         self
+    }
+
+    /// Adds a fixed authorization value to every upstream gRPC request.
+    pub fn with_authorization(
+        mut self,
+        authorization: impl AsRef<str>,
+    ) -> Result<Self, TranscodeError> {
+        self.authorization = Some(
+            authorization
+                .as_ref()
+                .parse()
+                .map_err(|_| TranscodeError::InvalidAuthorization)?,
+        );
+        Ok(self)
     }
 
     /// Loads `google.api.http` primary and additional bindings when those extensions are present
@@ -207,6 +226,7 @@ impl TranscoderBuilder {
         Ok(Transcoder {
             channel: self.channel,
             routes: Arc::new(routes),
+            authorization: self.authorization,
         })
     }
 }
@@ -216,6 +236,7 @@ impl TranscoderBuilder {
 pub struct Transcoder {
     channel: Channel,
     routes: Arc<Vec<Route>>,
+    authorization: Option<AsciiMetadataValue>,
 }
 
 impl Transcoder {
@@ -251,6 +272,11 @@ impl Transcoder {
         let input = request_message(route, request, body, captures)?;
         let mut grpc_request = Request::new(input);
         forward_metadata(request, &mut grpc_request);
+        if let Some(authorization) = &self.authorization {
+            grpc_request
+                .metadata_mut()
+                .insert("authorization", authorization.clone());
+        }
         let path: PathAndQuery = format!(
             "/{}/{}",
             route.method.parent_service().full_name(),
@@ -661,6 +687,7 @@ pub enum TranscodeError {
     ReflectionDescriptor(prost::DecodeError),
     Reflection(String),
     InvalidReflectionResponse,
+    InvalidAuthorization,
     UnknownMethod(String),
     UnsupportedClientStreaming(String),
     InvalidTemplate(String),
@@ -683,6 +710,9 @@ impl fmt::Display for TranscodeError {
             Self::Reflection(message) => write!(formatter, "gRPC reflection failed: {message}"),
             Self::InvalidReflectionResponse => {
                 formatter.write_str("gRPC reflection returned an unexpected response")
+            }
+            Self::InvalidAuthorization => {
+                formatter.write_str("gRPC authorization value is not valid ASCII metadata")
             }
             Self::UnknownMethod(method) => write!(formatter, "unknown protobuf method: {method}"),
             Self::UnsupportedClientStreaming(method) => write!(

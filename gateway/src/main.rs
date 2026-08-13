@@ -5,7 +5,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let path = std::env::args()
         .nth(1)
         .ok_or("usage: gateway <config.{json,json5,toml,yaml,yml}>")?;
-    let server = GatewayServer::new(GatewayConfig::load(path)?)?;
+    let server = GatewayServer::from_config(GatewayConfig::load(path)?).await?;
     server
         .serve_until(async {
             let _ = rust_zero_core::wait_for_shutdown_signal().await;

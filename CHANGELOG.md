@@ -5,6 +5,9 @@ Versioning, with the pre-1.0 compatibility policy described in the README.
 
 ## [Unreleased]
 
+- Added stock mixed-protocol gateway configuration for HTTP proxy and descriptor/reflection-driven
+  gRPC routes, including explicit/annotated bindings, TLS, bearer auth, static balancing, and live
+  etcd discovery.
 - Added explicitly selectable MCP 2024-11-05 HTTP+SSE compatibility alongside the default
   2025-03-26 Streamable HTTP transport, with session-specific legacy message endpoints and
   protocol-version coverage.

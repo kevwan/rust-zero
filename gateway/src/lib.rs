@@ -12,6 +12,10 @@ use actix_web::{
     web, App, HttpRequest, HttpResponse, HttpServer,
 };
 use futures::{future::LocalBoxFuture, StreamExt};
+use rpc::{RpcClient, RpcClientConfig, RpcClientTlsConfig};
+use rust_zero_core::{
+    EndpointChangeFuture, EndpointSubscription, EtcdClient, EtcdConfig, EtcdTlsConfig,
+};
 use serde::{Deserialize, Serialize};
 use std::{
     cmp::Reverse,
@@ -59,6 +63,8 @@ pub struct GatewayConfig {
     pub request_body_limit: usize,
     pub response_body_limit: usize,
     pub routes: Vec<GatewayRoute>,
+    /// Descriptor-driven JSON/HTTP to gRPC upstreams mounted by path prefix.
+    pub grpc: Vec<GatewayGrpcUpstream>,
 }
 
 impl Default for GatewayConfig {
@@ -71,6 +77,7 @@ impl Default for GatewayConfig {
             request_body_limit: default_request_body_limit(),
             response_body_limit: default_response_body_limit(),
             routes: Vec::new(),
+            grpc: Vec::new(),
         }
     }
 }
@@ -103,9 +110,9 @@ impl GatewayConfig {
                 "gateway body limits must be greater than zero",
             ));
         }
-        if self.routes.is_empty() {
+        if self.routes.is_empty() && self.grpc.is_empty() {
             return Err(GatewayConfigError::Invalid(
-                "at least one gateway route is required",
+                "at least one HTTP or gRPC gateway route is required",
             ));
         }
         for route in &self.routes {
@@ -133,8 +140,210 @@ impl GatewayConfig {
                 }
             }
         }
+        let mut prefixes: HashSet<&str> = self
+            .routes
+            .iter()
+            .map(|route| route.prefix.as_str())
+            .collect();
+        for grpc in &self.grpc {
+            grpc.validate()?;
+            if !prefixes.insert(&grpc.prefix) {
+                return Err(GatewayConfigError::Invalid(
+                    "HTTP and gRPC gateway route prefixes must be unique",
+                ));
+            }
+        }
         GatewayRouter::new(self.routes.clone()).map_err(GatewayConfigError::Route)?;
         Ok(())
+    }
+}
+
+/// A configured gRPC upstream and its public HTTP bindings.
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayGrpcUpstream {
+    pub prefix: String,
+    /// One or more direct/discovered endpoints. Multiple endpoints use Tonic balancing.
+    #[serde(default)]
+    pub endpoints: Vec<String>,
+    /// Optional live etcd service discovery. Mutually exclusive with `endpoints`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discovery: Option<GatewayGrpcEtcdDiscovery>,
+    /// A compiled protobuf `FileDescriptorSet`. Omit when `reflection` is enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub descriptor_set: Option<std::path::PathBuf>,
+    #[serde(default)]
+    pub reflection: bool,
+    #[serde(default)]
+    pub annotated_bindings: bool,
+    #[serde(default)]
+    pub bindings: Vec<HttpBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<RpcClientTlsConfig>,
+    /// Fixed bearer token used after any downstream authorization header is stripped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bearer_token: Option<String>,
+}
+
+impl std::fmt::Debug for GatewayGrpcUpstream {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GatewayGrpcUpstream")
+            .field("prefix", &self.prefix)
+            .field("endpoints", &self.endpoints)
+            .field("discovery", &self.discovery)
+            .field("descriptor_set", &self.descriptor_set)
+            .field("reflection", &self.reflection)
+            .field("annotated_bindings", &self.annotated_bindings)
+            .field("bindings", &self.bindings)
+            .field("tls", &self.tls)
+            .field(
+                "bearer_token",
+                &self.bearer_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish()
+    }
+}
+
+impl GatewayGrpcUpstream {
+    fn validate(&self) -> Result<(), GatewayConfigError> {
+        let normalized =
+            normalize_prefix(self.prefix.clone()).map_err(GatewayConfigError::Route)?;
+        if normalized != self.prefix {
+            return Err(GatewayConfigError::Invalid(
+                "gRPC gateway prefixes must not have a trailing slash",
+            ));
+        }
+        if self.endpoints.is_empty() == self.discovery.is_none() {
+            return Err(GatewayConfigError::Invalid(
+                "configure exactly one of endpoints or discovery for a gRPC upstream",
+            ));
+        }
+        for endpoint in &self.endpoints {
+            let uri: http::Uri = endpoint.parse().map_err(|_| {
+                GatewayConfigError::Invalid("gRPC endpoint must be a valid absolute URI")
+            })?;
+            if !matches!(uri.scheme_str(), Some("http" | "https")) || uri.authority().is_none() {
+                return Err(GatewayConfigError::Invalid(
+                    "gRPC endpoint must use HTTP or HTTPS and include an authority",
+                ));
+            }
+        }
+        if let Some(discovery) = &self.discovery {
+            discovery.validate()?;
+        }
+        if self.descriptor_set.is_some() == self.reflection {
+            return Err(GatewayConfigError::Invalid(
+                "configure exactly one of descriptor_set or reflection for a gRPC upstream",
+            ));
+        }
+        if !self.annotated_bindings && self.bindings.is_empty() {
+            return Err(GatewayConfigError::Invalid(
+                "gRPC gateway requires explicit or annotated HTTP bindings",
+            ));
+        }
+        if self
+            .bearer_token
+            .as_ref()
+            .is_some_and(|token| token.trim().is_empty())
+        {
+            return Err(GatewayConfigError::Invalid(
+                "gRPC gateway bearer token must not be empty",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Etcd-backed live endpoint discovery for one gRPC service.
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct GatewayGrpcEtcdDiscovery {
+    pub endpoints: Vec<String>,
+    pub namespace: String,
+    pub service: String,
+    pub username: Option<String>,
+    pub password: Option<String>,
+    pub connect_timeout_ms: u64,
+    pub tls: Option<EtcdTlsConfig>,
+}
+
+impl Default for GatewayGrpcEtcdDiscovery {
+    fn default() -> Self {
+        Self {
+            endpoints: Vec::new(),
+            namespace: "/rust-zero".to_owned(),
+            service: String::new(),
+            username: None,
+            password: None,
+            connect_timeout_ms: 10_000,
+            tls: None,
+        }
+    }
+}
+
+impl std::fmt::Debug for GatewayGrpcEtcdDiscovery {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GatewayGrpcEtcdDiscovery")
+            .field("endpoints", &self.endpoints)
+            .field("namespace", &self.namespace)
+            .field("service", &self.service)
+            .field("username", &self.username)
+            .field("password", &self.password.as_ref().map(|_| "[REDACTED]"))
+            .field("connect_timeout_ms", &self.connect_timeout_ms)
+            .field("tls", &self.tls)
+            .finish()
+    }
+}
+
+impl GatewayGrpcEtcdDiscovery {
+    fn validate(&self) -> Result<(), GatewayConfigError> {
+        if self.endpoints.is_empty()
+            || self
+                .endpoints
+                .iter()
+                .any(|endpoint| endpoint.trim().is_empty())
+        {
+            return Err(GatewayConfigError::Invalid(
+                "gRPC etcd discovery requires non-empty etcd endpoints",
+            ));
+        }
+        if self.service.trim().is_empty() || self.service.contains('/') {
+            return Err(GatewayConfigError::Invalid(
+                "gRPC etcd discovery service must be a non-empty name",
+            ));
+        }
+        let namespace = self.namespace.trim_matches('/');
+        if namespace.is_empty() || namespace.contains('/') {
+            return Err(GatewayConfigError::Invalid(
+                "gRPC etcd discovery namespace must be a non-empty single path segment",
+            ));
+        }
+        if self.username.is_some() != self.password.is_some() {
+            return Err(GatewayConfigError::Invalid(
+                "gRPC etcd discovery username and password must be configured together",
+            ));
+        }
+        if self.connect_timeout_ms == 0 {
+            return Err(GatewayConfigError::Invalid(
+                "gRPC etcd discovery connect timeout must be greater than zero",
+            ));
+        }
+        Ok(())
+    }
+
+    fn etcd_config(&self) -> EtcdConfig {
+        let mut config = EtcdConfig::new(self.endpoints.clone())
+            .with_namespace(&self.namespace)
+            .with_timeout(Duration::from_millis(self.connect_timeout_ms));
+        if let (Some(username), Some(password)) = (&self.username, &self.password) {
+            config = config.with_credentials(username, password);
+        }
+        if let Some(tls) = &self.tls {
+            config = config.with_tls(tls.clone());
+        }
+        config
     }
 }
 
@@ -145,6 +354,10 @@ pub enum GatewayConfigError {
     Route(GatewayError),
     Middleware(String),
     Invalid(&'static str),
+    DescriptorIo(io::Error),
+    Transcode(TranscodeError),
+    Rpc(rpc::RpcClientError),
+    Etcd(rust_zero_core::EtcdError),
 }
 
 impl std::fmt::Display for GatewayConfigError {
@@ -154,6 +367,14 @@ impl std::fmt::Display for GatewayConfigError {
             Self::Route(error) => write!(formatter, "invalid gateway route: {error}"),
             Self::Middleware(error) => write!(formatter, "invalid gateway middleware: {error}"),
             Self::Invalid(message) => formatter.write_str(message),
+            Self::DescriptorIo(error) => {
+                write!(formatter, "failed to read descriptor set: {error}")
+            }
+            Self::Transcode(error) => {
+                write!(formatter, "failed to configure gRPC transcoding: {error}")
+            }
+            Self::Rpc(error) => write!(formatter, "failed to configure gRPC upstream: {error}"),
+            Self::Etcd(error) => write!(formatter, "failed to configure gRPC discovery: {error}"),
         }
     }
 }
@@ -163,6 +384,10 @@ impl std::error::Error for GatewayConfigError {
         match self {
             Self::Load(error) => Some(error),
             Self::Route(error) => Some(error),
+            Self::DescriptorIo(error) => Some(error),
+            Self::Transcode(error) => Some(error),
+            Self::Rpc(error) => Some(error),
+            Self::Etcd(error) => Some(error),
             Self::Middleware(_) | Self::Invalid(_) => None,
         }
     }
@@ -597,10 +822,33 @@ async fn dispatch_upstream(
 pub struct GatewayServer {
     config: GatewayConfig,
     proxy: GatewayProxy,
+    grpc: Vec<(String, Transcoder)>,
 }
 
 impl GatewayServer {
+    /// Builds an HTTP-only gateway. Use [`GatewayServer::from_config`] when `config.grpc` is set.
     pub fn new(config: GatewayConfig) -> Result<Self, GatewayConfigError> {
+        config.validate()?;
+        if !config.grpc.is_empty() {
+            return Err(GatewayConfigError::Invalid(
+                "gRPC gateway routes require the asynchronous from_config constructor",
+            ));
+        }
+        let router =
+            GatewayRouter::new(config.routes.clone()).map_err(GatewayConfigError::Route)?;
+        let proxy = GatewayProxy::new(router)
+            .with_request_body_limit(config.request_body_limit)
+            .with_response_body_limit(config.response_body_limit)
+            .with_timeout(Duration::from_millis(config.request_timeout_ms));
+        Ok(Self {
+            config,
+            proxy,
+            grpc: Vec::new(),
+        })
+    }
+
+    /// Builds the complete mixed-protocol gateway, including descriptor or reflection loading.
+    pub async fn from_config(config: GatewayConfig) -> Result<Self, GatewayConfigError> {
         config.validate()?;
         let router =
             GatewayRouter::new(config.routes.clone()).map_err(GatewayConfigError::Route)?;
@@ -608,7 +856,66 @@ impl GatewayServer {
             .with_request_body_limit(config.request_body_limit)
             .with_response_body_limit(config.response_body_limit)
             .with_timeout(Duration::from_millis(config.request_timeout_ms));
-        Ok(Self { config, proxy })
+        let mut grpc = Vec::with_capacity(config.grpc.len());
+        for upstream in &config.grpc {
+            let representative_uri = upstream.endpoints.first().cloned().unwrap_or_else(|| {
+                if upstream.tls.is_some() {
+                    "https://discovery.invalid".to_owned()
+                } else {
+                    "http://discovery.invalid".to_owned()
+                }
+            });
+            let mut client_config = RpcClientConfig::new(representative_uri)
+                .with_request_timeout(Duration::from_millis(config.request_timeout_ms));
+            if let Some(tls) = &upstream.tls {
+                client_config = client_config.with_tls(tls.clone());
+            }
+            let client = RpcClient::try_new(client_config).map_err(|error| {
+                GatewayConfigError::Rpc(rpc::RpcClientError::Configuration(error))
+            })?;
+            let channel = if let Some(discovery) = &upstream.discovery {
+                let etcd = EtcdClient::connect(discovery.etcd_config())
+                    .await
+                    .map_err(GatewayConfigError::Etcd)?;
+                let subscription = etcd
+                    .subscribe(&discovery.service)
+                    .await
+                    .map_err(GatewayConfigError::Etcd)?;
+                client.connect_discovered(subscription)
+            } else if upstream.endpoints.len() == 1 {
+                client.connect().await.map_err(GatewayConfigError::Rpc)?
+            } else {
+                client.connect_discovered(StaticEndpoints(upstream.endpoints.clone()))
+            };
+            let mut builder = if let Some(path) = &upstream.descriptor_set {
+                let bytes = std::fs::read(path).map_err(GatewayConfigError::DescriptorIo)?;
+                TranscoderBuilder::from_descriptor_set(bytes, channel)
+                    .map_err(GatewayConfigError::Transcode)?
+            } else {
+                TranscoderBuilder::from_reflection(channel)
+                    .await
+                    .map_err(GatewayConfigError::Transcode)?
+            };
+            if upstream.annotated_bindings {
+                builder = builder.load_annotated_bindings();
+            }
+            for binding in &upstream.bindings {
+                builder = builder.add_binding(binding.clone());
+            }
+            if let Some(token) = &upstream.bearer_token {
+                builder = builder
+                    .with_authorization(format!("Bearer {token}"))
+                    .map_err(GatewayConfigError::Transcode)?;
+            }
+            let transcoder = builder.build().map_err(GatewayConfigError::Transcode)?;
+            grpc.push((upstream.prefix.clone(), transcoder));
+        }
+        grpc.sort_unstable_by_key(|(prefix, _)| Reverse(prefix.len()));
+        Ok(Self {
+            config,
+            proxy,
+            grpc,
+        })
     }
 
     /// Registers a named policy referenced by configured upstream pools.
@@ -637,11 +944,26 @@ impl GatewayServer {
             .validate_middleware()
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
         let proxy = self.proxy.clone();
+        let grpc = self.grpc.clone();
         let workers = self.config.workers;
+        let request_body_limit = self.config.request_body_limit;
         let shutdown_seconds = self.config.shutdown_timeout_ms.div_ceil(1_000);
         HttpServer::new(move || {
             App::new()
                 .app_data(web::Data::new(proxy.clone()))
+                .app_data(web::PayloadConfig::new(request_body_limit))
+                .configure({
+                    let grpc = grpc.clone();
+                    move |services| {
+                        for (prefix, transcoder) in &grpc {
+                            services.service(
+                                web::scope(prefix)
+                                    .app_data(web::Data::new(transcoder.clone()))
+                                    .default_service(web::to(crate::transcode)),
+                            );
+                        }
+                    }
+                })
                 .default_service(web::to(crate::proxy))
         })
         .workers(workers)
@@ -662,6 +984,20 @@ impl GatewayServer {
         F: Future<Output = ()>,
     {
         drain_on_signal(self.run_on(listener)?, shutdown).await
+    }
+}
+
+struct StaticEndpoints(Vec<String>);
+
+impl EndpointSubscription for StaticEndpoints {
+    type Error = std::convert::Infallible;
+
+    fn endpoints(&self) -> Vec<String> {
+        self.0.clone()
+    }
+
+    fn changed(&mut self) -> EndpointChangeFuture<'_, Self::Error> {
+        Box::pin(std::future::pending())
     }
 }
 
@@ -774,6 +1110,50 @@ mod tests {
     use super::*;
     use actix_web::{test as actix_test, App, HttpServer};
     use rust_zero_core::{parse_config, ConfigFormat};
+    use tonic::{transport::Server as TonicServer, Request, Response, Status};
+
+    mod fixture {
+        tonic::include_proto!("rust_zero.gateway_test");
+    }
+
+    use fixture::{
+        greeter_server::{Greeter, GreeterServer},
+        GetRequest, GetResponse,
+    };
+
+    #[derive(Default)]
+    struct GreeterService;
+
+    #[tonic::async_trait]
+    impl Greeter for GreeterService {
+        type WatchStream = tokio_stream::wrappers::ReceiverStream<Result<GetResponse, Status>>;
+
+        async fn get(&self, request: Request<GetRequest>) -> Result<Response<GetResponse>, Status> {
+            let authenticated = request
+                .metadata()
+                .get("authorization")
+                .is_some_and(|value| value == "Bearer upstream-secret");
+            let request = request.into_inner();
+            Ok(Response::new(GetResponse {
+                id: request.id,
+                message: format!("grpc:{}:{authenticated}", request.view),
+            }))
+        }
+
+        async fn watch(
+            &self,
+            _: Request<GetRequest>,
+        ) -> Result<Response<Self::WatchStream>, Status> {
+            let (_, receiver) = tokio::sync::mpsc::channel(1);
+            Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+                receiver,
+            )))
+        }
+
+        async fn fail(&self, _: Request<GetRequest>) -> Result<Response<GetResponse>, Status> {
+            Err(Status::not_found("missing"))
+        }
+    }
 
     fn route(prefix: &str, upstreams: &[&str]) -> GatewayRoute {
         GatewayRoute::new(
@@ -838,6 +1218,40 @@ middleware = ["sign", "audit"]
             .unwrap_err()
             .to_string()
             .contains("not registered"));
+    }
+
+    #[test]
+    fn parses_grpc_configuration_and_redacts_credentials() {
+        let config: GatewayConfig = parse_config(
+            r#"
+[[grpc]]
+prefix = "/grpc"
+endpoints = ["https://greeter-a:50051", "https://greeter-b:50051"]
+reflection = true
+bearer_token = "upstream-secret"
+
+[[grpc.bindings]]
+verb = "get"
+path = "/grpc/greeters/{id}"
+rpc = "acme.greeter.v1.Greeter.Get"
+"#,
+            ConfigFormat::Toml,
+        )
+        .unwrap();
+
+        config.validate().unwrap();
+        assert_eq!(config.grpc[0].bindings[0].verb, HttpVerb::Get);
+        let debug = format!("{:?}", config.grpc[0]);
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("upstream-secret"));
+
+        let mut invalid = config.grpc[0].clone();
+        invalid.discovery = Some(GatewayGrpcEtcdDiscovery::default());
+        assert!(invalid
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("exactly one"));
     }
 
     #[actix_web::test]
@@ -1112,6 +1526,104 @@ middleware = ["sign", "audit"]
         assert_eq!(request.await.unwrap(), "drained");
         serving.await.unwrap().unwrap();
         upstream_handle.stop(true).await;
+    }
+
+    #[actix_web::test]
+    async fn configured_server_serves_http_proxy_and_grpc_transcoding_together() {
+        let http_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let http_address = http_listener.local_addr().unwrap();
+        let http_server = HttpServer::new(|| {
+            App::new().default_service(web::to(|| async {
+                HttpResponse::Ok().json(serde_json::json!({"protocol": "http"}))
+            }))
+        })
+        .listen(http_listener)
+        .unwrap()
+        .run();
+        let http_handle = http_server.handle();
+        actix_web::rt::spawn(http_server);
+
+        let grpc_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let grpc_address = grpc_listener.local_addr().unwrap();
+        let grpc_server = tokio::spawn(async move {
+            TonicServer::builder()
+                .add_service(GreeterServer::new(GreeterService))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(
+                    grpc_listener,
+                ))
+                .await
+                .unwrap();
+        });
+
+        let descriptor_path = std::env::temp_dir().join(format!(
+            "rust-zero-gateway-{}-{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(
+            &descriptor_path,
+            include_bytes!(concat!(env!("OUT_DIR"), "/gateway.bin")),
+        )
+        .unwrap();
+
+        let gateway_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let gateway_address = gateway_listener.local_addr().unwrap();
+        let config = GatewayConfig {
+            routes: vec![route("/http", &[&format!("http://{http_address}")])],
+            grpc: vec![GatewayGrpcUpstream {
+                prefix: "/grpc".to_owned(),
+                endpoints: vec![format!("http://{grpc_address}")],
+                discovery: None,
+                descriptor_set: Some(descriptor_path.clone()),
+                reflection: false,
+                annotated_bindings: false,
+                bindings: vec![HttpBinding::new(
+                    HttpVerb::Get,
+                    "/grpc/greeters/{id}",
+                    "rust_zero.gateway_test.Greeter.Get",
+                )],
+                tls: None,
+                bearer_token: Some("upstream-secret".to_owned()),
+            }],
+            ..GatewayConfig::default()
+        };
+        let gateway = GatewayServer::from_config(config)
+            .await
+            .unwrap()
+            .run_on(gateway_listener)
+            .unwrap();
+        let gateway_handle = gateway.handle();
+        actix_web::rt::spawn(gateway);
+
+        let http = reqwest::get(format!("http://{gateway_address}/http/orders"))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let http: serde_json::Value = serde_json::from_slice(&http).unwrap();
+        assert_eq!(http, serde_json::json!({"protocol": "http"}));
+        let grpc = reqwest::get(format!(
+            "http://{gateway_address}/grpc/greeters/7?view=configured"
+        ))
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+        let grpc: serde_json::Value = serde_json::from_slice(&grpc).unwrap();
+        assert_eq!(
+            grpc,
+            serde_json::json!({"id": 7, "message": "grpc:configured:true"})
+        );
+
+        gateway_handle.stop(true).await;
+        http_handle.stop(true).await;
+        grpc_server.abort();
+        std::fs::remove_file(descriptor_path).unwrap();
     }
 
     #[test]

@@ -899,9 +899,40 @@ upstreams = ["http://users-a:8080", "http://users-b:8080"]
 [[routes]]
 prefix = "/"
 upstreams = ["http://frontend:8080"]
+
+[[grpc]]
+prefix = "/grpc"
+endpoints = ["https://greeter-a:50051", "https://greeter-b:50051"]
+descriptor_set = "./descriptors/greeter.bin"
+annotated_bindings = true
+bearer_token = "${GREETER_TOKEN}"
+
+[grpc.tls]
+ca_certificate_pem = "${GRPC_CA_PEM}"
+domain_name = "greeter.internal"
+
+[[grpc.bindings]]
+verb = "get"
+path = "/grpc/greeters/{id}"
+rpc = "acme.greeter.v1.Greeter.Get"
 ```
 
-Run it with `cargo run -p rust-zero-gateway -- gateway.toml`.
+Run it with `cargo run -p rust-zero-gateway -- gateway.toml`. Set `reflection = true` instead of
+`descriptor_set` to load descriptors from the upstream reflection service. A gRPC route accepts
+either direct `endpoints` or live etcd discovery; for discovery, omit `endpoints` and add:
+
+```toml
+[grpc.discovery]
+endpoints = ["https://etcd:2379"]
+namespace = "/rust-zero"
+service = "greeter"
+username = "${ETCD_USERNAME}"
+password = "${ETCD_PASSWORD}"
+```
+
+The discovery block also accepts `connect_timeout_ms` and an optional `tls` table. gRPC
+transcoding supports unary and newline-delimited server-streaming responses. Client-streaming
+methods are rejected during startup.
 
 Middleware names are resolved by applications embedding `GatewayServer`. They run in declaration
 order, can mutate the outbound request, short-circuit dispatch, and wrap the streamed response;
