@@ -19,13 +19,13 @@ jobs:
       matrix:
         include:
           - name: minimal
-            command: cargo check --workspace --all-targets --no-default-features --locked
+            command: cargo test --workspace --all-targets --no-default-features --locked
           - name: core-adapters
-            command: cargo check -p rust-zero-core --all-targets --features etcd,kubernetes,stores --locked
+            command: cargo test -p rust-zero-core --all-targets --features etcd,kubernetes,stores --locked
           - name: telemetry
-            command: cargo check --workspace --all-targets --features rust-zero-core/telemetry,rust-zero-rest/telemetry,rust-zero-rpc/telemetry --locked
+            command: cargo test --workspace --all-targets --features rust-zero-core/telemetry,rust-zero-rest/telemetry,rust-zero-rpc/telemetry --locked
           - name: all
-            command: cargo check --workspace --all-targets --all-features --locked
+            command: cargo test --workspace --all-targets --all-features --locked
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -171,6 +171,31 @@ jobs:
           done
       - name: Exercise etcd, Redis, SQL, and MongoDB
         run: cargo test -p rust-zero-core --all-features -- --test-threads=1
+
+  etcd-tls:
+    name: etcd TLS (opt-in)
+    runs-on: ubuntu-latest
+    env:
+      RUST_ZERO_ETCD_TLS_ENDPOINT: ${{ secrets.RUST_ZERO_ETCD_TLS_ENDPOINT }}
+      RUST_ZERO_ETCD_CA_PEM: ${{ secrets.RUST_ZERO_ETCD_CA_PEM }}
+      RUST_ZERO_ETCD_DOMAIN_NAME: ${{ secrets.RUST_ZERO_ETCD_DOMAIN_NAME }}
+      RUST_ZERO_ETCD_CLIENT_CERT_PEM: ${{ secrets.RUST_ZERO_ETCD_CLIENT_CERT_PEM }}
+      RUST_ZERO_ETCD_CLIENT_KEY_PEM: ${{ secrets.RUST_ZERO_ETCD_CLIENT_KEY_PEM }}
+    steps:
+      - uses: actions/checkout@v4
+        if: ${{ env.RUST_ZERO_ETCD_TLS_ENDPOINT != '' && env.RUST_ZERO_ETCD_CA_PEM != '' }}
+      - uses: dtolnay/rust-toolchain@stable
+        if: ${{ env.RUST_ZERO_ETCD_TLS_ENDPOINT != '' && env.RUST_ZERO_ETCD_CA_PEM != '' }}
+      - name: Install protobuf compiler
+        if: ${{ env.RUST_ZERO_ETCD_TLS_ENDPOINT != '' && env.RUST_ZERO_ETCD_CA_PEM != '' }}
+        run: sudo apt-get update && sudo apt-get install --yes protobuf-compiler
+      - uses: Swatinem/rust-cache@v2
+        if: ${{ env.RUST_ZERO_ETCD_TLS_ENDPOINT != '' && env.RUST_ZERO_ETCD_CA_PEM != '' }}
+      - name: Exercise opt-in TLS or mTLS etcd
+        if: ${{ env.RUST_ZERO_ETCD_TLS_ENDPOINT != '' && env.RUST_ZERO_ETCD_CA_PEM != '' }}
+        run: >-
+          cargo test -p rust-zero-core --features etcd
+          integration_connects_to_tls_etcd_when_configured -- --nocapture
 
   redis-cluster:
     runs-on: ubuntu-latest

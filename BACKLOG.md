@@ -238,7 +238,7 @@ scale.
   for equivalent REST, gRPC, partial-failure, overload-recovery, discovery, and queue workloads on
   recorded hardware. Define regression thresholds and run enough samples to report medians and
   tail latency rather than leaving the benchmark results directory without a baseline.
-- [ ] **Feature-enabled runtime test matrix.** Run transport and core tests—not only compilation
+- [x] **Feature-enabled runtime test matrix.** Run transport and core tests—not only compilation
   checks—with telemetry and all supported feature combinations. Retain real-backend tests and add
   coverage for gateway TLS/observability plus opt-in etcd TLS where CI credentials permit.
 - [ ] **Large-fleet discovery subsetting.** Add configurable, randomized, stable-enough client-side

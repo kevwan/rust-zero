@@ -1813,6 +1813,84 @@ rpc = "acme.greeter.v1.Greeter.Get"
         std::fs::remove_file(descriptor_path).unwrap();
     }
 
+    #[actix_web::test]
+    async fn configured_https_gateway_keeps_observability_middleware_enabled() {
+        use rcgen::{
+            BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair,
+            KeyUsagePurpose,
+        };
+
+        let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params.key_usages = vec![
+            KeyUsagePurpose::DigitalSignature,
+            KeyUsagePurpose::KeyCertSign,
+            KeyUsagePurpose::CrlSign,
+        ];
+        let ca_key = KeyPair::generate().unwrap();
+        let ca = ca_params.self_signed(&ca_key).unwrap();
+        let server_key = KeyPair::generate().unwrap();
+        let mut server_params = CertificateParams::new(["localhost".to_owned()]).unwrap();
+        server_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        let server_certificate = server_params.signed_by(&server_key, &ca, &ca_key).unwrap();
+
+        let upstream_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let upstream_address = upstream_listener.local_addr().unwrap();
+        let upstream = HttpServer::new(|| {
+            App::new().default_service(web::to(|| async { HttpResponse::Ok().body("secure") }))
+        })
+        .listen(upstream_listener)
+        .unwrap()
+        .run();
+        let upstream_handle = upstream.handle();
+        actix_web::rt::spawn(upstream);
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let gateway = GatewayServer::new(GatewayConfig {
+            routes: vec![route("/api", &[&format!("http://{upstream_address}")])],
+            tls: Some(RestTlsConfig::new(
+                server_certificate.pem(),
+                server_key.serialize_pem(),
+            )),
+            tracing: true,
+            metrics: true,
+            request_ids: true,
+            ..GatewayConfig::default()
+        })
+        .unwrap();
+        let metrics = gateway.metrics();
+        let server = gateway.run_on(listener).unwrap();
+        let server_handle = server.handle();
+        actix_web::rt::spawn(server);
+
+        let root = reqwest::Certificate::from_pem(ca.pem().as_bytes()).unwrap();
+        let client = reqwest::Client::builder()
+            .add_root_certificate(root)
+            .build()
+            .unwrap();
+        let trace_id = "4bf92f3577b34da6a3ce929d0e0e4736";
+        let response = client
+            .get(format!("https://localhost:{}/api/health", address.port()))
+            .header("x-request-id", "gateway-tls")
+            .header("traceparent", format!("00-{trace_id}-00f067aa0ba902b7-01"))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(response.headers()["x-request-id"], "gateway-tls");
+        assert!(response.headers()["traceparent"]
+            .to_str()
+            .unwrap()
+            .starts_with(&format!("00-{trace_id}-")));
+        assert_eq!(response.text().await.unwrap(), "secure");
+        assert!(metrics.render().contains("path=\"/api/{tail:.*}\""));
+
+        server_handle.stop(true).await;
+        upstream_handle.stop(true).await;
+    }
+
     #[test]
     fn rejects_invalid_routes() {
         assert_eq!(

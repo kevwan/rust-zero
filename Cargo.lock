@@ -3965,6 +3965,7 @@ dependencies = [
  "prost-reflect",
  "prost-types 0.13.5",
  "protoc-bin-vendored",
+ "rcgen",
  "reqwest 0.11.16",
  "rust-zero-core",
  "rust-zero-rest",
