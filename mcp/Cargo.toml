@@ -9,7 +9,7 @@ homepage.workspace = true
 readme.workspace = true
 keywords.workspace = true
 categories.workspace = true
-description = "Streamable HTTP Model Context Protocol server runtime for rust-zero"
+description = "Streamable HTTP and legacy SSE Model Context Protocol server runtime for rust-zero"
 documentation = "https://docs.rs/rust-zero-mcp"
 
 [package.metadata.docs.rs]

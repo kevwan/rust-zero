@@ -16,7 +16,7 @@ The public crates are released together at the same version:
 - [`rust-zero-rpc`](https://docs.rs/rust-zero-rpc) — Tonic client/server and discovery integration.
 - [`rust-zero-gateway`](https://docs.rs/rust-zero-gateway) — HTTP proxy and gRPC transcoding.
 - [`rust-zero-mapreduce`](https://docs.rs/rust-zero-mapreduce) — bounded async MapReduce.
-- [`rust-zero-mcp`](https://docs.rs/rust-zero-mcp) — Streamable HTTP MCP server runtime.
+- [`rust-zero-mcp`](https://docs.rs/rust-zero-mcp) — Streamable HTTP and legacy SSE MCP runtime.
 
 Add only the transports and runtimes an application uses. Package names are rust-zero-prefixed;
 the shorter library names keep imports compact:
@@ -65,10 +65,11 @@ runtime free of external-service adapters.
   middleware stack, policies, metrics, and static fallback as the listener-based server.
 - Opt-in authenticated REST body encryption with bounded buffering, a versioned AES-256-GCM
   envelope, explicit rotation-safe key IDs, and application-provided key providers.
-- An MCP 2025-03-26 Streamable HTTP server with validated stateless or expiring stateful sessions,
-  tool/resource/prompt registration, JSON or SSE responses, resumable GET event streams, explicit
-  termination, cancellation, protocol errors, request deadlines, origin validation, graceful
-  draining, and handler access to projected HTTP request metadata.
+- An MCP server with explicitly selectable 2025-03-26 Streamable HTTP and legacy 2024-11-05
+  HTTP+SSE transports, validated stateless or expiring stateful sessions, tool/resource/prompt
+  registration, JSON or SSE responses, resumable GET event streams, explicit termination,
+  cancellation, protocol errors, request deadlines, origin validation, graceful draining, and
+  handler access to projected HTTP request metadata.
 - Tonic-based gRPC client and server builders with global, service, and exact-method deadlines,
   automatic renewable etcd registration and graceful withdrawal, connection concurrency, and stream
   limits plus gRPC health reporting, bearer/JWT/signature interceptors, and backend-neutral dynamic
@@ -143,8 +144,8 @@ runtime free of external-service adapters.
 Configuration files may use JSON, JSON5, TOML, YAML, or YML. JSON5 supports comments, trailing
 commas, single-quoted strings, and unquoted object keys while retaining environment expansion.
 
-Run the stateful MCP example, which registers a tool, resource, and prompt and uses the shared
-signal-aware service supervisor:
+Run the stateful dual-transport MCP example, which exposes `/mcp`, `/sse`, and `/message`, registers
+a tool, resource, and prompt, and uses the shared signal-aware service supervisor:
 
 ```bash
 cargo run -p rust-zero-mcp --example server

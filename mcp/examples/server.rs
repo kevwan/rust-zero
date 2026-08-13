@@ -1,5 +1,7 @@
 use rust_zero_core::ServiceGroup;
-use rust_zero_mcp::{McpServer, McpServerConfig, Prompt, PromptArgument, Resource, Tool};
+use rust_zero_mcp::{
+    McpServer, McpServerConfig, McpTransport, Prompt, PromptArgument, Resource, Tool,
+};
 use serde_json::json;
 use std::{error::Error, time::Duration};
 
@@ -7,6 +9,7 @@ use std::{error::Error, time::Duration};
 async fn main() -> Result<(), Box<dyn Error>> {
     let server = McpServer::new(McpServerConfig {
         stateful: true,
+        transport: McpTransport::Both,
         ..McpServerConfig::default()
     })?;
 

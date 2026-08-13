@@ -49,7 +49,7 @@ complete, the project claims **broad runtime coverage**, not full runtime parity
 
 ### P2 — compatibility
 
-- [ ] **Legacy MCP SSE transport.** Add the MCP 2024-11-05 SSE transport alongside the implemented
+- [x] **Legacy MCP SSE transport.** Add the MCP 2024-11-05 SSE transport alongside the implemented
   2025-03-26 Streamable HTTP transport for older clients, with explicit transport selection and
   protocol-version tests.
 
@@ -201,14 +201,13 @@ complete, the project claims **broad runtime coverage**, not full runtime parity
 
 ## Recommended execution order
 
-The reopened P0 runtime items and standard-stack CORS are complete. Add legacy MCP SSE only where
-older-client compatibility is required. Durable brokers and the `goctl` developer toolchain remain
-intentional ecosystem boundaries.
+The reopened runtime items are complete. Legacy MCP SSE is opt-in for older-client compatibility.
+Durable brokers and the `goctl` developer toolchain remain intentional ecosystem boundaries.
 
 ## Remaining catch-up items
 
 `goctl` and all other code generation remain outside this runtime catch-up scope. MCP Streamable
-HTTP is covered; only its legacy SSE compatibility transport remains above.
+HTTP and its opt-in legacy SSE compatibility transport are covered.
 
 ### P0 — runtime semantics
 
@@ -258,6 +257,9 @@ HTTP is covered; only its legacy SSE compatibility transport remains above.
 
 ## Recently completed
 
+- [x] Explicitly selectable MCP 2025-03-26 Streamable HTTP and 2024-11-05 HTTP+SSE transports,
+  including separate legacy connection/message endpoints, session-specific endpoint discovery,
+  asynchronous SSE responses, origin validation, and protocol-version integration tests.
 - [x] End-to-end TLS/mTLS configuration for the standard REST and gRPC server/client transports and
   authenticated etcd, including private-key redaction, PEM/identity validation, CA and hostname
   verification, direct REST Rustls and live gRPC mutual handshakes, and opt-in real-etcd TLS CI.

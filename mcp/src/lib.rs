@@ -1,8 +1,8 @@
 //! Model Context Protocol server support.
 //!
-//! This crate starts with the stateless form of the 2025-03-26 Streamable HTTP
-//! transport. A server can be mounted in any Actix application and shares its
-//! normal middleware, listener, and graceful-shutdown lifecycle.
+//! Supports the 2025-03-26 Streamable HTTP transport and the legacy 2024-11-05
+//! HTTP+SSE transport. A server can be mounted in any Actix application and
+//! shares its normal middleware, listener, and graceful-shutdown lifecycle.
 
 use actix_web::{
     http::{header, StatusCode},
@@ -31,8 +31,32 @@ use tokio::sync::broadcast;
 use uuid::Uuid;
 
 pub const LATEST_PROTOCOL_VERSION: &str = "2025-03-26";
+pub const LEGACY_PROTOCOL_VERSION: &str = "2024-11-05";
 
-/// Configuration for a Streamable HTTP endpoint.
+/// HTTP transport endpoints installed by [`McpServer::configure`].
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpTransport {
+    /// The current single-endpoint 2025-03-26 transport.
+    #[default]
+    StreamableHttp,
+    /// The deprecated two-endpoint 2024-11-05 HTTP+SSE transport.
+    LegacySse,
+    /// Install both transports for old and new clients.
+    Both,
+}
+
+impl McpTransport {
+    fn streamable_http(self) -> bool {
+        matches!(self, Self::StreamableHttp | Self::Both)
+    }
+
+    fn legacy_sse(self) -> bool {
+        matches!(self, Self::LegacySse | Self::Both)
+    }
+}
+
+/// Configuration for the MCP HTTP transports.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct McpServerConfig {
@@ -40,6 +64,12 @@ pub struct McpServerConfig {
     pub workers: usize,
     pub shutdown_timeout_ms: u64,
     pub endpoint: String,
+    /// Selects which HTTP transport routes are installed.
+    pub transport: McpTransport,
+    /// Legacy HTTP+SSE connection endpoint.
+    pub legacy_sse_endpoint: String,
+    /// Legacy HTTP+SSE client-to-server message endpoint.
+    pub legacy_message_endpoint: String,
     pub name: String,
     pub version: String,
     pub message_timeout_ms: u64,
@@ -61,6 +91,9 @@ impl Default for McpServerConfig {
             workers: 1,
             shutdown_timeout_ms: 30_000,
             endpoint: "/mcp".into(),
+            transport: McpTransport::StreamableHttp,
+            legacy_sse_endpoint: "/sse".into(),
+            legacy_message_endpoint: "/message".into(),
             name: "rust-zero-mcp".into(),
             version: "1.0.0".into(),
             message_timeout_ms: 30_000,
@@ -80,8 +113,27 @@ impl McpServerConfig {
         if self.shutdown_timeout_ms == 0 {
             return Err(McpConfigError("shutdown_timeout_ms must be positive"));
         }
-        if !self.endpoint.starts_with('/') || self.endpoint.contains('?') {
+        if self.transport.streamable_http()
+            && (!self.endpoint.starts_with('/') || self.endpoint.contains('?'))
+        {
             return Err(McpConfigError("endpoint must be an absolute path"));
+        }
+        if self.transport.legacy_sse()
+            && (!is_absolute_path(&self.legacy_sse_endpoint)
+                || !is_absolute_path(&self.legacy_message_endpoint))
+        {
+            return Err(McpConfigError(
+                "legacy endpoints must be absolute paths without queries",
+            ));
+        }
+        if self.transport.legacy_sse() && self.legacy_sse_endpoint == self.legacy_message_endpoint {
+            return Err(McpConfigError("legacy endpoints must be distinct"));
+        }
+        if self.transport == McpTransport::Both
+            && (self.endpoint == self.legacy_sse_endpoint
+                || self.endpoint == self.legacy_message_endpoint)
+        {
+            return Err(McpConfigError("transport endpoints must be distinct"));
         }
         if self.name.trim().is_empty() {
             return Err(McpConfigError("name must not be empty"));
@@ -359,9 +411,18 @@ impl Session {
         self: &Arc<Self>,
         after: u64,
     ) -> Pin<Box<dyn Stream<Item = Result<web::Bytes, actix_web::Error>>>> {
+        self.event_stream_after(after, VecDeque::new())
+    }
+
+    fn event_stream_after(
+        self: &Arc<Self>,
+        after: u64,
+        prefix: VecDeque<web::Bytes>,
+    ) -> Pin<Box<dyn Stream<Item = Result<web::Bytes, actix_web::Error>>>> {
         struct State {
             session: Arc<Session>,
             _active: ActiveStream,
+            prefix: VecDeque<web::Bytes>,
             replay: VecDeque<StoredEvent>,
             receiver: broadcast::Receiver<SessionEvent>,
             last_id: u64,
@@ -380,12 +441,16 @@ impl Session {
         let state = State {
             session: self.clone(),
             _active: ActiveStream(self.clone()),
+            prefix,
             replay,
             receiver,
             last_id: after,
         };
         Box::pin(futures::stream::unfold(state, |mut state| async move {
             loop {
+                if let Some(event) = state.prefix.pop_front() {
+                    return Some((Ok(event), state));
+                }
                 if let Some(event) = state.replay.pop_front() {
                     state.last_id = event.id;
                     return Some((Ok(sse_event(&event)), state));
@@ -430,7 +495,7 @@ struct Sessions {
     values: RwLock<HashMap<String, Arc<Session>>>,
 }
 
-/// Cloneable MCP protocol core and Actix Streamable HTTP handler.
+/// Cloneable MCP protocol core and Actix HTTP transport handler.
 #[derive(Clone)]
 pub struct McpServer {
     config: McpServerConfig,
@@ -492,13 +557,28 @@ impl McpServer {
 
     /// Mounts the configured MCP endpoint on an Actix application.
     pub fn configure(&self, service: &mut web::ServiceConfig) {
-        service.service(
-            web::resource(self.config.endpoint.clone())
-                .app_data(web::Data::new(self.clone()))
-                .route(web::post().to(Self::http_post))
-                .route(web::get().to(Self::http_get))
-                .route(web::delete().to(Self::http_delete)),
-        );
+        let data = web::Data::new(self.clone());
+        if self.config.transport.streamable_http() {
+            service.service(
+                web::resource(self.config.endpoint.clone())
+                    .app_data(data.clone())
+                    .route(web::post().to(Self::http_post))
+                    .route(web::get().to(Self::http_get))
+                    .route(web::delete().to(Self::http_delete)),
+            );
+        }
+        if self.config.transport.legacy_sse() {
+            service.service(
+                web::resource(self.config.legacy_sse_endpoint.clone())
+                    .app_data(data.clone())
+                    .route(web::get().to(Self::legacy_sse_get)),
+            );
+            service.service(
+                web::resource(self.config.legacy_message_endpoint.clone())
+                    .app_data(data)
+                    .route(web::post().to(Self::legacy_message_post)),
+            );
+        }
     }
 
     /// Binds the configured address and starts a standalone MCP HTTP server.
@@ -626,6 +706,124 @@ impl McpServer {
         }
     }
 
+    fn legacy_request_session(&self, request: &HttpRequest) -> Result<Arc<Session>, HttpResponse> {
+        self.remove_expired_sessions();
+        let id = web::Query::<HashMap<String, String>>::from_query(request.query_string())
+            .ok()
+            .and_then(|query| query.get("sessionId").cloned());
+        let Some(id) = id else {
+            return Err(HttpResponse::BadRequest().json(error_response(
+                Value::Null,
+                McpError::new(-32600, "sessionId query parameter is required"),
+            )));
+        };
+        match self.sessions.values.read().unwrap().get(&id).cloned() {
+            Some(session) => {
+                session.touch();
+                Ok(session)
+            }
+            None => Err(HttpResponse::NotFound().json(error_response(
+                Value::Null,
+                McpError::new(-32002, "session not found or expired"),
+            ))),
+        }
+    }
+
+    async fn legacy_sse_get(server: web::Data<Self>, request: HttpRequest) -> HttpResponse {
+        if let Some(response) = server.reject_origin(&request) {
+            return response;
+        }
+        let accepts_sse = request
+            .headers()
+            .get(header::ACCEPT)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.contains("text/event-stream"));
+        if !accepts_sse {
+            return HttpResponse::NotAcceptable().finish();
+        }
+
+        let session = server.create_session();
+        let endpoint = format!(
+            "{}?sessionId={}",
+            server.config.legacy_message_endpoint, session.id
+        );
+        let prefix = VecDeque::from([web::Bytes::from(format!(
+            "event: endpoint\ndata: {endpoint}\n\n"
+        ))]);
+        HttpResponse::Ok()
+            .insert_header((header::CONTENT_TYPE, "text/event-stream"))
+            .insert_header((header::CACHE_CONTROL, "no-cache"))
+            .streaming(session.event_stream_after(0, prefix))
+    }
+
+    async fn legacy_message_post(
+        server: web::Data<Self>,
+        request: HttpRequest,
+        body: web::Bytes,
+    ) -> HttpResponse {
+        if let Some(response) = server.reject_origin(&request) {
+            return response;
+        }
+        if !has_json_content_type(&request) {
+            return HttpResponse::UnsupportedMediaType().json(error_response(
+                Value::Null,
+                McpError::new(-32600, "Content-Type must be application/json"),
+            ));
+        }
+        let message = match parse_json_rpc(&body) {
+            Ok(message) => message,
+            Err(response) => return response,
+        };
+        let session = match server.legacy_request_session(&request) {
+            Ok(session) => session,
+            Err(response) => return response,
+        };
+
+        if message.id.is_none() {
+            if message.method == "notifications/cancelled" {
+                if let Some(request_id) = message.params.get("requestId") {
+                    session.cancel(request_id);
+                }
+            }
+            return HttpResponse::Accepted().finish();
+        }
+
+        let id = message.id.unwrap();
+        let metadata = RequestMetadata::from_request(&request);
+        let (abort_handle, abort_registration) = AbortHandle::new_pair();
+        session
+            .requests
+            .lock()
+            .unwrap()
+            .insert(request_key(&id), abort_handle);
+        let server = server.get_ref().clone();
+        actix_web::rt::spawn(async move {
+            let outcome = actix_web::rt::time::timeout(
+                Duration::from_millis(server.config.message_timeout_ms),
+                Abortable::new(
+                    server.dispatch(
+                        &message.method,
+                        metadata,
+                        message.params,
+                        LEGACY_PROTOCOL_VERSION,
+                    ),
+                    abort_registration,
+                ),
+            )
+            .await;
+            session.requests.lock().unwrap().remove(&request_key(&id));
+            session.touch();
+            let response = match outcome {
+                Ok(Ok(Ok(result))) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
+                Ok(Ok(Err(error))) => error_response(id, error),
+                Ok(Err(_)) => error_response(id, McpError::new(-32800, "request cancelled")),
+                Err(_) => error_response(id, McpError::new(-32001, "request timed out")),
+            };
+            session.publish(response);
+        });
+        HttpResponse::Accepted().finish()
+    }
+
     async fn http_get(server: web::Data<Self>, request: HttpRequest) -> HttpResponse {
         if let Some(response) = server.reject_origin(&request) {
             return response;
@@ -706,34 +904,17 @@ impl McpServer {
             return response;
         }
 
-        let content_type_ok = request
-            .headers()
-            .get(header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| value.split(';').next() == Some("application/json"));
-        if !content_type_ok {
+        if !has_json_content_type(&request) {
             return HttpResponse::UnsupportedMediaType().json(error_response(
                 Value::Null,
                 McpError::new(-32600, "Content-Type must be application/json"),
             ));
         }
 
-        let message: JsonRpcRequest = match serde_json::from_slice(&body) {
+        let message = match parse_json_rpc(&body) {
             Ok(message) => message,
-            Err(error) => {
-                return HttpResponse::BadRequest().json(error_response(
-                    Value::Null,
-                    McpError::new(-32700, "parse error")
-                        .with_data(json!({"detail": error.to_string()})),
-                ));
-            }
+            Err(response) => return response,
         };
-        if message.jsonrpc != "2.0" || message.method.is_empty() {
-            return HttpResponse::BadRequest().json(error_response(
-                message.id.unwrap_or(Value::Null),
-                McpError::new(-32600, "invalid JSON-RPC request"),
-            ));
-        }
 
         let session = if server.config.stateful {
             if message.method == "initialize" {
@@ -773,7 +954,12 @@ impl McpServer {
         let outcome = actix_web::rt::time::timeout(
             Duration::from_millis(server.config.message_timeout_ms),
             Abortable::new(
-                server.dispatch(&message.method, metadata, message.params),
+                server.dispatch(
+                    &message.method,
+                    metadata,
+                    message.params,
+                    LATEST_PROTOCOL_VERSION,
+                ),
                 abort_registration,
             ),
         )
@@ -831,10 +1017,11 @@ impl McpServer {
         method: &str,
         metadata: RequestMetadata,
         params: Value,
+        protocol_version: &'static str,
     ) -> Result<Value, McpError> {
         match method {
             "initialize" => Ok(json!({
-                "protocolVersion": LATEST_PROTOCOL_VERSION,
+                "protocolVersion": protocol_version,
                 "capabilities": {
                     "tools": {"listChanged": false},
                     "resources": {"subscribe": false, "listChanged": false},
@@ -931,6 +1118,34 @@ struct JsonRpcRequest {
     params: Value,
 }
 
+fn is_absolute_path(path: &str) -> bool {
+    path.starts_with('/') && !path.contains('?')
+}
+
+fn has_json_content_type(request: &HttpRequest) -> bool {
+    request
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.split(';').next() == Some("application/json"))
+}
+
+fn parse_json_rpc(body: &[u8]) -> Result<JsonRpcRequest, HttpResponse> {
+    let message: JsonRpcRequest = serde_json::from_slice(body).map_err(|error| {
+        HttpResponse::BadRequest().json(error_response(
+            Value::Null,
+            McpError::new(-32700, "parse error").with_data(json!({"detail": error.to_string()})),
+        ))
+    })?;
+    if message.jsonrpc != "2.0" || message.method.is_empty() {
+        return Err(HttpResponse::BadRequest().json(error_response(
+            message.id.unwrap_or(Value::Null),
+            McpError::new(-32600, "invalid JSON-RPC request"),
+        )));
+    }
+    Ok(message)
+}
+
 fn empty_object() -> Value {
     json!({})
 }
@@ -983,6 +1198,29 @@ mod tests {
             },
         );
         server
+    }
+
+    #[actix_web::test]
+    async fn deserializes_and_validates_transport_selection() {
+        let config: McpServerConfig = serde_json::from_value(json!({
+            "transport": "both",
+            "endpoint": "/mcp",
+            "legacy_sse_endpoint": "/events",
+            "legacy_message_endpoint": "/send"
+        }))
+        .unwrap();
+        assert_eq!(config.transport, McpTransport::Both);
+        config.validate().unwrap();
+
+        let invalid = McpServerConfig {
+            transport: McpTransport::Both,
+            legacy_sse_endpoint: "/mcp".into(),
+            ..McpServerConfig::default()
+        };
+        assert_eq!(
+            invalid.validate().unwrap_err().to_string(),
+            "transport endpoints must be distinct"
+        );
     }
 
     #[actix_web::test]
@@ -1173,6 +1411,91 @@ mod tests {
             .to_request();
         let response = test::call_service(&app, rejected).await;
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[actix_web::test]
+    async fn legacy_sse_announces_message_endpoint_and_uses_legacy_protocol() {
+        let server = McpServer::new(McpServerConfig {
+            transport: McpTransport::Both,
+            ..McpServerConfig::default()
+        })
+        .unwrap();
+        let app = test::init_service(App::new().configure(|cfg| server.configure(cfg))).await;
+
+        let connect = test::TestRequest::get()
+            .uri("/sse")
+            .insert_header((header::ACCEPT, "text/event-stream"))
+            .to_request();
+        let response = test::call_service(&app, connect).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut stream = response.into_body();
+        let endpoint = poll_fn(|cx| Pin::new(&mut stream).poll_next(cx))
+            .await
+            .unwrap()
+            .unwrap();
+        let endpoint = std::str::from_utf8(&endpoint).unwrap();
+        assert!(endpoint.starts_with("event: endpoint\ndata: /message?sessionId="));
+        let message_uri = endpoint
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .unwrap();
+
+        let initialize = test::TestRequest::post()
+            .uri(message_uri)
+            .insert_header((header::CONTENT_TYPE, "application/json"))
+            .set_json(json!({"jsonrpc":"2.0","id":1,"method":"initialize"}))
+            .to_request();
+        assert_eq!(
+            test::call_service(&app, initialize).await.status(),
+            StatusCode::ACCEPTED
+        );
+
+        let message = poll_fn(|cx| Pin::new(&mut stream).poll_next(cx))
+            .await
+            .unwrap()
+            .unwrap();
+        let message = std::str::from_utf8(&message).unwrap();
+        assert!(message.contains("event: message"));
+        let payload: Value = serde_json::from_str(
+            message
+                .lines()
+                .find_map(|line| line.strip_prefix("data: "))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            payload["result"]["protocolVersion"],
+            LEGACY_PROTOCOL_VERSION
+        );
+    }
+
+    #[actix_web::test]
+    async fn transport_selection_only_installs_selected_routes() {
+        let server = McpServer::new(McpServerConfig {
+            transport: McpTransport::LegacySse,
+            ..McpServerConfig::default()
+        })
+        .unwrap();
+        let app = test::init_service(App::new().configure(|cfg| server.configure(cfg))).await;
+
+        let streamable = test::TestRequest::post()
+            .uri("/mcp")
+            .insert_header((header::CONTENT_TYPE, "application/json"))
+            .set_json(json!({"jsonrpc":"2.0","id":1,"method":"initialize"}))
+            .to_request();
+        assert_eq!(
+            test::call_service(&app, streamable).await.status(),
+            StatusCode::NOT_FOUND
+        );
+
+        let legacy = test::TestRequest::get()
+            .uri("/sse")
+            .insert_header((header::ACCEPT, "text/event-stream"))
+            .to_request();
+        assert_eq!(
+            test::call_service(&app, legacy).await.status(),
+            StatusCode::OK
+        );
     }
 
     fn stateful_server() -> McpServer {
