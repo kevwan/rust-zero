@@ -1,8 +1,8 @@
 use crate::{
     route::RoutePolicies, AdaptiveLoadShed, ConcurrencyLimit, ContentEncryption, HttpMetrics,
-    LoggingMiddleware, MetricsMiddleware, MultipartConfig, Recover, RequestBodyLimit, RequestId,
-    ResponsePolicy, RouteGroupConfig, RouteMiddleware, SecurityHeaders, ServerCircuitBreaker,
-    StaticAssets, Timeout, TraceContextMiddleware,
+    LoggingMiddleware, MetricsMiddleware, MultipartConfig, RateLimit, Recover, RequestBodyLimit,
+    RequestId, ResponsePolicy, RouteGroupConfig, RouteMiddleware, SecurityHeaders,
+    ServerCircuitBreaker, StaticAssets, Timeout, TraceContextMiddleware,
 };
 use actix_cors::Cors;
 use actix_web::{
@@ -373,6 +373,14 @@ macro_rules! standard_app {
         if config.metrics {
             server_breaker = server_breaker.with_metrics(http_metrics.clone());
         }
+        let rate_limit_enabled = config.rate_limit_requests_per_second.is_some();
+        let mut rate_limit = RateLimit::new(
+            config.rate_limit_requests_per_second.unwrap_or(1),
+            config.rate_limit_burst.unwrap_or(1),
+        );
+        if config.metrics {
+            rate_limit = rate_limit.with_metrics(http_metrics.clone());
+        }
         let cors_enabled = config.cors.is_some();
         let cors = config
             .cors
@@ -400,6 +408,7 @@ macro_rules! standard_app {
                 MetricsMiddleware::new(http_metrics),
             ))
             .wrap(timeout)
+            .wrap(Condition::new(rate_limit_enabled, rate_limit))
             .wrap(concurrency)
             .wrap(Condition::new(config.adaptive_load_shedding, adaptive_load))
             .wrap(Condition::new(
@@ -508,6 +517,10 @@ pub struct RestServerConfig {
     pub multipart_temp_dir: Option<PathBuf>,
     pub max_concurrent_requests: usize,
     pub priority_concurrency_reserve: usize,
+    /// Optional process-local token-bucket refill rate. Set together with `rate_limit_burst`.
+    pub rate_limit_requests_per_second: Option<u32>,
+    /// Optional process-local token-bucket capacity. Set together with the refill rate.
+    pub rate_limit_burst: Option<u32>,
     pub adaptive_load_shedding: bool,
     pub server_circuit_breaking: bool,
     pub load_shed_cpu_threshold_percent: u8,
@@ -543,6 +556,8 @@ impl Default for RestServerConfig {
             multipart_temp_dir: None,
             max_concurrent_requests: 1_024,
             priority_concurrency_reserve: 256,
+            rate_limit_requests_per_second: None,
+            rate_limit_burst: None,
             adaptive_load_shedding: true,
             server_circuit_breaking: true,
             load_shed_cpu_threshold_percent: 90,
@@ -624,6 +639,21 @@ impl RestServerConfig {
         if self.priority_concurrency_reserve == 0 {
             return Err(RestServerConfigError::Invalid(
                 "priority_concurrency_reserve must be greater than zero",
+            ));
+        }
+        if self.rate_limit_requests_per_second.is_some() != self.rate_limit_burst.is_some() {
+            return Err(RestServerConfigError::Invalid(
+                "rate_limit_requests_per_second and rate_limit_burst must be configured together",
+            ));
+        }
+        if self.rate_limit_requests_per_second == Some(0) {
+            return Err(RestServerConfigError::Invalid(
+                "rate_limit_requests_per_second must be greater than zero",
+            ));
+        }
+        if self.rate_limit_burst == Some(0) {
+            return Err(RestServerConfigError::Invalid(
+                "rate_limit_burst must be greater than zero",
             ));
         }
         if !(1..=100).contains(&self.load_shed_cpu_threshold_percent) {
@@ -981,6 +1011,8 @@ mod tests {
 address = "127.0.0.1:9000"
 workers = 2
 request_timeout_ms = 250
+rate_limit_requests_per_second = 100
+rate_limit_burst = 25
 adaptive_load_shedding = true
 load_shed_cpu_threshold_percent = 85
 load_shed_bucket_ms = 250
@@ -1019,6 +1051,8 @@ priority = true
         assert_eq!(config.address, "127.0.0.1:9000".parse().unwrap());
         assert_eq!(config.workers, 2);
         assert_eq!(config.request_timeout_ms, 250);
+        assert_eq!(config.rate_limit_requests_per_second, Some(100));
+        assert_eq!(config.rate_limit_burst, Some(25));
         assert!(config.adaptive_load_shedding);
         assert_eq!(config.load_shed_cpu_threshold_percent, 85);
         assert_eq!(config.load_shed_bucket_ms, 250);
@@ -1074,6 +1108,15 @@ priority = true
         assert!(error
             .to_string()
             .contains("load_shed_cpu_threshold_percent"));
+
+        let error = RestServer::new(RestServerConfig {
+            rate_limit_requests_per_second: Some(1),
+            rate_limit_burst: None,
+            ..RestServerConfig::default()
+        })
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("configured together"));
 
         for cors in [
             RestCorsConfig::new(["https://frontend.example/path"]),
@@ -1236,6 +1279,42 @@ priority = true
         assert!(response.headers().contains_key("x-request-id"));
         assert!(response.headers().contains_key("traceparent"));
         assert!(metrics.render().contains("http_requests_total"));
+    }
+
+    #[actix_rt::test]
+    async fn configured_standard_stack_enforces_rate_limit() {
+        let handler = RestServer::new(RestServerConfig {
+            rate_limit_requests_per_second: Some(1),
+            rate_limit_burst: Some(1),
+            ..RestServerConfig::default()
+        })
+        .unwrap()
+        .serverless_handler(|routes| {
+            routes.route("/limited", web::get().to(HttpResponse::Ok));
+        })
+        .await
+        .unwrap();
+
+        let first = handler
+            .call(ServerlessRequest::new(
+                Method::GET,
+                Uri::from_static("/limited"),
+                web::Bytes::new(),
+            ))
+            .await
+            .unwrap();
+        let second = handler
+            .call(ServerlessRequest::new(
+                Method::GET,
+                Uri::from_static("/limited"),
+                web::Bytes::new(),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(first.status, StatusCode::OK);
+        assert_eq!(second.status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(second.headers.get("retry-after").unwrap(), "1");
     }
 
     #[actix_rt::test]

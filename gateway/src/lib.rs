@@ -9,9 +9,13 @@ pub use transcode::{
 
 use actix_web::{
     http::{header, StatusCode},
-    web, App, HttpRequest, HttpResponse, HttpServer,
+    web, HttpRequest, HttpResponse,
 };
 use futures::{future::LocalBoxFuture, StreamExt};
+use rest::{
+    RestCorsConfig, RestServer, RestServerConfig, RestServerConfigError, RestTlsConfig,
+    RouteGroupConfig,
+};
 use rpc::{RpcClient, RpcClientConfig, RpcClientTlsConfig};
 use rust_zero_core::{
     EndpointChangeFuture, EndpointSubscription, EtcdClient, EtcdConfig, EtcdTlsConfig,
@@ -62,6 +66,28 @@ pub struct GatewayConfig {
     pub shutdown_timeout_ms: u64,
     pub request_body_limit: usize,
     pub response_body_limit: usize,
+    pub max_concurrent_requests: usize,
+    pub priority_concurrency_reserve: usize,
+    pub rate_limit_requests_per_second: Option<u32>,
+    pub rate_limit_burst: Option<u32>,
+    pub adaptive_load_shedding: bool,
+    pub server_circuit_breaking: bool,
+    pub load_shed_cpu_threshold_percent: u8,
+    pub load_shed_bucket_ms: u64,
+    pub load_shed_buckets: usize,
+    pub load_shed_cooldown_ms: u64,
+    pub logging: bool,
+    pub recovery: bool,
+    pub tracing: bool,
+    pub metrics: bool,
+    pub security_headers: bool,
+    pub request_ids: bool,
+    pub decompress_gzip: bool,
+    pub metrics_namespace: String,
+    pub tls: Option<RestTlsConfig>,
+    pub cors: Option<RestCorsConfig>,
+    /// Declarative authentication and per-route policy for proxy/transcoding route patterns.
+    pub route_groups: Vec<RouteGroupConfig>,
     pub routes: Vec<GatewayRoute>,
     /// Descriptor-driven JSON/HTTP to gRPC upstreams mounted by path prefix.
     pub grpc: Vec<GatewayGrpcUpstream>,
@@ -69,6 +95,7 @@ pub struct GatewayConfig {
 
 impl Default for GatewayConfig {
     fn default() -> Self {
+        let rest = RestServerConfig::default();
         Self {
             address: default_address(),
             workers: default_workers(),
@@ -76,6 +103,27 @@ impl Default for GatewayConfig {
             shutdown_timeout_ms: default_timeout_ms(),
             request_body_limit: default_request_body_limit(),
             response_body_limit: default_response_body_limit(),
+            max_concurrent_requests: rest.max_concurrent_requests,
+            priority_concurrency_reserve: rest.priority_concurrency_reserve,
+            rate_limit_requests_per_second: rest.rate_limit_requests_per_second,
+            rate_limit_burst: rest.rate_limit_burst,
+            adaptive_load_shedding: rest.adaptive_load_shedding,
+            server_circuit_breaking: rest.server_circuit_breaking,
+            load_shed_cpu_threshold_percent: rest.load_shed_cpu_threshold_percent,
+            load_shed_bucket_ms: rest.load_shed_bucket_ms,
+            load_shed_buckets: rest.load_shed_buckets,
+            load_shed_cooldown_ms: rest.load_shed_cooldown_ms,
+            logging: rest.logging,
+            recovery: rest.recovery,
+            tracing: rest.tracing,
+            metrics: rest.metrics,
+            security_headers: rest.security_headers,
+            request_ids: rest.request_ids,
+            decompress_gzip: rest.decompress_gzip,
+            metrics_namespace: rest.metrics_namespace,
+            tls: rest.tls,
+            cors: rest.cors,
+            route_groups: rest.route_groups,
             routes: Vec::new(),
             grpc: Vec::new(),
         }
@@ -83,6 +131,43 @@ impl Default for GatewayConfig {
 }
 
 impl GatewayConfig {
+    fn rest_config(&self) -> RestServerConfig {
+        let mut config = RestServerConfig::default();
+        config.address = self.address;
+        config.workers = self.workers;
+        config.shutdown_timeout_ms = self.shutdown_timeout_ms;
+        config.request_timeout_ms = self.request_timeout_ms;
+        config.max_body_bytes = self.request_body_limit;
+        config.max_multipart_field_bytes = config
+            .max_multipart_field_bytes
+            .min(self.request_body_limit);
+        config.max_multipart_file_bytes =
+            config.max_multipart_file_bytes.min(self.request_body_limit);
+        config.max_multipart_total_bytes = self.request_body_limit;
+        config.max_concurrent_requests = self.max_concurrent_requests;
+        config.priority_concurrency_reserve = self.priority_concurrency_reserve;
+        config.rate_limit_requests_per_second = self.rate_limit_requests_per_second;
+        config.rate_limit_burst = self.rate_limit_burst;
+        config.adaptive_load_shedding = self.adaptive_load_shedding;
+        config.server_circuit_breaking = self.server_circuit_breaking;
+        config.load_shed_cpu_threshold_percent = self.load_shed_cpu_threshold_percent;
+        config.load_shed_bucket_ms = self.load_shed_bucket_ms;
+        config.load_shed_buckets = self.load_shed_buckets;
+        config.load_shed_cooldown_ms = self.load_shed_cooldown_ms;
+        config.logging = self.logging;
+        config.recovery = self.recovery;
+        config.tracing = self.tracing;
+        config.metrics = self.metrics;
+        config.security_headers = self.security_headers;
+        config.request_ids = self.request_ids;
+        config.decompress_gzip = self.decompress_gzip;
+        config.metrics_namespace = self.metrics_namespace.clone();
+        config.tls = self.tls.clone();
+        config.cors = self.cors.clone();
+        config.route_groups = self.route_groups.clone();
+        config
+    }
+
     pub fn load(path: impl AsRef<Path>) -> Result<Self, GatewayConfigError> {
         let config: Self = rust_zero_core::load_config(path).map_err(GatewayConfigError::Load)?;
         config.validate()?;
@@ -110,6 +195,9 @@ impl GatewayConfig {
                 "gateway body limits must be greater than zero",
             ));
         }
+        self.rest_config()
+            .validate()
+            .map_err(GatewayConfigError::Rest)?;
         if self.routes.is_empty() && self.grpc.is_empty() {
             return Err(GatewayConfigError::Invalid(
                 "at least one HTTP or gRPC gateway route is required",
@@ -358,6 +446,7 @@ pub enum GatewayConfigError {
     Transcode(TranscodeError),
     Rpc(rpc::RpcClientError),
     Etcd(rust_zero_core::EtcdError),
+    Rest(RestServerConfigError),
 }
 
 impl std::fmt::Display for GatewayConfigError {
@@ -375,6 +464,7 @@ impl std::fmt::Display for GatewayConfigError {
             }
             Self::Rpc(error) => write!(formatter, "failed to configure gRPC upstream: {error}"),
             Self::Etcd(error) => write!(formatter, "failed to configure gRPC discovery: {error}"),
+            Self::Rest(error) => write!(formatter, "failed to configure gateway server: {error}"),
         }
     }
 }
@@ -388,6 +478,7 @@ impl std::error::Error for GatewayConfigError {
             Self::Transcode(error) => Some(error),
             Self::Rpc(error) => Some(error),
             Self::Etcd(error) => Some(error),
+            Self::Rest(error) => Some(error),
             Self::Middleware(_) | Self::Invalid(_) => None,
         }
     }
@@ -821,6 +912,7 @@ async fn dispatch_upstream(
 /// Configuration-driven Actix gateway with bounded graceful draining.
 pub struct GatewayServer {
     config: GatewayConfig,
+    rest: RestServer,
     proxy: GatewayProxy,
     grpc: Vec<(String, Transcoder)>,
 }
@@ -840,8 +932,10 @@ impl GatewayServer {
             .with_request_body_limit(config.request_body_limit)
             .with_response_body_limit(config.response_body_limit)
             .with_timeout(Duration::from_millis(config.request_timeout_ms));
+        let rest = RestServer::new(config.rest_config()).map_err(GatewayConfigError::Rest)?;
         Ok(Self {
             config,
+            rest,
             proxy,
             grpc: Vec::new(),
         })
@@ -911,8 +1005,10 @@ impl GatewayServer {
             grpc.push((upstream.prefix.clone(), transcoder));
         }
         grpc.sort_unstable_by_key(|(prefix, _)| Reverse(prefix.len()));
+        let rest = RestServer::new(config.rest_config()).map_err(GatewayConfigError::Rest)?;
         Ok(Self {
             config,
+            rest,
             proxy,
             grpc,
         })
@@ -931,6 +1027,11 @@ impl GatewayServer {
         Ok(self)
     }
 
+    /// Returns the registry populated by the standard gateway HTTP metrics middleware.
+    pub fn metrics(&self) -> Arc<rust_zero_core::Metrics> {
+        self.rest.metrics()
+    }
+
     pub fn run(&self) -> io::Result<actix_web::dev::Server> {
         self.proxy
             .validate_middleware()
@@ -945,31 +1046,39 @@ impl GatewayServer {
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
         let proxy = self.proxy.clone();
         let grpc = self.grpc.clone();
-        let workers = self.config.workers;
-        let request_body_limit = self.config.request_body_limit;
-        let shutdown_seconds = self.config.shutdown_timeout_ms.div_ceil(1_000);
-        HttpServer::new(move || {
-            App::new()
-                .app_data(web::Data::new(proxy.clone()))
-                .app_data(web::PayloadConfig::new(request_body_limit))
-                .configure({
-                    let grpc = grpc.clone();
-                    move |services| {
-                        for (prefix, transcoder) in &grpc {
-                            services.service(
-                                web::scope(prefix)
-                                    .app_data(web::Data::new(transcoder.clone()))
-                                    .default_service(web::to(crate::transcode)),
-                            );
-                        }
-                    }
-                })
-                .default_service(web::to(crate::proxy))
+        let http_prefixes: Vec<_> = self
+            .config
+            .routes
+            .iter()
+            .map(|route| route.prefix.clone())
+            .collect();
+        self.rest.run_on(listener, move |services| {
+            services.app_data(web::Data::new(proxy.clone()));
+            for (prefix, transcoder) in &grpc {
+                services.service(
+                    web::scope(prefix)
+                        .app_data(web::Data::new(transcoder.clone()))
+                        .service(web::resource("").route(web::route().to(crate::transcode)))
+                        .service(
+                            web::resource("/{tail:.*}").route(web::route().to(crate::transcode)),
+                        ),
+                );
+            }
+            for prefix in &http_prefixes {
+                if prefix == "/" {
+                    services
+                        .service(web::resource("/{tail:.*}").route(web::route().to(crate::proxy)));
+                } else {
+                    services.service(
+                        web::resource(prefix.as_str()).route(web::route().to(crate::proxy)),
+                    );
+                    services.service(
+                        web::resource(format!("{prefix}/{{tail:.*}}"))
+                            .route(web::route().to(crate::proxy)),
+                    );
+                }
+            }
         })
-        .workers(workers)
-        .shutdown_timeout(shutdown_seconds)
-        .listen(listener)
-        .map(HttpServer::run)
     }
 
     pub async fn serve_until<F>(&self, shutdown: F) -> io::Result<()>
@@ -1176,6 +1285,14 @@ request_timeout_ms = 1500
 shutdown_timeout_ms = 4000
 request_body_limit = 1024
 response_body_limit = 2048
+max_concurrent_requests = 64
+priority_concurrency_reserve = 8
+rate_limit_requests_per_second = 100
+rate_limit_burst = 25
+
+[cors]
+allowed_origins = ["https://console.example"]
+allowed_methods = ["GET"]
 
 [[routes]]
 prefix = "/api"
@@ -1188,6 +1305,13 @@ middleware = ["sign", "audit"]
 
         config.validate().unwrap();
         assert_eq!(config.workers, 2);
+        assert_eq!(config.max_concurrent_requests, 64);
+        assert_eq!(config.rate_limit_requests_per_second, Some(100));
+        assert_eq!(config.rate_limit_burst, Some(25));
+        assert_eq!(
+            config.cors.as_ref().unwrap().allowed_origins,
+            ["https://console.example"]
+        );
         assert_eq!(config.routes[0].prefix, "/api");
         assert_eq!(config.routes[0].middleware, ["sign", "audit"]);
 
@@ -1571,6 +1695,29 @@ rpc = "acme.greeter.v1.Greeter.Get"
 
         let gateway_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let gateway_address = gateway_listener.local_addr().unwrap();
+        let protected_routes = |prefix: &str| rest::RouteGroupConfig {
+            prefix: prefix.to_owned(),
+            jwt: Some(rest::RouteJwtConfig {
+                secret: "downstream-secret".to_owned(),
+                previous_secret: None,
+                leeway_seconds: 0,
+                claim_projection: Default::default(),
+            }),
+            routes: ["", "/{tail:.*}"]
+                .into_iter()
+                .map(|path| rest::RoutePolicyConfig {
+                    method: "GET".to_owned(),
+                    path: path.to_owned(),
+                    public: false,
+                    jwt: None,
+                    timeout_ms: None,
+                    max_body_bytes: None,
+                    priority: None,
+                    sse: None,
+                })
+                .collect(),
+            ..Default::default()
+        };
         let config = GatewayConfig {
             routes: vec![route("/http", &[&format!("http://{http_address}")])],
             grpc: vec![GatewayGrpcUpstream {
@@ -1588,37 +1735,77 @@ rpc = "acme.greeter.v1.Greeter.Get"
                 tls: None,
                 bearer_token: Some("upstream-secret".to_owned()),
             }],
+            cors: Some(RestCorsConfig::new(["https://console.example"])),
+            route_groups: vec![protected_routes("/http"), protected_routes("/grpc")],
             ..GatewayConfig::default()
         };
-        let gateway = GatewayServer::from_config(config)
-            .await
-            .unwrap()
-            .run_on(gateway_listener)
-            .unwrap();
+        let gateway = GatewayServer::from_config(config).await.unwrap();
+        let metrics = gateway.metrics();
+        let gateway = gateway.run_on(gateway_listener).unwrap();
         let gateway_handle = gateway.handle();
         actix_web::rt::spawn(gateway);
 
-        let http = reqwest::get(format!("http://{gateway_address}/http/orders"))
-            .await
-            .unwrap()
-            .bytes()
+        let client = reqwest::Client::new();
+        for path in [
+            "/http",
+            "/http/orders",
+            "/grpc",
+            "/grpc/greeters/7?view=configured",
+        ] {
+            let unauthorized = client
+                .get(format!("http://{gateway_address}{path}"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(unauthorized.status(), reqwest::StatusCode::UNAUTHORIZED);
+        }
+        let token = rest::encode_hs256(
+            &serde_json::json!({"sub": "gateway-client"}),
+            b"downstream-secret",
+        )
+        .unwrap();
+        let http_response = client
+            .get(format!("http://{gateway_address}/http/orders"))
+            .bearer_auth(&token)
+            .header("origin", "https://console.example")
+            .header("x-request-id", "gateway-http")
+            .send()
             .await
             .unwrap();
+        assert_eq!(http_response.headers()["x-request-id"], "gateway-http");
+        assert_eq!(http_response.headers()["x-content-type-options"], "nosniff");
+        assert_eq!(
+            http_response.headers()["access-control-allow-origin"],
+            "https://console.example"
+        );
+        let http = http_response.bytes().await.unwrap();
         let http: serde_json::Value = serde_json::from_slice(&http).unwrap();
         assert_eq!(http, serde_json::json!({"protocol": "http"}));
-        let grpc = reqwest::get(format!(
-            "http://{gateway_address}/grpc/greeters/7?view=configured"
-        ))
-        .await
-        .unwrap()
-        .bytes()
-        .await
-        .unwrap();
+        let grpc_response = client
+            .get(format!(
+                "http://{gateway_address}/grpc/greeters/7?view=configured"
+            ))
+            .bearer_auth(&token)
+            .header("origin", "https://console.example")
+            .header("x-request-id", "gateway-grpc")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(grpc_response.headers()["x-request-id"], "gateway-grpc");
+        assert_eq!(grpc_response.headers()["x-content-type-options"], "nosniff");
+        assert_eq!(
+            grpc_response.headers()["access-control-allow-origin"],
+            "https://console.example"
+        );
+        let grpc = grpc_response.bytes().await.unwrap();
         let grpc: serde_json::Value = serde_json::from_slice(&grpc).unwrap();
         assert_eq!(
             grpc,
             serde_json::json!({"id": 7, "message": "grpc:configured:true"})
         );
+        let rendered_metrics = metrics.render();
+        assert!(rendered_metrics.contains("path=\"/http/{tail:.*}\""));
+        assert!(rendered_metrics.contains("path=\"/grpc/{tail:.*}\""));
 
         gateway_handle.stop(true).await;
         http_handle.stop(true).await;

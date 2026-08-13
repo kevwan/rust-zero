@@ -891,6 +891,31 @@ request_timeout_ms = 30000
 shutdown_timeout_ms = 30000
 request_body_limit = 10485760
 response_body_limit = 52428800
+max_concurrent_requests = 1024
+priority_concurrency_reserve = 256
+rate_limit_requests_per_second = 10000
+rate_limit_burst = 20000
+
+[cors]
+allowed_origins = ["https://console.example.com"]
+allowed_methods = ["GET", "POST"]
+allowed_headers = ["authorization", "content-type"]
+exposed_headers = ["x-request-id"]
+allow_credentials = true
+
+[[route_groups]]
+prefix = "/api"
+
+[route_groups.jwt]
+secret = "${DOWNSTREAM_JWT_SECRET}"
+
+[[route_groups.routes]]
+method = "GET"
+path = "/{tail:.*}"
+
+[[route_groups.routes]]
+method = "GET"
+path = "" # protect the exact /api prefix too
 
 [[routes]]
 prefix = "/api"
@@ -933,6 +958,15 @@ password = "${ETCD_PASSWORD}"
 The discovery block also accepts `connect_timeout_ms` and an optional `tls` table. gRPC
 transcoding supports unary and newline-delimited server-streaming responses. Client-streaming
 methods are rejected during startup.
+
+`GatewayServer` runs these routes inside the standard REST production stack. Logging, panic
+recovery, trace propagation, metrics, request IDs, security headers, timeouts, body limits,
+concurrency limiting, adaptive shedding, and per-route result-aware circuit breaking are enabled
+by default. CORS, downstream JWT route policies, token-bucket rate limiting, and listener TLS/mTLS
+are configured with the same fields as `RestServerConfig`; set `tls.certificate_pem`,
+`tls.private_key_pem`, and optionally `tls.client_ca_pem` to enable HTTPS or mutual TLS. Gateway
+catch-all policy paths use `/{tail:.*}` beneath the configured HTTP or gRPC prefix; add an empty
+route path when the exact prefix is also a valid endpoint, as shown above.
 
 Middleware names are resolved by applications embedding `GatewayServer`. They run in declaration
 order, can mutate the outbound request, short-circuit dispatch, and wrap the streamed response;

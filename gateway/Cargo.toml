@@ -32,6 +32,7 @@ prost-reflect = { version = "0.14", features = ["serde"] }
 prost-types = "0.13"
 reqwest = { version = "=0.11.16", features = ["stream"] }
 rust-zero-core = { path = "../core", version = "0.1.0-alpha.1" }
+rust-zero-rest = { path = "../rest", version = "0.1.0-alpha.1" }
 rust-zero-rpc = { path = "../rpc", version = "0.1.0-alpha.1" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

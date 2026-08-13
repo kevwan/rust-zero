@@ -201,10 +201,10 @@ complete, the project claims **broad runtime coverage**, not full runtime parity
 
 ## Recommended execution order
 
-The previously reopened TLS, server-circuit, gRPC-lifecycle, CORS, and legacy MCP items are
-complete. The gateway integration items below are the current runtime priority. Durable brokers
-and the `goctl` developer toolchain remain intentional ecosystem boundaries unless explicitly
-brought into scope.
+The previously reopened TLS, server-circuit, gRPC-lifecycle, CORS, legacy MCP, and gateway
+integration items are complete. Production-confidence and large-fleet operational evidence are
+the current priorities. Durable brokers and the `goctl` developer toolchain remain intentional
+ecosystem boundaries unless explicitly brought into scope.
 
 ## Remaining catch-up items
 
@@ -214,9 +214,9 @@ HTTP and its opt-in legacy SSE compatibility transport are covered.
 ## Reopened gaps from the 2026-08-13 follow-up audit
 
 These items distinguish individually available primitives from the configuration-driven,
-production-ready assembly and operational evidence provided by go-zero. Until the P0 gateway
-items are complete, gateway support should be described as **library capability covered; standard
-assembly partial**.
+production-ready assembly and operational evidence provided by go-zero. The P0 gateway runtime
+integration items are complete; remaining work focuses on production evidence and operational
+scale.
 
 ### P0 — gateway runtime integration
 
@@ -225,7 +225,7 @@ assembly partial**.
   explicit and `google.api.http` bindings, upstream TLS/auth/discovery settings, and unary or
   server-streaming transcoding without requiring callers to assemble a custom Actix application.
   Prove HTTP proxy and JSON-to-gRPC routes operate together through the stock binary.
-- [ ] **Standard production gateway stack.** Reuse or compose the standard REST listener and
+- [x] **Standard production gateway stack.** Reuse or compose the standard REST listener and
   middleware configuration in `GatewayServer`, including TLS/mTLS, request identity, recovery,
   structured logging, tracing, metrics, CORS, security headers, authentication, timeouts, body
   limits, rate/concurrency limiting, adaptive shedding, and result-aware circuit breaking. Add
@@ -311,6 +311,11 @@ assembly partial**.
 
 ## Recently completed
 
+- [x] Standard gateway routes now run inside the shared REST production listener and middleware
+  stack, with configuration-driven TLS/mTLS, CORS, JWT route policies, request identity, recovery,
+  logging, tracing, metrics, security headers, timeouts, body and concurrency limits, token-bucket
+  rate limiting, adaptive shedding, and result-aware circuit breaking for both HTTP proxy and
+  transcoded gRPC traffic.
 - [x] Stock configuration-driven mixed-protocol gateway assembly with HTTP proxy routes and
   descriptor-set or reflection-driven gRPC transcoding routes, explicit/annotated bindings,
   direct or live etcd-discovered endpoint pools, TLS/mTLS, redacted bearer credentials, unary and

@@ -49,6 +49,7 @@ impl fmt::Debug for RouteJwtConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RoutePolicyConfig {
     pub method: String,
+    /// Path below the group prefix. An empty path targets the prefix itself.
     pub path: String,
     #[serde(default)]
     pub public: bool,
@@ -170,7 +171,10 @@ impl RoutePolicies {
             }
 
             for route in &group.routes {
-                if !route.path.starts_with('/') {
+                if route.path.is_empty() && group.prefix.is_empty() {
+                    return Err("an empty route path requires a non-empty group prefix".to_owned());
+                }
+                if !route.path.is_empty() && !route.path.starts_with('/') {
                     return Err(format!("route path must start with '/': {}", route.path));
                 }
                 validate_optional_limits(route.timeout_ms, route.max_body_bytes)?;
@@ -307,6 +311,9 @@ fn jwt_secrets(jwt: &RouteJwtConfig) -> Vec<Arc<[u8]>> {
 }
 
 fn join_route(prefix: &str, path: &str) -> String {
+    if path.is_empty() {
+        return prefix.to_owned();
+    }
     if prefix.is_empty() || prefix == "/" {
         return path.to_owned();
     }
@@ -752,6 +759,39 @@ mod tests {
 
     #[actix_web::test]
     async fn rejects_ambiguous_or_invalid_route_policies() {
+        let exact_prefix = RoutePolicies::compile(&[RouteGroupConfig {
+            prefix: "/api".to_owned(),
+            routes: vec![RoutePolicyConfig {
+                method: "GET".to_owned(),
+                path: String::new(),
+                public: true,
+                jwt: None,
+                timeout_ms: None,
+                max_body_bytes: None,
+                priority: None,
+                sse: None,
+            }],
+            ..RouteGroupConfig::default()
+        }])
+        .unwrap();
+        assert!(exact_prefix.find(&Method::GET, "/api").is_some());
+
+        let empty_root = RoutePolicies::compile(&[RouteGroupConfig {
+            routes: vec![RoutePolicyConfig {
+                method: "GET".to_owned(),
+                path: String::new(),
+                public: true,
+                jwt: None,
+                timeout_ms: None,
+                max_body_bytes: None,
+                priority: None,
+                sse: None,
+            }],
+            ..RouteGroupConfig::default()
+        }])
+        .unwrap_err();
+        assert!(empty_root.contains("non-empty group prefix"));
+
         let duplicate = RoutePolicyConfig {
             method: "GET".to_owned(),
             path: "/users/{id}".to_owned(),
