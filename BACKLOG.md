@@ -234,7 +234,7 @@ scale.
 
 ### P1 — production confidence and large-scale operation
 
-- [ ] **Cross-framework benchmark baselines.** Check in reproducible rust-zero and go-zero results
+- [x] **Cross-framework benchmark baselines.** Check in reproducible rust-zero and go-zero results
   for equivalent REST, gRPC, partial-failure, overload-recovery, discovery, and queue workloads on
   recorded hardware. Define regression thresholds and run enough samples to report medians and
   tail latency rather than leaving the benchmark results directory without a baseline.

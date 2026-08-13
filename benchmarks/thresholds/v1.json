@@ -1,0 +1,48 @@
+{
+  "default": {
+    "operations_per_second": {
+      "direction": "higher",
+      "max_regression_percent": 10
+    },
+    "p95_us": {
+      "direction": "lower",
+      "max_regression_percent": 15
+    },
+    "p99_us": {
+      "direction": "lower",
+      "max_regression_percent": 15
+    },
+    "allocations": {
+      "direction": "lower",
+      "max_regression_percent": 15
+    },
+    "allocated_bytes": {
+      "direction": "lower",
+      "max_regression_percent": 15
+    }
+  },
+  "workloads": {
+    "queue_saturation": {
+      "operations_per_second": {
+        "direction": "higher",
+        "max_regression_percent": 20
+      },
+      "p95_us": {
+        "direction": "lower",
+        "max_regression_percent": 25
+      },
+      "p99_us": {
+        "direction": "lower",
+        "max_regression_percent": 25
+      },
+      "allocations": {
+        "direction": "lower",
+        "max_regression_percent": 30
+      },
+      "allocated_bytes": {
+        "direction": "lower",
+        "max_regression_percent": 30
+      }
+    }
+  }
+}

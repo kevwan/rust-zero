@@ -1,0 +1,118 @@
+{
+  "schema_version": 1,
+  "framework": "go-zero",
+  "framework_version": "v1.10.3",
+  "unix_timestamp": 1786639187,
+  "git_revision": "working-tree-after-321512a",
+  "go_version": "go1.26.3",
+  "target": "arm64-darwin",
+  "config": {
+    "version": 1,
+    "warmup_iterations": 100,
+    "measured_iterations": 2000,
+    "concurrency": 16,
+    "payload_bytes": 256,
+    "breaker_failure_percent": 40,
+    "discovery_endpoints": 10000,
+    "queue_capacity": 64,
+    "queue_messages": 2000,
+    "queue_consumer_delay_us": 100,
+    "overload_concurrency": 64
+  },
+  "workloads": [
+    {
+      "name": "rest_transport",
+      "operations": 2000,
+      "elapsed_ms": 76.168084,
+      "operations_per_second": 26257.71707740476,
+      "p50_us": 550.958,
+      "p95_us": 1207.625,
+      "p99_us": 1618.292,
+      "allocations": 211931,
+      "allocated_bytes": 56013440,
+      "peak_rss_kib": 29840,
+      "counters": {
+        "completed": 2000
+      }
+    },
+    {
+      "name": "grpc_transport",
+      "operations": 2000,
+      "elapsed_ms": 30.527417,
+      "operations_per_second": 65514.87798656532,
+      "p50_us": 197.791,
+      "p95_us": 495.917,
+      "p99_us": 628.834,
+      "allocations": 271569,
+      "allocated_bytes": 25135712,
+      "peak_rss_kib": 31920,
+      "counters": {
+        "completed": 2000
+      }
+    },
+    {
+      "name": "circuit_breaker_partial_failure",
+      "operations": 2000,
+      "elapsed_ms": 1.363125,
+      "operations_per_second": 1467216.8729940394,
+      "p50_us": 0.5,
+      "p95_us": 0.833,
+      "p99_us": 4.584,
+      "allocations": 14486,
+      "allocated_bytes": 1051352,
+      "peak_rss_kib": 31936,
+      "counters": {
+        "rejected": 1645,
+        "upstream_failures": 152
+      }
+    },
+    {
+      "name": "overload_recovery",
+      "operations": 2000,
+      "elapsed_ms": 0.117459,
+      "operations_per_second": 17027218.007985763,
+      "p50_us": 0,
+      "p95_us": 0.042,
+      "p99_us": 0.042,
+      "allocations": 4,
+      "allocated_bytes": 16752,
+      "peak_rss_kib": 31936,
+      "counters": {
+        "recovered": 1,
+        "recovery_us": 0,
+        "rejected": 1000
+      }
+    },
+    {
+      "name": "large_discovery_snapshot",
+      "operations": 100,
+      "elapsed_ms": 3.498875,
+      "operations_per_second": 28580.615197742132,
+      "p50_us": 9.833,
+      "p95_us": 122.084,
+      "p99_us": 145.084,
+      "allocations": 103,
+      "allocated_bytes": 16385152,
+      "peak_rss_kib": 33440,
+      "counters": {
+        "snapshot_endpoints": 10000
+      }
+    },
+    {
+      "name": "queue_saturation",
+      "operations": 2000,
+      "elapsed_ms": 237.05875,
+      "operations_per_second": 8436.727182607687,
+      "p50_us": 117.375,
+      "p95_us": 123.834,
+      "p99_us": 129.458,
+      "allocations": 7,
+      "allocated_bytes": 17504,
+      "peak_rss_kib": 33440,
+      "counters": {
+        "capacity": 64,
+        "processed": 2000
+      }
+    }
+  ]
+}

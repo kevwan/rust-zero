@@ -1,0 +1,186 @@
+{
+  "frameworks": {
+    "go-zero": {
+      "config": {
+        "breaker_failure_percent": 40,
+        "concurrency": 16,
+        "discovery_endpoints": 10000,
+        "measured_iterations": 2000,
+        "overload_concurrency": 64,
+        "payload_bytes": 256,
+        "queue_capacity": 64,
+        "queue_consumer_delay_us": 100,
+        "queue_messages": 2000,
+        "version": 1,
+        "warmup_iterations": 100
+      },
+      "framework_version": "v1.10.3",
+      "sample_count": 5,
+      "target": "arm64-darwin",
+      "workloads": {
+        "circuit_breaker_partial_failure": {
+          "allocated_bytes": 1051352,
+          "allocations": 14486,
+          "counters": {
+            "rejected": 1645,
+            "upstream_failures": 152
+          },
+          "operations": 2000,
+          "operations_per_second": 1467216.8729940394,
+          "p95_us": 0.792,
+          "p99_us": 4.584
+        },
+        "grpc_transport": {
+          "allocated_bytes": 25557832,
+          "allocations": 271885,
+          "counters": {
+            "completed": 2000
+          },
+          "operations": 2000,
+          "operations_per_second": 65514.87798656532,
+          "p95_us": 499.958,
+          "p99_us": 628.834
+        },
+        "large_discovery_snapshot": {
+          "allocated_bytes": 16385152,
+          "allocations": 103,
+          "counters": {
+            "snapshot_endpoints": 10000
+          },
+          "operations": 100,
+          "operations_per_second": 28580.615197742132,
+          "p95_us": 131.125,
+          "p99_us": 146.791
+        },
+        "overload_recovery": {
+          "allocated_bytes": 16752,
+          "allocations": 4,
+          "counters": {
+            "recovered": 1,
+            "recovery_us": 0,
+            "rejected": 1000
+          },
+          "operations": 2000,
+          "operations_per_second": 19818266.496229574,
+          "p95_us": 0.042,
+          "p99_us": 0.042
+        },
+        "queue_saturation": {
+          "allocated_bytes": 17504,
+          "allocations": 7,
+          "counters": {
+            "capacity": 64,
+            "processed": 2000
+          },
+          "operations": 2000,
+          "operations_per_second": 8446.356136383312,
+          "p95_us": 122.792,
+          "p99_us": 126.875
+        },
+        "rest_transport": {
+          "allocated_bytes": 60496736,
+          "allocations": 213084,
+          "counters": {
+            "completed": 2000
+          },
+          "operations": 2000,
+          "operations_per_second": 25454.279341625064,
+          "p95_us": 1229.792,
+          "p99_us": 1618.292
+        }
+      }
+    },
+    "rust-zero": {
+      "config": {
+        "breaker_failure_percent": 40,
+        "concurrency": 16,
+        "discovery_endpoints": 10000,
+        "measured_iterations": 2000,
+        "overload_concurrency": 64,
+        "payload_bytes": 256,
+        "queue_capacity": 64,
+        "queue_consumer_delay_us": 100,
+        "queue_messages": 2000,
+        "version": 1,
+        "warmup_iterations": 100
+      },
+      "framework_version": "0.1.0-alpha.1",
+      "sample_count": 5,
+      "target": "aarch64-macos",
+      "workloads": {
+        "circuit_breaker_partial_failure": {
+          "allocated_bytes": 32488,
+          "allocations": 6,
+          "counters": {
+            "rejected": 203,
+            "upstream_failures": 710
+          },
+          "operations": 2000,
+          "operations_per_second": 9437657.195977671,
+          "p95_us": 0.125,
+          "p99_us": 0.125
+        },
+        "grpc_transport": {
+          "allocated_bytes": 95991719,
+          "allocations": 148495,
+          "counters": {
+            "completed": 2000
+          },
+          "operations": 2000,
+          "operations_per_second": 62891.51540628296,
+          "p95_us": 306.458,
+          "p99_us": 325.75
+        },
+        "large_discovery_snapshot": {
+          "allocated_bytes": 46002910,
+          "allocations": 1000204,
+          "counters": {
+            "snapshot_endpoints": 10000
+          },
+          "operations": 100,
+          "operations_per_second": 3884.3373303034987,
+          "p95_us": 289.45799999999997,
+          "p99_us": 301.458
+        },
+        "overload_recovery": {
+          "allocated_bytes": 35517,
+          "allocations": 13,
+          "counters": {
+            "recovered": 1,
+            "recovery_us": 0,
+            "rejected": 1000
+          },
+          "operations": 2000,
+          "operations_per_second": 8390141.583639223,
+          "p95_us": 0.125,
+          "p99_us": 0.125
+        },
+        "queue_saturation": {
+          "allocated_bytes": 33329,
+          "allocations": 9,
+          "counters": {
+            "capacity": 64,
+            "processed": 2000
+          },
+          "operations": 2000,
+          "operations_per_second": 806.2024514844516,
+          "p95_us": 2258.958,
+          "p99_us": 2267.3329999999996
+        },
+        "rest_transport": {
+          "allocated_bytes": 62298750,
+          "allocations": 176560,
+          "counters": {
+            "completed": 2000
+          },
+          "operations": 2000,
+          "operations_per_second": 74129.78672712098,
+          "p95_us": 308.5,
+          "p99_us": 372.042
+        }
+      }
+    }
+  },
+  "minimum_samples": 5,
+  "schema_version": 1
+}

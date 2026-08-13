@@ -19,9 +19,33 @@ cargo run --release --locked -p rust-zero-benchmarks -- benchmarks/config/v1.tom
 
 Run at least five times after one discarded warm-up run. Keep every raw JSON file; compare the
 median `operations_per_second`, `p95_us`, `p99_us`, `allocations`, and `allocated_bytes`. Treat a
-change as a regression candidate when it repeats in three runs and exceeds both 5% and ordinary
-run-to-run variation. Transport results are loopback-only and should only be compared on the same
-machine and OS configuration.
+change as a regression when the five-run median exceeds the versioned limits in
+`thresholds/v1.json`. Transport results are loopback-only and should only be compared on the same
+machine and OS configuration. The default limits are 10% lower throughput or 15% higher p95/p99,
+allocation count, or allocated bytes; the timer-sensitive saturated-queue workload allows 20%
+throughput, 25% tail-latency, and 30% allocation movement.
+
+The pinned go-zero v1.10.3 companion uses the same configuration and output schema:
+
+```sh
+go build -trimpath -o /tmp/go-zero-benchmark ./benchmarks/go-zero
+RUST_ZERO_GIT_REVISION="$(git rev-parse HEAD)" \
+  /tmp/go-zero-benchmark benchmarks/config/v1.toml \
+  > benchmarks/results/<host>/go-run1.json
+```
+
+Discard one warm-up from each executable, then retain at least five measured files from each. Build
+the medians and check a later same-host candidate with:
+
+```sh
+python3 benchmarks/compare.py summarize --minimum-samples 5 \
+  --output benchmarks/results/<host>/baseline-summary.json \
+  benchmarks/results/<host>/*-run*.json
+python3 benchmarks/compare.py check \
+  --baseline benchmarks/results/<host>/baseline-summary.json \
+  --candidate /tmp/candidate-summary.json \
+  --thresholds benchmarks/thresholds/v1.json
+```
 
 The workloads are:
 
@@ -30,6 +54,12 @@ The workloads are:
 - `overload_recovery`: admission rejection at capacity followed by immediate recovery;
 - `large_discovery_snapshot`: cloning a 10,000-endpoint complete snapshot;
 - `queue_saturation`: producer latency while a bounded supervised queue remains saturated.
+
+The Go companion traverses go-zero's REST serverless route stack and Google circuit breaker. Its
+gRPC case uses the same `grpc-go` transport underlying `zrpc`; the overload, complete-snapshot, and
+bounded-queue harnesses intentionally use framework-neutral equivalents so both sides receive the
+same deterministic inputs. The comparison is evidence for relative workload behavior, not a claim
+that unlike APIs or allocators perform identical work.
 
 The counting global allocator reports total allocation calls and requested bytes during each
 measured interval. `peak_rss_kib` comes from `getrusage`; because it is a process high-water mark,

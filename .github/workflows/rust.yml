@@ -83,6 +83,30 @@ jobs:
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - run: cargo test --workspace --all-targets --locked
 
+  benchmark-artifacts:
+    name: benchmark artifacts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: benchmarks/go-zero/go.mod
+          cache-dependency-path: benchmarks/go-zero/go.sum
+      - name: Compile the pinned go-zero companion
+        working-directory: benchmarks/go-zero
+        run: go test ./...
+      - name: Reproduce and validate the checked-in medians
+        run: |
+          python3 benchmarks/compare.py summarize --minimum-samples 5 \
+            --output /tmp/baseline-summary.json \
+            benchmarks/results/v1-m3-max-2026-08-14/*-run*.json
+          diff -u benchmarks/results/v1-m3-max-2026-08-14/baseline-summary.json \
+            /tmp/baseline-summary.json
+          python3 benchmarks/compare.py check \
+            --baseline benchmarks/results/v1-m3-max-2026-08-14/baseline-summary.json \
+            --candidate /tmp/baseline-summary.json \
+            --thresholds benchmarks/thresholds/v1.json
+
   real-backends:
     runs-on: ubuntu-latest
     services:

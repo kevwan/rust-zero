@@ -82,6 +82,8 @@ struct Config {
 #[derive(Serialize)]
 struct Report {
     schema_version: u32,
+    framework: String,
+    framework_version: String,
     unix_timestamp: u64,
     git_revision: String,
     rustc: String,
@@ -270,6 +272,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let report = Report {
         schema_version: 1,
+        framework: "rust-zero".to_owned(),
+        framework_version: env!("CARGO_PKG_VERSION").to_owned(),
         unix_timestamp: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
         git_revision: std::env::var("RUST_ZERO_GIT_REVISION")
             .unwrap_or_else(|_| "unknown".to_owned()),
