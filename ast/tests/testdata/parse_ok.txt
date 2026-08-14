@@ -1,0 +1,260 @@
+---------- Input ----------
+file: greet.api
+---------- AST ------------
+ApiFile {
+    syntax: Syntax {
+        version: "v1",
+    },
+    imports: [],
+    info: None,
+    types: [
+        TypeDef {
+            name: "Resp",
+            fields: [
+                Field {
+                    attrs: [],
+                    name: "msg",
+                    ty: Named(
+                        "String",
+                    ),
+                },
+            ],
+        },
+    ],
+    services: [
+        Service {
+            server: None,
+            name: "greet",
+            routes: [
+                Route {
+                    doc: None,
+                    handler: None,
+                    method: Get,
+                    path: "/ping",
+                    request: None,
+                    returns: Some(
+                        Named(
+                            "Resp",
+                        ),
+                    ),
+                },
+            ],
+        },
+    ],
+}
+
+
+---------- Input ----------
+syntax = "v1"
+
+struct Resp {
+    msg: String,
+    tags: [String],
+    extra: {String: i64},
+    nickname: String?,
+}
+
+#[server]
+service greet {
+    #[handler(ping)]
+    get /ping() -> Resp;
+}
+---------- AST ------------
+ApiFile {
+    syntax: Syntax {
+        version: "v1",
+    },
+    imports: [],
+    info: None,
+    types: [
+        TypeDef {
+            name: "Resp",
+            fields: [
+                Field {
+                    attrs: [],
+                    name: "msg",
+                    ty: Named(
+                        "String",
+                    ),
+                },
+                Field {
+                    attrs: [],
+                    name: "tags",
+                    ty: List(
+                        Named(
+                            "String",
+                        ),
+                    ),
+                },
+                Field {
+                    attrs: [],
+                    name: "extra",
+                    ty: Map {
+                        key: Named(
+                            "String",
+                        ),
+                        value: Named(
+                            "i64",
+                        ),
+                    },
+                },
+                Field {
+                    attrs: [],
+                    name: "nickname",
+                    ty: Optional(
+                        Named(
+                            "String",
+                        ),
+                    ),
+                },
+            ],
+        },
+    ],
+    services: [
+        Service {
+            server: Some(
+                AtServer {
+                    items: [],
+                },
+            ),
+            name: "greet",
+            routes: [
+                Route {
+                    doc: None,
+                    handler: Some(
+                        "ping",
+                    ),
+                    method: Get,
+                    path: "/ping",
+                    request: None,
+                    returns: Some(
+                        Named(
+                            "Resp",
+                        ),
+                    ),
+                },
+            ],
+        },
+    ],
+}
+
+
+---------- Input ----------
+service pay {
+    post /pay (PayReq) -> PayResp
+}
+---------- AST ------------
+ApiFile {
+    syntax: Syntax {
+        version: "v1",
+    },
+    imports: [],
+    info: None,
+    types: [],
+    services: [
+        Service {
+            server: None,
+            name: "pay",
+            routes: [
+                Route {
+                    doc: None,
+                    handler: None,
+                    method: Post,
+                    path: "/pay",
+                    request: Some(
+                        Named(
+                            "PayReq",
+                        ),
+                    ),
+                    returns: Some(
+                        Named(
+                            "PayResp",
+                        ),
+                    ),
+                },
+            ],
+        },
+    ],
+}
+
+
+---------- Input ----------
+struct GetUserReq {
+    #[path]
+    #[json("user_id")]
+    userId: String,
+    #[path("id"), json("user_id")]
+    userId2: String,
+    #[query]
+    page: i64?,
+}
+---------- AST ------------
+ApiFile {
+    syntax: Syntax {
+        version: "v1",
+    },
+    imports: [],
+    info: None,
+    types: [
+        TypeDef {
+            name: "GetUserReq",
+            fields: [
+                Field {
+                    attrs: [
+                        FieldAttr {
+                            name: "path",
+                            value: None,
+                        },
+                        FieldAttr {
+                            name: "json",
+                            value: Some(
+                                "user_id",
+                            ),
+                        },
+                    ],
+                    name: "userId",
+                    ty: Named(
+                        "String",
+                    ),
+                },
+                Field {
+                    attrs: [
+                        FieldAttr {
+                            name: "path",
+                            value: Some(
+                                "id",
+                            ),
+                        },
+                        FieldAttr {
+                            name: "json",
+                            value: Some(
+                                "user_id",
+                            ),
+                        },
+                    ],
+                    name: "userId2",
+                    ty: Named(
+                        "String",
+                    ),
+                },
+                Field {
+                    attrs: [
+                        FieldAttr {
+                            name: "query",
+                            value: None,
+                        },
+                    ],
+                    name: "page",
+                    ty: Optional(
+                        Named(
+                            "i64",
+                        ),
+                    ),
+                },
+            ],
+        },
+    ],
+    services: [],
+}
+
+

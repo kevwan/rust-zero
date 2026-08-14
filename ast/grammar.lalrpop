@@ -1,0 +1,260 @@
+use crate::ast::{
+    ApiFile, AtDoc, AtServer, Field, FieldAttr, HttpMethod, InfoBlock, InfoItem, Route, Service,
+    Syntax, TypeDef, TypeExpr,
+};
+use crate::lexer::{Token, TokenKind};
+use crate::parse::{token_text, unquote, TopItem};
+
+grammar<'input>(source: &'input str);
+
+extern {
+    type Location = usize;
+    type Error = &'static str;
+
+    enum Token {
+        "syntax" => Token { kind: TokenKind::Syntax, .. },
+        "import" => Token { kind: TokenKind::Import, .. },
+        "info" => Token { kind: TokenKind::Info, .. },
+        "struct" => Token { kind: TokenKind::Struct, .. },
+        "service" => Token { kind: TokenKind::Service, .. },
+        "ident" => Token { kind: TokenKind::Ident, .. },
+        "int" => Token { kind: TokenKind::Int, .. },
+        "duration" => Token { kind: TokenKind::Duration, .. },
+        "string" => Token { kind: TokenKind::String, .. },
+        "path" => Token { kind: TokenKind::Path, .. },
+        "@doc" => Token { kind: TokenKind::AtDoc, .. },
+        "@handler" => Token { kind: TokenKind::AtHandler, .. },
+        "@server" => Token { kind: TokenKind::AtServer, .. },
+        "#[" => Token { kind: TokenKind::HashLBracket, .. },
+        "get" => Token { kind: TokenKind::Get, .. },
+        "head" => Token { kind: TokenKind::Head, .. },
+        "post" => Token { kind: TokenKind::Post, .. },
+        "put" => Token { kind: TokenKind::Put, .. },
+        "patch" => Token { kind: TokenKind::Patch, .. },
+        "delete" => Token { kind: TokenKind::Delete, .. },
+        "connect" => Token { kind: TokenKind::Connect, .. },
+        "options" => Token { kind: TokenKind::Options, .. },
+        "trace" => Token { kind: TokenKind::Trace, .. },
+        "->" => Token { kind: TokenKind::Arrow, .. },
+        "?" => Token { kind: TokenKind::Question, .. },
+        "-" => Token { kind: TokenKind::Sub, .. },
+        "*" => Token { kind: TokenKind::Star, .. },
+        "/" => Token { kind: TokenKind::Slash, .. },
+        "=" => Token { kind: TokenKind::Assign, .. },
+        "(" => Token { kind: TokenKind::LParen, .. },
+        "[" => Token { kind: TokenKind::LBracket, .. },
+        "{" => Token { kind: TokenKind::LBrace, .. },
+        "," => Token { kind: TokenKind::Comma, .. },
+        "." => Token { kind: TokenKind::Dot, .. },
+        ")" => Token { kind: TokenKind::RParen, .. },
+        "}" => Token { kind: TokenKind::RBrace, .. },
+        "]" => Token { kind: TokenKind::RBracket, .. },
+        ";" => Token { kind: TokenKind::Semicolon, .. },
+        ":" => Token { kind: TokenKind::Colon, .. },
+    }
+}
+
+pub ApiFile: ApiFile = {
+    <syntax:Syntax?> <imports:Import*> <info:Info?> <items:TopItem*> => {
+        let mut types = Vec::new();
+        let mut services = Vec::new();
+        for item in items {
+            match item {
+                TopItem::Type(def) => types.push(def),
+                TopItem::Service(service) => services.push(service),
+            }
+        }
+        ApiFile {
+            syntax: syntax.unwrap_or(Syntax { version: "v1".into() }),
+            imports: imports.into_iter().flatten().collect(),
+            info,
+            types,
+            services,
+        }
+    },
+};
+
+Syntax: Syntax = {
+    "syntax" "=" <v:"string"> => Syntax { version: unquote(&v.text) },
+};
+
+Import: Vec<String> = {
+    "import" <v:"string"> => vec![unquote(&v.text)],
+    "import" "(" <items:QuotedString*> ")" => items,
+};
+
+QuotedString: String = {
+    <v:"string"> => unquote(&v.text),
+};
+
+Info: InfoBlock = {
+    "info" "(" <items:Kv*> ")" => InfoBlock { items },
+};
+
+Kv: InfoItem = {
+    <k:IdentOrKw> ":" <v:KvValue> => InfoItem { key: k, value: v },
+};
+
+KvValue: String = {
+    <v:"string"> => unquote(&v.text),
+    <v:"int"> => v.text,
+    <v:"duration"> => v.text,
+    <v:"path"> => v.text,
+    <head:IdentOrKw> <tail:KvValueTail*> => {
+        let mut value = head;
+        for part in tail {
+            value.push_str(&part);
+        }
+        value
+    },
+};
+
+KvValueTail: String = {
+    "," <id:IdentOrKw> => format!(",{id}"),
+    "/" <id:IdentOrKw> => format!("/{id}"),
+    <p:"path"> => p.text,
+};
+
+TopItem: TopItem = {
+    <d:TypeDef> => TopItem::Type(d),
+    <s:Service> => TopItem::Service(s),
+};
+
+TypeDef: TypeDef = {
+    "struct" <name:IdentOrKw> "{" <fields:Field*> "}" => TypeDef { name, fields },
+};
+
+Field: Field = {
+    <lines:FieldAttrLine*> <name:IdentOrKw> ":" <ty:TypeExpr> ","? => Field {
+        attrs: lines.into_iter().flatten().collect(),
+        name,
+        ty,
+    },
+};
+
+FieldAttrLine: Vec<FieldAttr> = {
+    "#[" <items:FieldAttrList> "]" => items,
+};
+
+FieldAttrList: Vec<FieldAttr> = {
+    <head:FieldAttrItem> <tail:FieldAttrTail*> => {
+        let mut items = vec![head];
+        items.extend(tail);
+        items
+    },
+};
+
+FieldAttrTail: FieldAttr = {
+    "," <item:FieldAttrItem> => item,
+};
+
+FieldAttrItem: FieldAttr = {
+    <name:IdentOrKw> => FieldAttr { name, value: None },
+    <name:IdentOrKw> "(" <v:"string"> ")" => FieldAttr {
+        name,
+        value: Some(unquote(&v.text)),
+    },
+    <name:IdentOrKw> "(" <id:IdentOrKw> ")" => FieldAttr {
+        name,
+        value: Some(id),
+    },
+};
+
+TypeExpr: TypeExpr = {
+    <inner:TypeExprPrimary> "?" => TypeExpr::Optional(Box::new(inner)),
+    <inner:TypeExprPrimary> => inner,
+};
+
+TypeExprPrimary: TypeExpr = {
+    <name:IdentOrKw> => TypeExpr::Named(name),
+    "[" <inner:TypeExpr> "]" => TypeExpr::List(Box::new(inner)),
+    "{" <key:TypeExpr> ":" <value:TypeExpr> "}" => TypeExpr::Map {
+        key: Box::new(key),
+        value: Box::new(value),
+    },
+};
+
+Service: Service = {
+    <server:ServerAttr?> "service" <name:IdentOrKw> "{" <routes:Route*> "}" => Service {
+        server,
+        name,
+        routes,
+    },
+};
+
+ServerAttr: AtServer = {
+    "#[" "ident" <items:AttrArgs?> "]" => AtServer { items: items.unwrap_or_default() },
+    "@server" <items:AttrArgs?> => AtServer { items: items.unwrap_or_default() },
+};
+
+AttrArgs: Vec<InfoItem> = {
+    "(" <items:Kv*> ")" => items,
+};
+
+Route: Route = {
+    <doc:DocAttr?> <handler:HandlerAttr?> <method:HttpMethod> <path:RoutePath> <request:RequestType?> <returns:ReturnsType?> ";"? => Route {
+        doc,
+        handler,
+        method,
+        path,
+        request: request.flatten(),
+        returns,
+    },
+};
+
+DocAttr: AtDoc = {
+    "#[" "ident" <v:"string"> "]" => AtDoc { text: Some(unquote(&v.text)) },
+    "@doc" <v:"string"> => AtDoc { text: Some(unquote(&v.text)) },
+    "@doc" "(" <items:Kv*> ")" => AtDoc {
+        text: items.into_iter().find(|item| item.key == "desc" || item.key == "description").map(|item| item.value),
+    },
+};
+
+HandlerAttr: String = {
+    "#[" "ident" "(" <name:IdentOrKw> ")" "]" => name,
+    "@handler" <name:IdentOrKw> => name,
+};
+
+HttpMethod: HttpMethod = {
+    "get" => HttpMethod::Get,
+    "head" => HttpMethod::Head,
+    "post" => HttpMethod::Post,
+    "put" => HttpMethod::Put,
+    "patch" => HttpMethod::Patch,
+    "delete" => HttpMethod::Delete,
+    "connect" => HttpMethod::Connect,
+    "options" => HttpMethod::Options,
+    "trace" => HttpMethod::Trace,
+};
+
+RoutePath: String = {
+    <p:"path"> => p.text,
+    "/" => "/".to_string(),
+};
+
+RequestType: Option<TypeExpr> = {
+    "(" ")" => None,
+    "(" <ty:TypeExpr> ")" => Some(ty),
+};
+
+ReturnsType: TypeExpr = {
+    "->" <ty:TypeExpr> => ty,
+};
+
+IdentOrKw: String = {
+    <t:"ident"> => t.text,
+    <t:"syntax"> => token_text(&t),
+    <t:"import"> => token_text(&t),
+    <t:"info"> => token_text(&t),
+    <t:"struct"> => token_text(&t),
+    <t:"service"> => token_text(&t),
+    <t:"get"> => token_text(&t),
+    <t:"head"> => token_text(&t),
+    <t:"post"> => token_text(&t),
+    <t:"put"> => token_text(&t),
+    <t:"patch"> => token_text(&t),
+    <t:"delete"> => token_text(&t),
+    <t:"connect"> => token_text(&t),
+    <t:"options"> => token_text(&t),
+    <t:"trace"> => token_text(&t),
+};

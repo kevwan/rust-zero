@@ -1,0 +1,14 @@
+---------- Input ----------
+@@@
+---------- Error -----------
+invalid token
+
+
+---------- Input ----------
+syntax = "v1"
+service greet {
+    unknown /ping -> Resp
+}
+---------- Error -----------
+unexpected
+
