@@ -2,6 +2,7 @@
 
 mod entry;
 mod handlers;
+mod manifest;
 mod request;
 mod routes;
 mod types;
@@ -19,6 +20,10 @@ pub struct GeneratedFile {
 /// Generate rust-zero REST files from a parsed `.api` tree.
 pub fn generate(ast: &ApiFile) -> Vec<GeneratedFile> {
     let mut files = vec![
+        GeneratedFile {
+            path: "Cargo.toml".into(),
+            contents: manifest::render(ast),
+        },
         GeneratedFile {
             path: "src/main.rs".into(),
             contents: entry::render(),

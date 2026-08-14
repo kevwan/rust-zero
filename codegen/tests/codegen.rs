@@ -59,6 +59,10 @@ fn test_generate_ok() {
             }
         }
         assert!(
+            generated.iter().any(|item| item.path == "Cargo.toml"),
+            "{stem}: missing Cargo.toml"
+        );
+        assert!(
             generated.iter().any(|item| item.path == "src/main.rs"),
             "{stem}: missing src/main.rs"
         );
@@ -78,7 +82,7 @@ fn test_generate_ok() {
         );
         for item in &generated {
             assert!(
-                item.path.starts_with("src/"),
+                item.path == "Cargo.toml" || item.path.starts_with("src/"),
                 "{stem}: unexpected path {}",
                 item.path
             );
@@ -101,6 +105,11 @@ fn test_generate_ok() {
         assert!(
             routes.contains("pub fn route_groups()"),
             "{stem}: routes.rs missing route_groups"
+        );
+        let manifest = file_named(&generated, "Cargo.toml");
+        assert!(
+            manifest.contains("rust-zero-rest"),
+            "{stem}: Cargo.toml missing rust-zero-rest"
         );
     }
 }

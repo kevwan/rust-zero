@@ -62,8 +62,8 @@ fn render_handler_file(ast: &ApiFile, route: &Route) -> String {
     pretty(
         "// Code scaffolded by rust-zero. Safe to edit.\n\n",
         quote! {
-            use actix_web::web;
             #types_use
+            use actix_web::web;
             #extract_use
             #handler
         },

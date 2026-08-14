@@ -5,11 +5,11 @@ pub(crate) fn render() -> String {
     pretty(
         "// Code scaffolded by rust-zero. Safe to edit.\n\n",
         quote! {
-            use rest::{RestServer, RestServerConfig};
-
             mod handlers;
             mod routes;
             mod types;
+
+            use rest::{RestServer, RestServerConfig};
 
             #[actix_web::main]
             async fn main() -> std::io::Result<()> {

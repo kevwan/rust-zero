@@ -1,6 +1,8 @@
 use ast::{Field, HttpMethod, Route, TypeExpr};
 use proc_macro2::{Span, TokenStream};
 use quote::quote;
+use std::io::Write;
+use std::process::{Command, Stdio};
 use syn::{Ident, Type};
 
 const KEYWORDS: &[&str] = &[
@@ -13,7 +15,76 @@ const KEYWORDS: &[&str] = &[
 pub(crate) fn pretty(banner: &str, tokens: TokenStream) -> String {
     let file: syn::File = syn::parse2(tokens.clone())
         .unwrap_or_else(|err| panic!("generated invalid Rust: {err}\n{tokens}"));
-    format!("{banner}{}", prettyplease::unparse(&file))
+    let source = format!("{banner}{}", prettyplease::unparse(&file));
+    let formatted = rustfmt(&source).unwrap_or(source);
+    space_items(&formatted)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ItemKind {
+    Use,
+    Mod,
+    Attr,
+    Item,
+}
+
+fn item_kind(line: &str) -> Option<ItemKind> {
+    if line.starts_with("use ") {
+        Some(ItemKind::Use)
+    } else if line.starts_with("mod ") {
+        Some(ItemKind::Mod)
+    } else if line.starts_with("#[") {
+        Some(ItemKind::Attr)
+    } else if line.starts_with("pub ") || line.starts_with("fn ") || line.starts_with("impl ") {
+        Some(ItemKind::Item)
+    } else {
+        None
+    }
+}
+
+fn space_items(source: &str) -> String {
+    let mut out = String::new();
+    let mut prev = None;
+    for line in source.lines() {
+        let kind = item_kind(line);
+        let blank = match (prev, kind) {
+            (Some(ItemKind::Use), Some(ItemKind::Use))
+            | (Some(ItemKind::Mod), Some(ItemKind::Mod))
+            | (Some(ItemKind::Attr), Some(ItemKind::Attr))
+            | (Some(ItemKind::Attr), Some(ItemKind::Item)) => false,
+            (Some(_), Some(_)) => true,
+            _ => false,
+        };
+        if blank {
+            out.push('\n');
+        }
+        out.push_str(line);
+        out.push('\n');
+        if line.is_empty() {
+            prev = None;
+        } else if !line.starts_with(' ') && !line.starts_with('\t') {
+            if kind.is_some() {
+                prev = kind;
+            }
+        }
+    }
+    out
+}
+
+fn rustfmt(source: &str) -> Option<String> {
+    let mut child = Command::new("rustfmt")
+        .args(["--emit", "stdout", "--quiet", "--edition", "2021"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    child.stdin.take()?.write_all(source.as_bytes()).ok()?;
+    let output = child.wait_with_output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout).ok()
 }
 
 pub(crate) fn rust_ident(name: &str) -> Ident {
