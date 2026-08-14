@@ -600,7 +600,10 @@ not-found errors, Prometheus operation metrics, and opt-in OpenTelemetry spans.
 MongoDB stores provide the same typed operation, not-found, metrics, and tracing baseline, plus
 native bounded `insert_many` batching and cache-aware mutation helpers.
 Redis commands expose the same Prometheus and OpenTelemetry hooks, with explicit timeout outcomes
-and bounded labels for application-supplied raw commands.
+and bounded labels for application-supplied raw commands. Typed helpers cover incremental scans,
+bitmaps, HyperLogLog, blocking and atomic list/set operations, score/rank sorted-set queries and
+mutations, stream inspection, and atomic pipelines; `do_command` remains available for uncommon or
+new Redis commands.
 The Redis-backed token and keyed-period limiters execute atomic Lua scripts against standalone or
 clustered deployments. Fixed windows use Redis server time and aligned boundaries. During an
 outage, a bounded process-local limiter protects the instance while a single caller periodically
@@ -617,6 +620,11 @@ use std::time::Duration;
 let redis = RedisStore::new(RedisStoreConfig::new("redis://127.0.0.1/"))?;
 redis
     .set_json("user:42", &serde_json::json!({"name": "Ada"}), Some(Duration::from_secs(60)))
+    .await?;
+redis.bitmap_set("daily-active", 42, true).await?;
+let active = redis.bitmap_count("daily-active", None).await?;
+let recent = redis
+    .sorted_set_range_by_score_with_scores("recent-users", 0.0, f64::INFINITY, Some((0, 100)))
     .await?;
 
 let requests = RedisTokenLimiter::new(redis.clone(), "checkout", 100, 200);

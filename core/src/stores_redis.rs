@@ -263,6 +263,49 @@ enum RedisSubscriptionMode {
     Patterns,
 }
 
+/// One cursor page returned by Redis' incremental scan commands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RedisScanPage<T> {
+    pub cursor: u64,
+    pub items: Vec<T>,
+}
+
+/// Source or destination side used by [`RedisStore::list_move`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RedisListSide {
+    Left,
+    Right,
+}
+
+impl RedisListSide {
+    fn argument(self) -> &'static str {
+        match self {
+            Self::Left => "LEFT",
+            Self::Right => "RIGHT",
+        }
+    }
+}
+
+/// Bitwise operation used by [`RedisStore::bitmap_operation`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RedisBitOperation {
+    And,
+    Or,
+    Xor,
+    Not,
+}
+
+impl RedisBitOperation {
+    fn argument(self) -> &'static str {
+        match self {
+            Self::And => "AND",
+            Self::Or => "OR",
+            Self::Xor => "XOR",
+            Self::Not => "NOT",
+        }
+    }
+}
+
 impl RedisStore {
     pub fn new(config: RedisStoreConfig) -> Result<Self, RedisStoreError> {
         let client = if config.cluster {
@@ -416,6 +459,43 @@ impl RedisStore {
         self.run("delete", connection.del(keys)).await
     }
 
+    /// Asynchronously unlinks keys from the keyspace and returns the number found.
+    pub async fn unlink(&self, keys: &[&str]) -> Result<u64, RedisStoreError> {
+        if keys.is_empty() {
+            return Ok(0);
+        }
+        let mut command = redis::cmd("UNLINK");
+        command.arg(keys.iter().map(|key| self.key(key)).collect::<Vec<_>>());
+        self.query(&mut command).await
+    }
+
+    /// Incrementally scans logical keys in this store's namespace.
+    ///
+    /// Returned keys have the configured prefix removed. In cluster mode, Redis applies `SCAN`
+    /// to the routed node; callers that need a cluster-wide inventory should scan every node.
+    pub async fn scan_keys(
+        &self,
+        cursor: u64,
+        pattern: Option<&str>,
+        count: Option<usize>,
+    ) -> Result<RedisScanPage<Vec<u8>>, RedisStoreError> {
+        let mut command = redis::cmd("SCAN");
+        command.arg(cursor);
+        let pattern = pattern.map(|pattern| self.key(pattern)).or_else(|| {
+            (!self.config.key_prefix.is_empty()).then(|| format!("{}*", self.config.key_prefix))
+        });
+        append_scan_options(&mut command, pattern.as_deref(), count)?;
+        let (cursor, keys): (u64, Vec<Vec<u8>>) = self.query(&mut command).await?;
+        let prefix = self.config.key_prefix.as_bytes();
+        Ok(RedisScanPage {
+            cursor,
+            items: keys
+                .into_iter()
+                .map(|key| key.strip_prefix(prefix).unwrap_or(&key).to_vec())
+                .collect(),
+        })
+    }
+
     pub async fn exists(&self, key: &str) -> Result<bool, RedisStoreError> {
         let mut connection = self.connection().await?;
         let key = self.key(key);
@@ -462,6 +542,130 @@ impl RedisStore {
         }
     }
 
+    pub async fn bitmap_get(&self, key: &str, offset: u64) -> Result<bool, RedisStoreError> {
+        let mut command = redis::cmd("GETBIT");
+        command.arg(self.key(key)).arg(offset);
+        self.query(&mut command).await
+    }
+
+    /// Sets one bit and returns its previous value.
+    pub async fn bitmap_set(
+        &self,
+        key: &str,
+        offset: u64,
+        value: bool,
+    ) -> Result<bool, RedisStoreError> {
+        let mut command = redis::cmd("SETBIT");
+        command.arg(self.key(key)).arg(offset).arg(u8::from(value));
+        self.query(&mut command).await
+    }
+
+    /// Counts set bits in the whole value or an inclusive byte range.
+    pub async fn bitmap_count(
+        &self,
+        key: &str,
+        byte_range: Option<(isize, isize)>,
+    ) -> Result<u64, RedisStoreError> {
+        let mut command = redis::cmd("BITCOUNT");
+        command.arg(self.key(key));
+        if let Some((start, stop)) = byte_range {
+            command.arg(start).arg(stop);
+        }
+        self.query(&mut command).await
+    }
+
+    /// Finds the first bit matching `value`, optionally within an inclusive byte range.
+    pub async fn bitmap_position(
+        &self,
+        key: &str,
+        value: bool,
+        byte_range: Option<(isize, isize)>,
+    ) -> Result<Option<u64>, RedisStoreError> {
+        let mut command = redis::cmd("BITPOS");
+        command.arg(self.key(key)).arg(u8::from(value));
+        if let Some((start, stop)) = byte_range {
+            command.arg(start).arg(stop);
+        }
+        match self.query::<i64>(&mut command).await? {
+            -1 => Ok(None),
+            position if position >= 0 => Ok(Some(position as u64)),
+            value => Err(RedisStoreError::UnexpectedResponse(format!(
+                "BITPOS returned {value}"
+            ))),
+        }
+    }
+
+    /// Applies a bitwise operation into `destination` and returns its resulting byte length.
+    pub async fn bitmap_operation(
+        &self,
+        operation: RedisBitOperation,
+        destination: &str,
+        sources: &[&str],
+    ) -> Result<u64, RedisStoreError> {
+        let valid_source_count = match operation {
+            RedisBitOperation::Not => sources.len() == 1,
+            _ => !sources.is_empty(),
+        };
+        if !valid_source_count {
+            return Err(RedisStoreError::InvalidArgument(
+                "Redis BITOP requires one source for NOT and at least one for other operations",
+            ));
+        }
+        let mut command = redis::cmd("BITOP");
+        command
+            .arg(operation.argument())
+            .arg(self.key(destination))
+            .arg(sources.iter().map(|key| self.key(key)).collect::<Vec<_>>());
+        self.query(&mut command).await
+    }
+
+    /// Adds values to a HyperLogLog and reports whether its registers changed.
+    pub async fn hyperloglog_add<V: AsRef<[u8]>>(
+        &self,
+        key: &str,
+        values: &[V],
+    ) -> Result<bool, RedisStoreError> {
+        if values.is_empty() {
+            return Err(RedisStoreError::InvalidArgument(
+                "Redis PFADD requires at least one value",
+            ));
+        }
+        let mut command = redis::cmd("PFADD");
+        command.arg(self.key(key));
+        for value in values {
+            command.arg(value.as_ref());
+        }
+        self.query(&mut command).await
+    }
+
+    pub async fn hyperloglog_count(&self, keys: &[&str]) -> Result<u64, RedisStoreError> {
+        if keys.is_empty() {
+            return Err(RedisStoreError::InvalidArgument(
+                "Redis PFCOUNT requires at least one key",
+            ));
+        }
+        let mut command = redis::cmd("PFCOUNT");
+        command.arg(keys.iter().map(|key| self.key(key)).collect::<Vec<_>>());
+        self.query(&mut command).await
+    }
+
+    pub async fn hyperloglog_merge(
+        &self,
+        destination: &str,
+        sources: &[&str],
+    ) -> Result<(), RedisStoreError> {
+        if sources.is_empty() {
+            return Err(RedisStoreError::InvalidArgument(
+                "Redis PFMERGE requires at least one source",
+            ));
+        }
+        let mut command = redis::cmd("PFMERGE");
+        command
+            .arg(self.key(destination))
+            .arg(sources.iter().map(|key| self.key(key)).collect::<Vec<_>>());
+        expect_ok(self.query(&mut command).await?, "PFMERGE")
+    }
+
     pub async fn hash_get(
         &self,
         key: &str,
@@ -490,6 +694,20 @@ impl RedisStore {
         let mut command = redis::cmd("HGETALL");
         command.arg(self.key(key));
         self.query(&mut command).await
+    }
+
+    pub async fn hash_scan(
+        &self,
+        key: &str,
+        cursor: u64,
+        pattern: Option<&str>,
+        count: Option<usize>,
+    ) -> Result<RedisScanPage<(Vec<u8>, Vec<u8>)>, RedisStoreError> {
+        let mut command = redis::cmd("HSCAN");
+        command.arg(self.key(key)).arg(cursor);
+        append_scan_options(&mut command, pattern, count)?;
+        let (cursor, items) = self.query(&mut command).await?;
+        Ok(RedisScanPage { cursor, items })
     }
 
     pub async fn hash_delete(&self, key: &str, fields: &[&str]) -> Result<u64, RedisStoreError> {
@@ -540,6 +758,41 @@ impl RedisStore {
         self.query(&mut command).await
     }
 
+    /// Blocks until a value can be popped from the first non-empty key or the timeout elapses.
+    pub async fn list_blocking_pop_front(
+        &self,
+        keys: &[&str],
+        timeout: Duration,
+    ) -> Result<Option<(String, Vec<u8>)>, RedisStoreError> {
+        self.list_blocking_pop("BLPOP", keys, timeout).await
+    }
+
+    /// Right-side counterpart of [`Self::list_blocking_pop_front`].
+    pub async fn list_blocking_pop_back(
+        &self,
+        keys: &[&str],
+        timeout: Duration,
+    ) -> Result<Option<(String, Vec<u8>)>, RedisStoreError> {
+        self.list_blocking_pop("BRPOP", keys, timeout).await
+    }
+
+    /// Atomically moves one list element and returns it, if the source exists.
+    pub async fn list_move(
+        &self,
+        source: &str,
+        destination: &str,
+        source_side: RedisListSide,
+        destination_side: RedisListSide,
+    ) -> Result<Option<Vec<u8>>, RedisStoreError> {
+        let mut command = redis::cmd("LMOVE");
+        command
+            .arg(self.key(source))
+            .arg(self.key(destination))
+            .arg(source_side.argument())
+            .arg(destination_side.argument());
+        self.query(&mut command).await
+    }
+
     pub async fn list_range(
         &self,
         key: &str,
@@ -576,6 +829,35 @@ impl RedisStore {
     pub async fn set_members(&self, key: &str) -> Result<HashSet<Vec<u8>>, RedisStoreError> {
         let mut command = redis::cmd("SMEMBERS");
         command.arg(self.key(key));
+        self.query(&mut command).await
+    }
+
+    pub async fn set_scan(
+        &self,
+        key: &str,
+        cursor: u64,
+        pattern: Option<&str>,
+        count: Option<usize>,
+    ) -> Result<RedisScanPage<Vec<u8>>, RedisStoreError> {
+        let mut command = redis::cmd("SSCAN");
+        command.arg(self.key(key)).arg(cursor);
+        append_scan_options(&mut command, pattern, count)?;
+        let (cursor, items) = self.query(&mut command).await?;
+        Ok(RedisScanPage { cursor, items })
+    }
+
+    /// Atomically moves a set member and reports whether it existed in the source.
+    pub async fn set_move(
+        &self,
+        source: &str,
+        destination: &str,
+        member: impl AsRef<[u8]>,
+    ) -> Result<bool, RedisStoreError> {
+        let mut command = redis::cmd("SMOVE");
+        command
+            .arg(self.key(source))
+            .arg(self.key(destination))
+            .arg(member.as_ref());
         self.query(&mut command).await
     }
 
@@ -635,6 +917,101 @@ impl RedisStore {
             .arg(stop)
             .arg("WITHSCORES");
         self.query(&mut command).await
+    }
+
+    pub async fn sorted_set_reverse_range_with_scores(
+        &self,
+        key: &str,
+        start: isize,
+        stop: isize,
+    ) -> Result<Vec<(Vec<u8>, f64)>, RedisStoreError> {
+        let mut command = redis::cmd("ZREVRANGE");
+        command
+            .arg(self.key(key))
+            .arg(start)
+            .arg(stop)
+            .arg("WITHSCORES");
+        self.query(&mut command).await
+    }
+
+    pub async fn sorted_set_range_by_score_with_scores(
+        &self,
+        key: &str,
+        min: f64,
+        max: f64,
+        limit: Option<(usize, usize)>,
+    ) -> Result<Vec<(Vec<u8>, f64)>, RedisStoreError> {
+        self.sorted_set_score_range("ZRANGEBYSCORE", key, min, max, limit)
+            .await
+    }
+
+    pub async fn sorted_set_reverse_range_by_score_with_scores(
+        &self,
+        key: &str,
+        min: f64,
+        max: f64,
+        limit: Option<(usize, usize)>,
+    ) -> Result<Vec<(Vec<u8>, f64)>, RedisStoreError> {
+        self.sorted_set_score_range("ZREVRANGEBYSCORE", key, min, max, limit)
+            .await
+    }
+
+    pub async fn sorted_set_increment(
+        &self,
+        key: &str,
+        amount: f64,
+        member: impl AsRef<[u8]>,
+    ) -> Result<f64, RedisStoreError> {
+        let mut command = redis::cmd("ZINCRBY");
+        command.arg(self.key(key)).arg(amount).arg(member.as_ref());
+        self.query(&mut command).await
+    }
+
+    pub async fn sorted_set_rank(
+        &self,
+        key: &str,
+        member: impl AsRef<[u8]>,
+        reverse: bool,
+    ) -> Result<Option<u64>, RedisStoreError> {
+        let mut command = redis::cmd(if reverse { "ZREVRANK" } else { "ZRANK" });
+        command.arg(self.key(key)).arg(member.as_ref());
+        self.query(&mut command).await
+    }
+
+    pub async fn sorted_set_remove_by_rank(
+        &self,
+        key: &str,
+        start: isize,
+        stop: isize,
+    ) -> Result<u64, RedisStoreError> {
+        let mut command = redis::cmd("ZREMRANGEBYRANK");
+        command.arg(self.key(key)).arg(start).arg(stop);
+        self.query(&mut command).await
+    }
+
+    pub async fn sorted_set_remove_by_score(
+        &self,
+        key: &str,
+        min: f64,
+        max: f64,
+    ) -> Result<u64, RedisStoreError> {
+        let mut command = redis::cmd("ZREMRANGEBYSCORE");
+        command.arg(self.key(key)).arg(min).arg(max);
+        self.query(&mut command).await
+    }
+
+    pub async fn sorted_set_scan(
+        &self,
+        key: &str,
+        cursor: u64,
+        pattern: Option<&str>,
+        count: Option<usize>,
+    ) -> Result<RedisScanPage<(Vec<u8>, f64)>, RedisStoreError> {
+        let mut command = redis::cmd("ZSCAN");
+        command.arg(self.key(key)).arg(cursor);
+        append_scan_options(&mut command, pattern, count)?;
+        let (cursor, items) = self.query(&mut command).await?;
+        Ok(RedisScanPage { cursor, items })
     }
 
     pub async fn sorted_set_score(
@@ -701,6 +1078,22 @@ impl RedisStore {
     ) -> Result<T, RedisStoreError> {
         let mut connection = self.connection().await?;
         self.run("pipeline", pipeline.query_async(&mut connection))
+            .await
+    }
+
+    /// Builds and executes an atomic `MULTI`/`EXEC` transaction.
+    ///
+    /// All keys in a clustered transaction must belong to the same Redis hash slot.
+    pub async fn transaction<T, F>(&self, build: F) -> Result<T, RedisStoreError>
+    where
+        T: FromRedisValue,
+        F: FnOnce(&mut Pipeline),
+    {
+        let mut pipeline = redis::pipe();
+        pipeline.atomic();
+        build(&mut pipeline);
+        let mut connection = self.connection().await?;
+        self.run("transaction", pipeline.query_async(&mut connection))
             .await
     }
 
@@ -823,6 +1216,31 @@ impl RedisStore {
     pub async fn stream_pending(&self, key: &str, group: &str) -> Result<Value, RedisStoreError> {
         let mut command = redis::cmd("XPENDING");
         command.arg(self.key(key)).arg(group);
+        self.query(&mut command).await
+    }
+
+    /// Returns Redis-version-specific stream metadata from `XINFO STREAM`.
+    pub async fn stream_info(&self, key: &str) -> Result<Value, RedisStoreError> {
+        let mut command = redis::cmd("XINFO");
+        command.arg("STREAM").arg(self.key(key));
+        self.query(&mut command).await
+    }
+
+    /// Returns Redis-version-specific group metadata from `XINFO GROUPS`.
+    pub async fn stream_group_info(&self, key: &str) -> Result<Value, RedisStoreError> {
+        let mut command = redis::cmd("XINFO");
+        command.arg("GROUPS").arg(self.key(key));
+        self.query(&mut command).await
+    }
+
+    /// Returns Redis-version-specific consumer metadata from `XINFO CONSUMERS`.
+    pub async fn stream_consumer_info(
+        &self,
+        key: &str,
+        group: &str,
+    ) -> Result<Value, RedisStoreError> {
+        let mut command = redis::cmd("XINFO");
+        command.arg("CONSUMERS").arg(self.key(key)).arg(group);
         self.query(&mut command).await
     }
 
@@ -1021,6 +1439,56 @@ impl RedisStore {
         command.arg(self.key(key));
         for value in values {
             command.arg(value.as_ref());
+        }
+        self.query(&mut command).await
+    }
+
+    async fn list_blocking_pop(
+        &self,
+        name: &str,
+        keys: &[&str],
+        timeout: Duration,
+    ) -> Result<Option<(String, Vec<u8>)>, RedisStoreError> {
+        if keys.is_empty() || timeout.is_zero() {
+            return Err(RedisStoreError::InvalidArgument(
+                "Redis blocking list pop requires keys and a positive timeout",
+            ));
+        }
+        let mut command = redis::cmd(name);
+        command
+            .arg(keys.iter().map(|key| self.key(key)).collect::<Vec<_>>())
+            .arg(timeout.as_secs_f64());
+        let result: Option<(String, Vec<u8>)> = self.query(&mut command).await?;
+        Ok(result.map(|(key, value)| {
+            let key = key
+                .strip_prefix(&self.config.key_prefix)
+                .unwrap_or(&key)
+                .to_owned();
+            (key, value)
+        }))
+    }
+
+    async fn sorted_set_score_range(
+        &self,
+        name: &str,
+        key: &str,
+        min: f64,
+        max: f64,
+        limit: Option<(usize, usize)>,
+    ) -> Result<Vec<(Vec<u8>, f64)>, RedisStoreError> {
+        let mut command = redis::cmd(name);
+        command.arg(self.key(key));
+        if name == "ZREVRANGEBYSCORE" {
+            command.arg(max).arg(min);
+        } else {
+            command.arg(min).arg(max);
+        }
+        command.arg("WITHSCORES");
+        if let Some((offset, count)) = limit {
+            if count == 0 {
+                return Ok(Vec::new());
+            }
+            command.arg("LIMIT").arg(offset).arg(count);
         }
         self.query(&mut command).await
     }
@@ -1498,22 +1966,33 @@ fn redis_command_name(command: &Cmd) -> &'static str {
     match name {
         Some(b"DECRBY") => "decrement",
         Some(b"DEL") => "delete",
+        Some(b"BITCOUNT") => "bitmap_count",
+        Some(b"BITOP") => "bitmap_operation",
+        Some(b"BITPOS") => "bitmap_position",
+        Some(b"BLPOP") => "list_blocking_pop_left",
+        Some(b"BRPOP") => "list_blocking_pop_right",
         Some(b"EVAL") => "eval",
         Some(b"EXISTS") => "exists",
         Some(b"GET") => "get",
+        Some(b"GETBIT") => "bitmap_get",
         Some(b"HDEL") => "hash_delete",
         Some(b"HGET") => "hash_get",
         Some(b"HGETALL") => "hash_get_all",
         Some(b"HINCRBY") => "hash_increment",
+        Some(b"HSCAN") => "hash_scan",
         Some(b"HSET") => "hash_set",
         Some(b"INCRBY") => "increment",
         Some(b"LLEN") => "list_len",
+        Some(b"LMOVE") => "list_move",
         Some(b"LPOP") => "list_pop_left",
         Some(b"LPUSH") => "list_push_left",
         Some(b"LRANGE") => "list_range",
         Some(b"MGET") => "get_many",
         Some(b"MSET") => "set_many",
         Some(b"PERSIST") => "persist",
+        Some(b"PFADD") => "hyperloglog_add",
+        Some(b"PFCOUNT") => "hyperloglog_count",
+        Some(b"PFMERGE") => "hyperloglog_merge",
         Some(b"PEXPIRE") => "expire",
         Some(b"PING") => "ping",
         Some(b"PTTL") => "ttl",
@@ -1521,23 +2000,38 @@ fn redis_command_name(command: &Cmd) -> &'static str {
         Some(b"RPOP") => "list_pop_right",
         Some(b"RPUSH") => "list_push_right",
         Some(b"SADD") => "set_add",
+        Some(b"SCAN") => "scan_keys",
         Some(b"SCARD") => "set_len",
         Some(b"SET") => "set",
+        Some(b"SETBIT") => "bitmap_set",
         Some(b"SISMEMBER") => "set_contains",
         Some(b"SMEMBERS") => "set_members",
+        Some(b"SMOVE") => "set_move",
         Some(b"SREM") => "set_remove",
+        Some(b"SSCAN") => "set_scan",
+        Some(b"UNLINK") => "unlink",
         Some(b"XACK") => "stream_ack",
         Some(b"XADD") => "stream_add",
         Some(b"XCLAIM") => "stream_claim",
         Some(b"XDEL") => "stream_delete",
         Some(b"XGROUP") => "stream_group",
+        Some(b"XINFO") => "stream_info",
         Some(b"XPENDING") => "stream_pending",
         Some(b"XREAD") => "stream_read",
         Some(b"XREADGROUP") => "stream_group_read",
         Some(b"ZADD") => "sorted_set_add",
         Some(b"ZCARD") => "sorted_set_len",
+        Some(b"ZINCRBY") => "sorted_set_increment",
         Some(b"ZRANGE") => "sorted_set_range",
+        Some(b"ZRANGEBYSCORE") => "sorted_set_score_range",
         Some(b"ZREM") => "sorted_set_remove",
+        Some(b"ZREMRANGEBYRANK") => "sorted_set_remove_rank",
+        Some(b"ZREMRANGEBYSCORE") => "sorted_set_remove_score",
+        Some(b"ZREVRANGE") => "sorted_set_reverse_range",
+        Some(b"ZREVRANGEBYSCORE") => "sorted_set_reverse_score_range",
+        Some(b"ZREVRANK") => "sorted_set_reverse_rank",
+        Some(b"ZRANK") => "sorted_set_rank",
+        Some(b"ZSCAN") => "sorted_set_scan",
         Some(b"ZSCORE") => "sorted_set_score",
         _ => "other",
     }
@@ -1744,6 +2238,25 @@ fn duration_millis(duration: Duration) -> Result<u64, RedisStoreError> {
         .map_err(|_| RedisStoreError::DurationOverflow)
 }
 
+fn append_scan_options(
+    command: &mut Cmd,
+    pattern: Option<&str>,
+    count: Option<usize>,
+) -> Result<(), RedisStoreError> {
+    if count == Some(0) {
+        return Err(RedisStoreError::InvalidArgument(
+            "Redis scan count must be positive",
+        ));
+    }
+    if let Some(pattern) = pattern {
+        command.arg("MATCH").arg(pattern);
+    }
+    if let Some(count) = count {
+        command.arg("COUNT").arg(count);
+    }
+    Ok(())
+}
+
 fn append_stream_read_options(
     command: &mut Cmd,
     count: Option<usize>,
@@ -1939,6 +2452,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejects_invalid_typed_operations_before_connecting() {
+        let store = RedisStore::new(RedisStoreConfig::new("redis://127.0.0.1/")).unwrap();
+        assert!(matches!(
+            store.scan_keys(0, None, Some(0)).await,
+            Err(RedisStoreError::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            store
+                .list_blocking_pop_front(&[], Duration::from_secs(1))
+                .await,
+            Err(RedisStoreError::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            store
+                .bitmap_operation(RedisBitOperation::Not, "destination", &["one", "two"])
+                .await,
+            Err(RedisStoreError::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            store.hyperloglog_add::<&[u8]>("visitors", &[]).await,
+            Err(RedisStoreError::InvalidArgument(_))
+        ));
+        assert_eq!(
+            store
+                .sorted_set_range_by_score_with_scores("scores", 0.0, 1.0, Some((0, 0)))
+                .await
+                .unwrap(),
+            Vec::new()
+        );
+    }
+
+    #[tokio::test]
     async fn rejects_invalid_subscription_configuration_before_connecting() {
         let store = RedisStore::new(RedisStoreConfig::new("redis://127.0.0.1/")).unwrap();
         assert!(matches!(
@@ -2067,8 +2612,26 @@ mod tests {
         );
         store
             .delete(&[
-                "user", "count", "lock", "string", "hash", "list", "set", "sorted", "stream",
+                "user",
+                "count",
+                "lock",
+                "string",
+                "hash",
+                "list",
+                "list-moved",
+                "set",
+                "set-moved",
+                "sorted",
+                "stream",
                 "pipeline",
+                "transaction",
+                "bitmap-a",
+                "bitmap-b",
+                "bitmap-destination",
+                "hll-a",
+                "hll-b",
+                "hll-merged",
+                "unlink-temp",
             ])
             .await
             .unwrap();
@@ -2094,6 +2657,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(raw_count, 5);
+        store.set("unlink-temp", "value", None).await.unwrap();
+        assert_eq!(store.unlink(&["unlink-temp"]).await.unwrap(), 1);
+        assert!(!store.exists("unlink-temp").await.unwrap());
 
         let mut pipeline = redis::pipe();
         pipeline
@@ -2156,6 +2722,21 @@ mod tests {
             .await
             .unwrap();
         assert!(!matches!(claimed, Value::Nil));
+        assert!(!matches!(
+            store.stream_info("stream").await.unwrap(),
+            Value::Nil
+        ));
+        assert!(!matches!(
+            store.stream_group_info("stream").await.unwrap(),
+            Value::Nil
+        ));
+        assert!(!matches!(
+            store
+                .stream_consumer_info("stream", "workers")
+                .await
+                .unwrap(),
+            Value::Nil
+        ));
         assert_eq!(
             store
                 .stream_ack("stream", "workers", &[&stream_id])
@@ -2195,6 +2776,12 @@ mod tests {
         );
         assert_eq!(store.hash_increment("hash", "visits", 2).await.unwrap(), 2);
         assert_eq!(store.hash_get_all("hash").await.unwrap().len(), 2);
+        let hash_page = store
+            .hash_scan("hash", 0, Some("n*"), Some(10))
+            .await
+            .unwrap();
+        assert_eq!(hash_page.cursor, 0);
+        assert_eq!(hash_page.items, vec![(b"name".to_vec(), b"Ada".to_vec())]);
 
         assert_eq!(
             store.list_push_back("list", &["one", "two"]).await.unwrap(),
@@ -2208,10 +2795,34 @@ mod tests {
             store.list_pop_front("list").await.unwrap(),
             Some(b"one".to_vec())
         );
+        assert_eq!(
+            store
+                .list_move(
+                    "list",
+                    "list-moved",
+                    RedisListSide::Left,
+                    RedisListSide::Right,
+                )
+                .await
+                .unwrap(),
+            Some(b"two".to_vec())
+        );
+        store.list_push_back("list", &["blocking"]).await.unwrap();
+        assert_eq!(
+            store
+                .list_blocking_pop_back(&["list"], Duration::from_millis(100))
+                .await
+                .unwrap(),
+            Some(("list".to_owned(), b"blocking".to_vec()))
+        );
 
         assert_eq!(store.set_add("set", &["one", "two"]).await.unwrap(), 2);
         assert!(store.set_contains("set", "two").await.unwrap());
         assert_eq!(store.set_len("set").await.unwrap(), 2);
+        let set_page = store.set_scan("set", 0, None, Some(10)).await.unwrap();
+        assert_eq!(set_page.cursor, 0);
+        assert_eq!(set_page.items.len(), 2);
+        assert!(store.set_move("set", "set-moved", "two").await.unwrap());
 
         assert!(store.sorted_set_add("sorted", 2.0, "two").await.unwrap());
         assert!(store.sorted_set_add("sorted", 1.0, "one").await.unwrap());
@@ -2222,6 +2833,123 @@ mod tests {
                 .unwrap(),
             vec![(b"one".to_vec(), 1.0), (b"two".to_vec(), 2.0)]
         );
+        assert_eq!(
+            store
+                .sorted_set_increment("sorted", 2.0, "one")
+                .await
+                .unwrap(),
+            3.0
+        );
+        assert_eq!(
+            store.sorted_set_rank("sorted", "one", true).await.unwrap(),
+            Some(0)
+        );
+        assert_eq!(
+            store
+                .sorted_set_range_by_score_with_scores("sorted", 2.0, 3.0, Some((0, 10)))
+                .await
+                .unwrap(),
+            vec![(b"two".to_vec(), 2.0), (b"one".to_vec(), 3.0)]
+        );
+        assert_eq!(
+            store
+                .sorted_set_reverse_range_by_score_with_scores("sorted", 2.0, 3.0, None)
+                .await
+                .unwrap(),
+            vec![(b"one".to_vec(), 3.0), (b"two".to_vec(), 2.0)]
+        );
+        assert_eq!(
+            store
+                .sorted_set_reverse_range_with_scores("sorted", 0, -1)
+                .await
+                .unwrap(),
+            vec![(b"one".to_vec(), 3.0), (b"two".to_vec(), 2.0)]
+        );
+        assert_eq!(
+            store
+                .sorted_set_scan("sorted", 0, None, Some(10))
+                .await
+                .unwrap()
+                .items
+                .len(),
+            2
+        );
+        assert_eq!(
+            store
+                .sorted_set_remove_by_score("sorted", 3.0, 3.0)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .sorted_set_remove_by_rank("sorted", 0, 0)
+                .await
+                .unwrap(),
+            1
+        );
+
+        assert!(!store.bitmap_set("bitmap-a", 3, true).await.unwrap());
+        assert!(store.bitmap_get("bitmap-a", 3).await.unwrap());
+        assert_eq!(store.bitmap_count("bitmap-a", None).await.unwrap(), 1);
+        assert!(!store.bitmap_set("bitmap-b", 4, true).await.unwrap());
+        assert_eq!(
+            store
+                .bitmap_operation(
+                    RedisBitOperation::Or,
+                    "bitmap-destination",
+                    &["bitmap-a", "bitmap-b"],
+                )
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .bitmap_count("bitmap-destination", None)
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            store
+                .bitmap_position("bitmap-destination", true, None)
+                .await
+                .unwrap(),
+            Some(3)
+        );
+
+        assert!(store
+            .hyperloglog_add("hll-a", &["one", "two"])
+            .await
+            .unwrap());
+        assert!(store
+            .hyperloglog_add("hll-b", &["two", "three"])
+            .await
+            .unwrap());
+        store
+            .hyperloglog_merge("hll-merged", &["hll-a", "hll-b"])
+            .await
+            .unwrap();
+        assert_eq!(store.hyperloglog_count(&["hll-merged"]).await.unwrap(), 3);
+
+        let transaction_key = store.prefixed_key("transaction");
+        let (transaction_value,): (String,) = store
+            .transaction(|pipeline| {
+                pipeline
+                    .cmd("SET")
+                    .arg(&transaction_key)
+                    .arg("committed")
+                    .ignore()
+                    .cmd("GET")
+                    .arg(&transaction_key);
+            })
+            .await
+            .unwrap();
+        assert_eq!(transaction_value, "committed");
+
+        let key_page = store.scan_keys(0, Some("*"), Some(1_000)).await.unwrap();
+        assert!(key_page.items.iter().any(|key| key == b"bitmap-a"));
 
         let mut owner = store.lock("lock", Duration::from_secs(5));
         let mut contender = store.lock("lock", Duration::from_secs(5));
@@ -2374,6 +3102,57 @@ mod tests {
         assert!(lock.acquire().await.unwrap());
         assert!(lock.extend(Duration::from_secs(10)).await.unwrap());
         assert!(lock.release().await.unwrap());
+
+        assert!(!store.bitmap_set("{typed}:bitmap-a", 1, true).await.unwrap());
+        assert!(!store.bitmap_set("{typed}:bitmap-b", 2, true).await.unwrap());
+        assert_eq!(
+            store
+                .bitmap_operation(
+                    RedisBitOperation::Or,
+                    "{typed}:bitmap-result",
+                    &["{typed}:bitmap-a", "{typed}:bitmap-b"],
+                )
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .bitmap_count("{typed}:bitmap-result", None)
+                .await
+                .unwrap(),
+            2
+        );
+        assert!(store
+            .hyperloglog_add("{typed}:hll", &["one", "two"])
+            .await
+            .unwrap());
+        assert_eq!(store.hyperloglog_count(&["{typed}:hll"]).await.unwrap(), 2);
+        store
+            .sorted_set_add("{typed}:sorted", 1.0, "one")
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .sorted_set_range_by_score_with_scores("{typed}:sorted", 0.0, 2.0, None,)
+                .await
+                .unwrap(),
+            vec![(b"one".to_vec(), 1.0)]
+        );
+        let transaction_key = store.prefixed_key("{typed}:transaction");
+        let (value,): (String,) = store
+            .transaction(|pipeline| {
+                pipeline
+                    .cmd("SET")
+                    .arg(&transaction_key)
+                    .arg("clustered")
+                    .ignore()
+                    .cmd("GET")
+                    .arg(&transaction_key);
+            })
+            .await
+            .unwrap();
+        assert_eq!(value, "clustered");
         assert_eq!(
             store
                 .delete(&[
@@ -2385,6 +3164,20 @@ mod tests {
                 .await
                 .unwrap(),
             3
+        );
+        assert_eq!(
+            store
+                .unlink(&[
+                    "{typed}:bitmap-a",
+                    "{typed}:bitmap-b",
+                    "{typed}:bitmap-result",
+                    "{typed}:hll",
+                    "{typed}:sorted",
+                    "{typed}:transaction",
+                ])
+                .await
+                .unwrap(),
+            6
         );
 
         let model = RedisModelCache::<User, String>::new(

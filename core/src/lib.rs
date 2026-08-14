@@ -109,10 +109,10 @@ pub use stores_mongo::{
 };
 #[cfg(feature = "stores-redis")]
 pub use stores_redis::{
-    RedisCacheError, RedisJsonCache, RedisLock, RedisModelCache, RedisModelCacheConfig,
-    RedisModelCacheError, RedisStore, RedisStoreConfig, RedisStoreError, RedisStoreMetrics,
-    RedisSubscription, RedisSubscriptionConfig, RedisSubscriptionEvent, RedisSubscriptionMessage,
-    RedisTtl,
+    RedisBitOperation, RedisCacheError, RedisJsonCache, RedisListSide, RedisLock, RedisModelCache,
+    RedisModelCacheConfig, RedisModelCacheError, RedisScanPage, RedisStore, RedisStoreConfig,
+    RedisStoreError, RedisStoreMetrics, RedisSubscription, RedisSubscriptionConfig,
+    RedisSubscriptionEvent, RedisSubscriptionMessage, RedisTtl,
 };
 #[cfg(feature = "stores-sql")]
 pub use stores_sql::{

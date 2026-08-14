@@ -5,6 +5,8 @@ Versioning, with the pre-1.0 compatibility policy described in the README.
 
 ## [Unreleased]
 
+- Expanded the typed Redis API with scans, bitmaps, HyperLogLog, score/rank sorted-set operations,
+  blocking and atomic list/set moves, unlink, stream inspection, and transactional pipelines.
 - Added configurable, randomized, low-churn client-side discovery subsetting for large endpoint
   fleets, including repeatable seeds, complete-snapshot status, and an explicit connect-all opt-out.
 - Added stock mixed-protocol gateway configuration for HTTP proxy and descriptor/reflection-driven

@@ -202,8 +202,8 @@ complete, the project claims **broad runtime coverage**, not full runtime parity
 ## Recommended execution order
 
 The previously reopened TLS, server-circuit, gRPC-lifecycle, CORS, legacy MCP, and gateway
-integration items are complete. Production-confidence and large-fleet operational evidence are
-the current priorities. Durable brokers and the `goctl` developer toolchain remain intentional
+integration items are complete. Stabilization and real-world adoption evidence are the remaining
+runtime-maturity priorities. Durable brokers and the `goctl` developer toolchain remain intentional
 ecosystem boundaries unless explicitly brought into scope.
 
 ## Remaining catch-up items
@@ -216,7 +216,7 @@ HTTP and its opt-in legacy SSE compatibility transport are covered.
 These items distinguish individually available primitives from the configuration-driven,
 production-ready assembly and operational evidence provided by go-zero. The P0 gateway runtime
 integration items are complete; remaining work focuses on production evidence and operational
-scale.
+adoption.
 
 ### P0 — gateway runtime integration
 
@@ -252,7 +252,7 @@ scale.
 
 ### P2 — adapter and ecosystem breadth
 
-- [ ] **Typed Redis API depth.** Expand the standardized typed wrapper for commonly used go-zero
+- [x] **Typed Redis API depth.** Expand the standardized typed wrapper for commonly used go-zero
   operations that currently require `do_command`, including scans, bitmaps, HyperLogLog, richer
   sorted-set ranges/mutations, blocking list operations, atomic move/unlink helpers, stream info,
   and transactional pipelines. Keep `do_command` as the escape hatch and test supported helpers
