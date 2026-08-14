@@ -107,6 +107,22 @@ jobs:
             --candidate /tmp/baseline-summary.json \
             --thresholds benchmarks/thresholds/v1.json
 
+  soak-smoke:
+    name: soak/fault smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install protobuf compiler
+        run: sudo apt-get update && sudo apt-get install --yes protobuf-compiler
+      - uses: Swatinem/rust-cache@v2
+      - name: Exercise repeated transports, protection, discovery, and queue invariants
+        run: >-
+          cargo run --locked -p rust-zero-benchmarks -- benchmarks/config/soak-smoke.toml
+          > /tmp/soak-smoke.json
+      - name: Validate soak report
+        run: python3 benchmarks/validate_soak.py --minimum-seconds 10 /tmp/soak-smoke.json
+
   real-backends:
     runs-on: ubuntu-latest
     services:

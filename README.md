@@ -13,7 +13,7 @@ for the transports and integrations they use.
 > [!IMPORTANT]
 > rust-zero is currently a `0.1.0-alpha` prerelease. It is suitable for evaluation and early
 > adopters, but minor releases may change APIs before 1.0. See the [compatibility policy](#compatibility)
-> before adopting it in production.
+> and [stabilization gates](STABILIZATION.md) before adopting it in production.
 
 ## Why rust-zero?
 
@@ -118,7 +118,9 @@ rust-zero provides composable production primitives rather than a code generator
   adapters; and HTTP/gRPC gateway routing.
 
 The detailed [feature-parity matrix](FEATURE_PARITY.md) defines exact coverage and deliberate
-ecosystem boundaries. [BACKLOG.md](BACKLOG.md) tracks audit status and remaining work.
+ecosystem boundaries. [BACKLOG.md](BACKLOG.md) tracks audit status and remaining work, while
+[STABILIZATION.md](STABILIZATION.md) separates completed engineering coverage from the sustained
+operational and independent-adoption evidence still required to leave alpha.
 
 ## Compatibility
 

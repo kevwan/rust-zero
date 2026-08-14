@@ -65,6 +65,27 @@ The counting global allocator reports total allocation calls and requested bytes
 measured interval. `peak_rss_kib` comes from `getrusage`; because it is a process high-water mark,
 it is cumulative across workloads. The JSON configuration is embedded in every result.
 
+## Soak and fault campaigns
+
+Set `soak_duration_seconds` in a benchmark configuration to repeat all six workloads in one
+process until the requested wall-clock duration has elapsed. Every cycle enforces transport
+completion, overload rejection and recovery, complete discovery snapshots, and lossless queue
+processing. The `soak` JSON object records cycle/operation totals, worst per-cycle p99 and
+allocation values, minimum throughput, and peak-RSS growth across the campaign.
+
+Run the ten-second smoke profile with:
+
+```sh
+cargo run --release --locked -p rust-zero-benchmarks -- benchmarks/config/soak-smoke.toml \
+  > /tmp/rust-zero-soak-smoke.json
+python3 benchmarks/validate_soak.py --minimum-seconds 10 /tmp/rust-zero-soak-smoke.json
+```
+
+The smoke profile catches panics, deadlocks, invariant failures, and schema regressions, but it is
+not qualifying maturity evidence. Qualifying campaigns use a copied configuration with at least
+86,400 seconds and follow the hardware, threshold, and retention rules in
+[`STABILIZATION.md`](../STABILIZATION.md).
+
 ## Hardware record
 
 Alongside raw output, record CPU model/core count, RAM, OS/kernel, power mode, compiler, target,

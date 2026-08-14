@@ -249,6 +249,16 @@ adoption.
   complete a public-API and upgrade-path review, publish sustained soak/fault-test results, and
   document at least one real production deployment before claiming production maturity comparable
   to go-zero. Pre-1.0 API compatibility rules remain in force until these gates are met.
+  - [x] Define objective alpha-exit gates, evidence retention rules, and failure thresholds in
+    `STABILIZATION.md`.
+  - [x] Complete the first public-API and upgrade-path review across all six published crates,
+    recording compatibility risks and required beta hardening.
+  - [x] Add a same-process soak/fault mode with stable JSON output, per-cycle invariant checks,
+    latency/allocation summaries, RSS growth reporting, and a repeatable CI smoke campaign.
+  - [ ] Publish qualifying sustained campaigns on recorded release hardware (at least 24 hours per
+    supported architecture and a 72-hour Linux release candidate) with zero invariant failures.
+  - [ ] Document an independently owned production deployment meeting the minimum duration and
+    traffic/SLO evidence gates; smoke tests, demos, and maintainer-only deployments do not qualify.
 
 ### P2 — adapter and ecosystem breadth
 

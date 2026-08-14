@@ -77,6 +77,8 @@ struct Config {
     queue_messages: usize,
     queue_consumer_delay_us: u64,
     overload_concurrency: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    soak_duration_seconds: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -90,6 +92,8 @@ struct Report {
     target: String,
     config: Config,
     workloads: Vec<Measurement>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    soak: Option<SoakReport>,
 }
 
 #[derive(Serialize)]
@@ -105,6 +109,100 @@ struct Measurement {
     allocated_bytes: u64,
     peak_rss_kib: u64,
     counters: BTreeMap<String, u64>,
+}
+
+#[derive(Serialize)]
+struct SoakReport {
+    requested_seconds: u64,
+    elapsed_seconds: f64,
+    cycles: usize,
+    total_operations: usize,
+    invariant_failures: usize,
+    initial_peak_rss_kib: u64,
+    final_peak_rss_kib: u64,
+    peak_rss_growth_kib: u64,
+    workloads: BTreeMap<String, SoakWorkloadSummary>,
+}
+
+#[derive(Default, Serialize)]
+struct SoakWorkloadSummary {
+    cycles: usize,
+    operations: usize,
+    min_operations_per_second: f64,
+    max_p99_us: f64,
+    max_allocations: u64,
+    max_allocated_bytes: u64,
+    max_peak_rss_kib: u64,
+}
+
+struct SoakAccumulator {
+    requested_seconds: u64,
+    started: Instant,
+    initial_peak_rss_kib: u64,
+    cycles: usize,
+    total_operations: usize,
+    workloads: BTreeMap<String, SoakWorkloadSummary>,
+}
+
+impl SoakAccumulator {
+    fn new(requested_seconds: u64) -> Self {
+        Self {
+            requested_seconds,
+            started: Instant::now(),
+            initial_peak_rss_kib: peak_rss_kib(),
+            cycles: 0,
+            total_operations: 0,
+            workloads: BTreeMap::new(),
+        }
+    }
+
+    fn record(
+        &mut self,
+        config: &Config,
+        measurements: &[Measurement],
+    ) -> Result<(), Box<dyn Error>> {
+        validate_workload_invariants(config, measurements)?;
+        self.cycles += 1;
+        for measurement in measurements {
+            self.total_operations += measurement.operations;
+            let summary = self.workloads.entry(measurement.name.clone()).or_default();
+            summary.cycles += 1;
+            summary.operations += measurement.operations;
+            if summary.cycles == 1 {
+                summary.min_operations_per_second = measurement.operations_per_second;
+            } else {
+                summary.min_operations_per_second = summary
+                    .min_operations_per_second
+                    .min(measurement.operations_per_second);
+            }
+            summary.max_p99_us = summary.max_p99_us.max(measurement.p99_us);
+            summary.max_allocations = summary.max_allocations.max(measurement.allocations);
+            summary.max_allocated_bytes =
+                summary.max_allocated_bytes.max(measurement.allocated_bytes);
+            summary.max_peak_rss_kib = summary.max_peak_rss_kib.max(measurement.peak_rss_kib);
+        }
+        Ok(())
+    }
+
+    fn elapsed(&self) -> Duration {
+        self.started.elapsed()
+    }
+
+    fn finish(self) -> SoakReport {
+        let elapsed_seconds = self.started.elapsed().as_secs_f64();
+        let final_peak_rss_kib = peak_rss_kib();
+        SoakReport {
+            requested_seconds: self.requested_seconds,
+            elapsed_seconds,
+            cycles: self.cycles,
+            total_operations: self.total_operations,
+            invariant_failures: 0,
+            initial_peak_rss_kib: self.initial_peak_rss_kib,
+            final_peak_rss_kib,
+            peak_rss_growth_kib: final_peak_rss_kib.saturating_sub(self.initial_peak_rss_kib),
+            workloads: self.workloads,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -262,13 +360,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
     validate(&config)?;
 
-    let mut workloads = Vec::new();
-    workloads.push(rest_transport(&config).await?);
-    workloads.push(grpc_transport(&config).await?);
-    workloads.push(breaker_failure(&config));
-    workloads.push(overload_recovery(&config).await);
-    workloads.push(discovery_snapshot(&config)?);
-    workloads.push(queue_saturation(&config).await?);
+    let (workloads, soak) = if let Some(seconds) = config.soak_duration_seconds {
+        let mut accumulator = SoakAccumulator::new(seconds);
+        let workloads = run_workloads(&config).await?;
+        accumulator.record(&config, &workloads)?;
+        while accumulator.elapsed() < Duration::from_secs(seconds) {
+            let cycle = run_workloads(&config).await?;
+            accumulator.record(&config, &cycle)?;
+        }
+        (workloads, Some(accumulator.finish()))
+    } else {
+        let workloads = run_workloads(&config).await?;
+        validate_workload_invariants(&config, &workloads)?;
+        (workloads, None)
+    };
 
     let report = Report {
         schema_version: 1,
@@ -281,8 +386,64 @@ async fn main() -> Result<(), Box<dyn Error>> {
         target: format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS),
         config,
         workloads,
+        soak,
     };
     println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+
+async fn run_workloads(config: &Config) -> Result<Vec<Measurement>, Box<dyn Error>> {
+    Ok(vec![
+        rest_transport(config).await?,
+        grpc_transport(config).await?,
+        breaker_failure(config),
+        overload_recovery(config).await,
+        discovery_snapshot(config)?,
+        queue_saturation(config).await?,
+    ])
+}
+
+fn validate_workload_invariants(
+    config: &Config,
+    measurements: &[Measurement],
+) -> Result<(), Box<dyn Error>> {
+    let by_name: BTreeMap<_, _> = measurements
+        .iter()
+        .map(|measurement| (measurement.name.as_str(), measurement))
+        .collect();
+    for transport in ["rest_transport", "grpc_transport"] {
+        let measurement = by_name
+            .get(transport)
+            .ok_or_else(|| format!("missing soak workload {transport}"))?;
+        if measurement.counters.get("completed") != Some(&(measurement.operations as u64)) {
+            return Err(format!("{transport} did not complete every operation").into());
+        }
+    }
+    let overload = by_name
+        .get("overload_recovery")
+        .ok_or("missing soak workload overload_recovery")?;
+    if overload.counters.get("recovered") != Some(&1)
+        || overload
+            .counters
+            .get("rejected")
+            .copied()
+            .unwrap_or_default()
+            == 0
+    {
+        return Err("overload workload did not reject and recover".into());
+    }
+    let discovery = by_name
+        .get("large_discovery_snapshot")
+        .ok_or("missing soak workload large_discovery_snapshot")?;
+    if discovery.counters.get("snapshot_endpoints") != Some(&(config.discovery_endpoints as u64)) {
+        return Err("discovery soak snapshot was incomplete".into());
+    }
+    let queue = by_name
+        .get("queue_saturation")
+        .ok_or("missing soak workload queue_saturation")?;
+    if queue.counters.get("processed") != Some(&(queue.operations as u64)) {
+        return Err("queue soak workload lost messages".into());
+    }
     Ok(())
 }
 
@@ -294,8 +455,12 @@ fn validate(config: &Config) -> Result<(), Box<dyn Error>> {
         || config.queue_messages == 0
         || config.overload_concurrency == 0
         || config.breaker_failure_percent > 100
+        || config.soak_duration_seconds == Some(0)
     {
-        return Err("benchmark counts must be positive and failure percentage <= 100".into());
+        return Err(
+            "benchmark counts and optional soak duration must be positive, and failure percentage <= 100"
+                .into(),
+        );
     }
     Ok(())
 }

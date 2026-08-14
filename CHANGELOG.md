@@ -5,6 +5,8 @@ Versioning, with the pre-1.0 compatibility policy described in the README.
 
 ## [Unreleased]
 
+- Added objective stabilization gates, a six-crate public-API/upgrade review, and a repeated
+  same-process soak/fault mode with invariant enforcement, RSS growth, and CI smoke coverage.
 - Expanded the typed Redis API with scans, bitmaps, HyperLogLog, score/rank sorted-set operations,
   blocking and atomic list/set moves, unlink, stream inspection, and transactional pipelines.
 - Added configurable, randomized, low-churn client-side discovery subsetting for large endpoint

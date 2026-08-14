@@ -32,3 +32,10 @@ clean worktree, pass CI on Rust 1.89 and stable, and contain matching versions i
 
 6. Create the GitHub release from the matching changelog entry. Do not reuse a published version
    or move an existing release tag.
+
+## Maturity promotion
+
+Changing the README status from alpha requires every gate in `STABILIZATION.md` to be satisfied by
+linked, reviewable evidence. A normal crate release, green CI, a short smoke run, or feature parity
+alone does not authorize a maturity claim. Record the evidence links and approval in the release
+PR; if any time-based or independent-deployment gate is missing, keep the alpha designation.
