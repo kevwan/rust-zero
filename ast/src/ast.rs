@@ -76,7 +76,7 @@ pub struct AtServer {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AtDoc {
-    pub text: Option<String>,
+    pub items: Vec<InfoItem>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

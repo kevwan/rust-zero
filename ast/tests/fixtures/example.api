@@ -74,7 +74,7 @@ service example {
 
 #[server(group = "path", middleware = Path, prefix = "/v1/v2", timeout = "100ms")]
 service example {
-    #[doc = "path demo"]
+    #[doc(desc = "path demo")]
     #[handler(postPath)]
     post /example/path (PostPathReq) -> PostJsonResp
 

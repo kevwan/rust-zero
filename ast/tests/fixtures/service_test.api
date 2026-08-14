@@ -30,6 +30,7 @@ service bar {
     #[handler(foo)]
     get /foo/:bar (Foo);
 
+    #[doc(desc = "path demo", key1 = "value1")]
     #[handler(foo)]
     get /foo/:bar -> Foo
 
@@ -37,7 +38,7 @@ service bar {
     get /foo/:bar () -> Foo;
 }
 
-service baz_api {
+service baz-api {
     #[handler(foo)]
     post /foo/:bar/foo-bar-baz (Foo) -> Bar?
 

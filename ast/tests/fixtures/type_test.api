@@ -30,4 +30,8 @@ struct GetUserReq {
     userId2: String,
     #[query]
     page: i64?,
+    #[form]
+    name: String,
+    #[header("Authorization")]
+    token: String,
 }

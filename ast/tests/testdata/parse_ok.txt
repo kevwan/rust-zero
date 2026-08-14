@@ -409,9 +409,12 @@ ApiFile {
                 Route {
                     doc: Some(
                         AtDoc {
-                            text: Some(
-                                "bar",
-                            ),
+                            items: [
+                                InfoItem {
+                                    key: "desc",
+                                    value: "bar",
+                                },
+                            ],
                         },
                     ),
                     handler: Some(
@@ -429,9 +432,12 @@ ApiFile {
                 Route {
                     doc: Some(
                         AtDoc {
-                            text: Some(
-                                "bar",
-                            ),
+                            items: [
+                                InfoItem {
+                                    key: "desc",
+                                    value: "bar",
+                                },
+                            ],
                         },
                     ),
                     handler: Some(
@@ -449,9 +455,12 @@ ApiFile {
                 Route {
                     doc: Some(
                         AtDoc {
-                            text: Some(
-                                "bar",
-                            ),
+                            items: [
+                                InfoItem {
+                                    key: "desc",
+                                    value: "bar",
+                                },
+                            ],
                         },
                     ),
                     handler: Some(
@@ -473,9 +482,12 @@ ApiFile {
                 Route {
                     doc: Some(
                         AtDoc {
-                            text: Some(
-                                "bar",
-                            ),
+                            items: [
+                                InfoItem {
+                                    key: "desc",
+                                    value: "bar",
+                                },
+                            ],
                         },
                     ),
                     handler: Some(
@@ -493,9 +505,12 @@ ApiFile {
                 Route {
                     doc: Some(
                         AtDoc {
-                            text: Some(
-                                "bar",
-                            ),
+                            items: [
+                                InfoItem {
+                                    key: "desc",
+                                    value: "bar",
+                                },
+                            ],
                         },
                     ),
                     handler: Some(
@@ -511,7 +526,20 @@ ApiFile {
                     returns: None,
                 },
                 Route {
-                    doc: None,
+                    doc: Some(
+                        AtDoc {
+                            items: [
+                                InfoItem {
+                                    key: "desc",
+                                    value: "path demo",
+                                },
+                                InfoItem {
+                                    key: "key1",
+                                    value: "value1",
+                                },
+                            ],
+                        },
+                    ),
                     handler: Some(
                         "foo",
                     ),
@@ -542,7 +570,7 @@ ApiFile {
         },
         Service {
             server: None,
-            name: "baz_api",
+            name: "baz-api",
             routes: [
                 Route {
                     doc: None,
@@ -968,10 +996,205 @@ ApiFile {
                         ),
                     ),
                 },
+                Field {
+                    attrs: [
+                        FieldAttr {
+                            name: "form",
+                            value: None,
+                        },
+                    ],
+                    name: "name",
+                    ty: Named(
+                        "String",
+                    ),
+                },
+                Field {
+                    attrs: [
+                        FieldAttr {
+                            name: "header",
+                            value: Some(
+                                "Authorization",
+                            ),
+                        },
+                    ],
+                    name: "token",
+                    ty: Named(
+                        "String",
+                    ),
+                },
             ],
         },
     ],
     services: [],
+}
+
+
+---------- Input ----------
+file: atdoc_group_test.api
+---------- AST ------------
+ApiFile {
+    syntax: Syntax {
+        version: "v1",
+    },
+    imports: [],
+    info: None,
+    types: [],
+    services: [
+        Service {
+            server: None,
+            name: "doc",
+            routes: [
+                Route {
+                    doc: Some(
+                        AtDoc {
+                            items: [
+                                InfoItem {
+                                    key: "foo",
+                                    value: "foo",
+                                },
+                                InfoItem {
+                                    key: "bar",
+                                    value: "bar",
+                                },
+                                InfoItem {
+                                    key: "baz",
+                                    value: "",
+                                },
+                            ],
+                        },
+                    ),
+                    handler: None,
+                    method: Get,
+                    path: "/ping",
+                    request: None,
+                    returns: None,
+                },
+            ],
+        },
+    ],
+}
+
+
+---------- Input ----------
+file: atdoc_literal_test.api
+---------- AST ------------
+ApiFile {
+    syntax: Syntax {
+        version: "v1",
+    },
+    imports: [],
+    info: None,
+    types: [],
+    services: [
+        Service {
+            server: None,
+            name: "doc",
+            routes: [
+                Route {
+                    doc: Some(
+                        AtDoc {
+                            items: [
+                                InfoItem {
+                                    key: "desc",
+                                    value: "",
+                                },
+                            ],
+                        },
+                    ),
+                    handler: None,
+                    method: Get,
+                    path: "/empty",
+                    request: None,
+                    returns: None,
+                },
+                Route {
+                    doc: Some(
+                        AtDoc {
+                            items: [
+                                InfoItem {
+                                    key: "desc",
+                                    value: "foo",
+                                },
+                            ],
+                        },
+                    ),
+                    handler: None,
+                    method: Get,
+                    path: "/foo",
+                    request: None,
+                    returns: None,
+                },
+                Route {
+                    doc: Some(
+                        AtDoc {
+                            items: [
+                                InfoItem {
+                                    key: "desc",
+                                    value: "bar",
+                                },
+                            ],
+                        },
+                    ),
+                    handler: None,
+                    method: Get,
+                    path: "/bar",
+                    request: None,
+                    returns: None,
+                },
+            ],
+        },
+    ],
+}
+
+
+---------- Input ----------
+file: athandler_test.api
+---------- AST ------------
+ApiFile {
+    syntax: Syntax {
+        version: "v1",
+    },
+    imports: [],
+    info: None,
+    types: [],
+    services: [
+        Service {
+            server: None,
+            name: "handler",
+            routes: [
+                Route {
+                    doc: None,
+                    handler: Some(
+                        "foo",
+                    ),
+                    method: Get,
+                    path: "/foo",
+                    request: None,
+                    returns: None,
+                },
+                Route {
+                    doc: None,
+                    handler: Some(
+                        "foo1",
+                    ),
+                    method: Get,
+                    path: "/foo1",
+                    request: None,
+                    returns: None,
+                },
+                Route {
+                    doc: None,
+                    handler: Some(
+                        "_bar",
+                    ),
+                    method: Get,
+                    path: "/bar",
+                    request: None,
+                    returns: None,
+                },
+            ],
+        },
+    ],
 }
 
 
@@ -1277,9 +1500,12 @@ ApiFile {
                 Route {
                     doc: Some(
                         AtDoc {
-                            text: Some(
-                                "json demo",
-                            ),
+                            items: [
+                                InfoItem {
+                                    key: "desc",
+                                    value: "json demo",
+                                },
+                            ],
                         },
                     ),
                     handler: Some(
@@ -1328,9 +1554,12 @@ ApiFile {
                 Route {
                     doc: Some(
                         AtDoc {
-                            text: Some(
-                                "path demo",
-                            ),
+                            items: [
+                                InfoItem {
+                                    key: "desc",
+                                    value: "path demo",
+                                },
+                            ],
                         },
                     ),
                     handler: Some(

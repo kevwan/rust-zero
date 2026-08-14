@@ -173,10 +173,21 @@ TypeExprPrimary: TypeExpr = {
 };
 
 Service: Service = {
-    <server:ServerAttr?> "service" <name:IdentOrKw> "{" <routes:Route*> "}" => Service {
+    <server:ServerAttr?> "service" <name:ServiceName> "{" <routes:Route*> "}" => Service {
         server,
         name,
         routes,
+    },
+};
+
+ServiceName: String = {
+    <head:IdentOrKw> <tail:HyphenIdent*> => {
+        let mut name = head;
+        for part in tail {
+            name.push('-');
+            name.push_str(&part);
+        }
+        name
     },
 };
 
@@ -231,7 +242,10 @@ Route: Route = {
 };
 
 DocAttr: AtDoc = {
-    "#[" "ident" "=" <v:"string"> "]" => AtDoc { text: Some(unquote(&v.text)) },
+    "#[" "ident" "=" <v:"string"> "]" => AtDoc {
+        items: vec![InfoItem { key: "desc".into(), value: unquote(&v.text) }],
+    },
+    "#[" "ident" <items:AttrArgs> "]" => AtDoc { items },
 };
 
 HandlerAttr: String = {
