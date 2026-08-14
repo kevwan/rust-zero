@@ -26,7 +26,7 @@ pub fn generate(ast: &ApiFile) -> Vec<GeneratedFile> {
         },
         GeneratedFile {
             path: "src/main.rs".into(),
-            contents: entry::render(),
+            contents: entry::render(ast),
         },
         GeneratedFile {
             path: "src/types.rs".into(),
@@ -36,13 +36,15 @@ pub fn generate(ast: &ApiFile) -> Vec<GeneratedFile> {
             path: "src/routes.rs".into(),
             contents: routes::render(ast),
         },
-        GeneratedFile {
+    ];
+    if handlers::has_routes(ast) {
+        files.push(GeneratedFile {
             path: "src/handlers/mod.rs".into(),
             contents: handlers::render_mod(ast),
-        },
-    ];
-    files.extend(handlers::render_files(ast).into_iter().map(|(path, contents)| {
-        GeneratedFile { path, contents }
-    }));
+        });
+        files.extend(handlers::render_files(ast).into_iter().map(|(path, contents)| {
+            GeneratedFile { path, contents }
+        }));
+    }
     files
 }

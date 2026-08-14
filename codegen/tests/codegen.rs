@@ -74,12 +74,23 @@ fn test_generate_ok() {
             generated.iter().any(|item| item.path == "src/routes.rs"),
             "{stem}: missing src/routes.rs"
         );
-        assert!(
-            generated
-                .iter()
-                .any(|item| item.path == "src/handlers/mod.rs"),
-            "{stem}: missing src/handlers/mod.rs"
-        );
+        let has_routes = file.services.iter().any(|service| !service.routes.is_empty());
+        let has_handlers = generated
+            .iter()
+            .any(|item| item.path.starts_with("src/handlers/"));
+        if has_routes {
+            assert!(
+                generated
+                    .iter()
+                    .any(|item| item.path == "src/handlers/mod.rs"),
+                "{stem}: missing src/handlers/mod.rs"
+            );
+        } else {
+            assert!(
+                !has_handlers,
+                "{stem}: handlers should not be generated without a service route"
+            );
+        }
         for item in &generated {
             assert!(
                 item.path == "Cargo.toml" || item.path.starts_with("src/"),
@@ -97,6 +108,17 @@ fn test_generate_ok() {
             main.contains("RestServer"),
             "{stem}: main does not use RestServer"
         );
+        if has_routes {
+            assert!(
+                main.contains("mod handlers"),
+                "{stem}: main missing handlers module"
+            );
+        } else {
+            assert!(
+                !main.contains("mod handlers"),
+                "{stem}: main should not declare handlers without routes"
+            );
+        }
         assert!(
             main.contains("route_groups: routes::route_groups()"),
             "{stem}: main does not install route groups"

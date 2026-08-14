@@ -6,6 +6,12 @@ use ast::{ApiFile, Route};
 use quote::quote;
 use syn::Ident;
 
+pub(crate) fn has_routes(ast: &ApiFile) -> bool {
+    ast.services
+        .iter()
+        .any(|service| !service.routes.is_empty())
+}
+
 pub(crate) fn render_mod(ast: &ApiFile) -> String {
     let mods: Vec<Ident> = unique_routes(ast)
         .into_iter()
