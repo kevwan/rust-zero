@@ -1,7 +1,7 @@
 //! rust-zero `.api` AST → rust-zero REST source.
 
+mod entry;
 mod handlers;
-mod main_rs;
 mod request;
 mod routes;
 mod types;
@@ -21,7 +21,7 @@ pub fn generate(ast: &ApiFile) -> Vec<GeneratedFile> {
     let mut files = vec![
         GeneratedFile {
             path: "src/main.rs".into(),
-            contents: main_rs::render(),
+            contents: entry::render(),
         },
         GeneratedFile {
             path: "src/types.rs".into(),
