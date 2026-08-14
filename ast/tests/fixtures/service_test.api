@@ -10,23 +10,23 @@ service foo {
 }
 
 service bar {
-    @doc "bar"
+    #[doc = "bar"]
     #[handler(root)]
     get / (Foo)
 
-    @doc "bar"
+    #[doc = "bar"]
     #[handler(root2)]
     get / -> Foo
 
-    @doc "bar"
+    #[doc = "bar"]
     #[handler(root3)]
     get / (Foo) -> Bar
 
-    @doc "bar"
+    #[doc = "bar"]
     #[handler(foo)]
     get /foo/:bar (Foo)
 
-    @doc "bar"
+    #[doc = "bar"]
     #[handler(foo)]
     get /foo/:bar (Foo);
 

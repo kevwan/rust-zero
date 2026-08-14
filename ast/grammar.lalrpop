@@ -22,9 +22,6 @@ extern {
         "duration" => Token { kind: TokenKind::Duration, .. },
         "string" => Token { kind: TokenKind::String, .. },
         "path" => Token { kind: TokenKind::Path, .. },
-        "@doc" => Token { kind: TokenKind::AtDoc, .. },
-        "@handler" => Token { kind: TokenKind::AtHandler, .. },
-        "@server" => Token { kind: TokenKind::AtServer, .. },
         "#[" => Token { kind: TokenKind::HashLBracket, .. },
         "get" => Token { kind: TokenKind::Get, .. },
         "head" => Token { kind: TokenKind::Head, .. },
@@ -185,11 +182,41 @@ Service: Service = {
 
 ServerAttr: AtServer = {
     "#[" "ident" <items:AttrArgs?> "]" => AtServer { items: items.unwrap_or_default() },
-    "@server" <items:AttrArgs?> => AtServer { items: items.unwrap_or_default() },
 };
 
 AttrArgs: Vec<InfoItem> = {
-    "(" <items:Kv*> ")" => items,
+    "(" <head:AttrKv> <tail:AttrKvTail*> ","? ")" => {
+        let mut items = vec![head];
+        items.extend(tail);
+        items
+    },
+};
+
+AttrKvTail: InfoItem = {
+    "," <item:AttrKv> => item,
+};
+
+AttrKv: InfoItem = {
+    <k:IdentOrKw> "=" <v:AttrValue> => InfoItem { key: k, value: v },
+};
+
+AttrValue: String = {
+    <v:"string"> => unquote(&v.text),
+    <v:"int"> => v.text,
+    <v:"duration"> => v.text,
+    <v:"path"> => v.text,
+    <head:IdentOrKw> <tail:HyphenIdent*> => {
+        let mut value = head;
+        for part in tail {
+            value.push('-');
+            value.push_str(&part);
+        }
+        value
+    },
+};
+
+HyphenIdent: String = {
+    "-" <id:IdentOrKw> => id,
 };
 
 Route: Route = {
@@ -204,16 +231,11 @@ Route: Route = {
 };
 
 DocAttr: AtDoc = {
-    "#[" "ident" <v:"string"> "]" => AtDoc { text: Some(unquote(&v.text)) },
-    "@doc" <v:"string"> => AtDoc { text: Some(unquote(&v.text)) },
-    "@doc" "(" <items:Kv*> ")" => AtDoc {
-        text: items.into_iter().find(|item| item.key == "desc" || item.key == "description").map(|item| item.value),
-    },
+    "#[" "ident" "=" <v:"string"> "]" => AtDoc { text: Some(unquote(&v.text)) },
 };
 
 HandlerAttr: String = {
     "#[" "ident" "(" <name:IdentOrKw> ")" "]" => name,
-    "@handler" <name:IdentOrKw> => name,
 };
 
 HttpMethod: HttpMethod = {

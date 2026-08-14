@@ -56,10 +56,7 @@ struct NestDemoResp {
     nest: [Nest?],
 }
 
-@server(
-    group: form
-    timeout: 3s
-)
+#[server(group = "form", timeout = "3s")]
 service example {
     #[handler(getForm)]
     get /example/form (GetFormReq) -> GetFormResp
@@ -68,27 +65,16 @@ service example {
     post /example/form (GetFormReq) -> GetFormResp
 }
 
-@server(
-    group: json
-    jwt: Auth
-    timeout: 3m
-)
+#[server(group = "json", jwt = Auth, timeout = "3m")]
 service example {
-    @doc "json demo"
+    #[doc = "json demo"]
     #[handler(postJson)]
     post /example/json (PostJsonReq) -> PostJsonResp
 }
 
-@server(
-    group: path
-    middleware: Path
-    prefix: /v1/v2
-    timeout: 100ms
-)
+#[server(group = "path", middleware = Path, prefix = "/v1/v2", timeout = "100ms")]
 service example {
-    @doc(
-        desc: "path demo"
-    )
+    #[doc = "path demo"]
     #[handler(postPath)]
     post /example/path (PostPathReq) -> PostJsonResp
 
@@ -96,11 +82,7 @@ service example {
     post / -> PostJsonResp
 }
 
-@server(
-    group: array
-    prefix: /array
-    maxBytes: 1024
-)
+#[server(group = "array", prefix = "/array", maxBytes = 1024)]
 service example {
     #[handler(getArray)]
     post /example/array (GetFormReq) -> [GetFormResp]
@@ -112,11 +94,7 @@ service example {
     post /example/array/base (GetFormReq) -> [String]
 }
 
-@server(
-    group: /g1/g2_test/g2_beta
-    prefix: /v1/v2_test/v2-beta
-    summary: "test"
-)
+#[server(group = "/g1/g2_test/g2_beta", prefix = "/v1/v2_test/v2-beta", summary = "test")]
 service example {
     #[handler(nestDemo)]
     post /a/b_c/d-e/:f/123/g (NestDemoReq) -> NestDemoResp

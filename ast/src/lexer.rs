@@ -16,9 +16,6 @@ pub enum TokenKind {
     Duration,
     String,
     Path,
-    AtDoc,
-    AtHandler,
-    AtServer,
     HashLBracket,
     Get,
     Head,
@@ -77,12 +74,6 @@ enum RawToken {
     Struct,
     #[token("service")]
     Service,
-    #[token("@doc")]
-    AtDoc,
-    #[token("@handler")]
-    AtHandler,
-    #[token("@server")]
-    AtServer,
     #[token("#[")]
     HashLBracket,
     #[token("get")]
@@ -155,9 +146,6 @@ impl From<RawToken> for TokenKind {
             RawToken::Info => Self::Info,
             RawToken::Struct => Self::Struct,
             RawToken::Service => Self::Service,
-            RawToken::AtDoc => Self::AtDoc,
-            RawToken::AtHandler => Self::AtHandler,
-            RawToken::AtServer => Self::AtServer,
             RawToken::HashLBracket => Self::HashLBracket,
             RawToken::Get => Self::Get,
             RawToken::Head => Self::Head,
@@ -206,9 +194,6 @@ impl fmt::Display for TokenKind {
             Self::Duration => "duration",
             Self::String => "string",
             Self::Path => "path",
-            Self::AtDoc => "@doc",
-            Self::AtHandler => "@handler",
-            Self::AtServer => "@server",
             Self::HashLBracket => "#[",
             Self::Get => "get",
             Self::Head => "head",
