@@ -1,0 +1,17 @@
+syntax = "v1"
+
+struct PayReq {
+    #[json("order_id")]
+    orderId: String,
+    amount: i64,
+}
+
+struct PayResp {
+    ok: bool,
+    extra: {String: String},
+}
+
+service pay {
+    #[handler(createPay)]
+    post /pay (PayReq) -> PayResp
+}

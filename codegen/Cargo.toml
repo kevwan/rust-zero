@@ -1,0 +1,26 @@
+[package]
+name = "rust-zero-codegen"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Generate rust-zero REST code from a parsed .api AST"
+documentation = "https://docs.rs/rust-zero-codegen"
+
+[lib]
+name = "codegen"
+
+[package.metadata.docs.rs]
+all-features = true
+
+[dependencies]
+prettyplease = "0.2"
+proc-macro2 = "1"
+quote = "1"
+rust-zero-ast = { path = "../ast", version = "0.1.0-alpha.1" }
+syn = { version = "2", features = ["full"] }

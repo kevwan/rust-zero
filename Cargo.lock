@@ -4230,6 +4230,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rust-zero-codegen"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "prettyplease",
+ "proc-macro2",
+ "quote",
+ "rust-zero-ast",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "rust-zero-core"
 version = "0.1.0-alpha.1"
 dependencies = [

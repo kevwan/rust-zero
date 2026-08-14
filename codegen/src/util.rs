@@ -1,0 +1,262 @@
+use ast::{Field, HttpMethod, Route, TypeExpr};
+use proc_macro2::{Span, TokenStream};
+use quote::quote;
+use syn::{Ident, Type};
+
+const KEYWORDS: &[&str] = &[
+    "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum",
+    "extern", "false", "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod", "move",
+    "mut", "pub", "ref", "return", "self", "Self", "static", "struct", "super", "trait", "true",
+    "type", "unsafe", "use", "where", "while",
+];
+
+pub(crate) fn pretty(banner: &str, tokens: TokenStream) -> String {
+    let file: syn::File = syn::parse2(tokens.clone())
+        .unwrap_or_else(|err| panic!("generated invalid Rust: {err}\n{tokens}"));
+    format!("{banner}{}", prettyplease::unparse(&file))
+}
+
+pub(crate) fn rust_ident(name: &str) -> Ident {
+    if KEYWORDS.contains(&name) {
+        Ident::new_raw(name, Span::call_site())
+    } else {
+        Ident::new(name, Span::call_site())
+    }
+}
+
+pub(crate) fn rust_type(ty: &TypeExpr) -> Type {
+    match ty {
+        TypeExpr::Named(name) => {
+            let ident = rust_ident(name);
+            syn::parse_quote!(#ident)
+        }
+        TypeExpr::List(inner) => {
+            let inner = rust_type(inner);
+            syn::parse_quote!(Vec<#inner>)
+        }
+        TypeExpr::Map { key, value } => {
+            let key = rust_type(key);
+            let value = rust_type(value);
+            syn::parse_quote!(HashMap<#key, #value>)
+        }
+        TypeExpr::Optional(inner) => {
+            let inner = rust_type(inner);
+            syn::parse_quote!(Option<#inner>)
+        }
+    }
+}
+
+pub(crate) fn type_needs_hashmap(ty: &TypeExpr) -> bool {
+    match ty {
+        TypeExpr::Named(_) => false,
+        TypeExpr::List(inner) | TypeExpr::Optional(inner) => type_needs_hashmap(inner),
+        TypeExpr::Map { .. } => true,
+    }
+}
+
+pub(crate) fn json_rename(field: &Field) -> Option<&str> {
+    field.attrs.iter().find_map(|attr| {
+        if attr.name == "json" {
+            attr.value.as_deref()
+        } else {
+            None
+        }
+    })
+}
+
+pub(crate) fn handler_name(route: &Route) -> Ident {
+    rust_ident(&handler_fn_name(route))
+}
+
+pub(crate) fn handler_fn_name(route: &Route) -> String {
+    if let Some(name) = &route.handler {
+        name.clone()
+    } else {
+        handler_name_from_path(&route.path)
+    }
+}
+
+pub(crate) fn handler_mod_name(route: &Route) -> Ident {
+    rust_ident(&to_snake(&handler_fn_name(route)))
+}
+
+pub(crate) fn to_snake(name: &str) -> String {
+    let mut out = String::new();
+    for (idx, ch) in name.chars().enumerate() {
+        if ch.is_uppercase() {
+            if idx > 0 {
+                out.push('_');
+            }
+            out.extend(ch.to_lowercase());
+        } else {
+            out.push(ch);
+        }
+    }
+    if out.is_empty() {
+        "handler".into()
+    } else {
+        out
+    }
+}
+
+pub(crate) fn handler_name_from_path(path: &str) -> String {
+    let trimmed = path.trim_matches('/');
+    if trimmed.is_empty() {
+        return "root".into();
+    }
+    let mut out = String::new();
+    for ch in trimmed.chars() {
+        match ch {
+            '/' | '-' | ':' => {
+                if !out.is_empty() && !out.ends_with('_') {
+                    out.push('_');
+                }
+            }
+            c if c.is_ascii_alphanumeric() || c == '_' => out.push(c),
+            _ => {}
+        }
+    }
+    let out = out.trim_matches('_').to_string();
+    if out.is_empty() {
+        "root".into()
+    } else if out.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+        format!("r_{out}")
+    } else {
+        out
+    }
+}
+
+pub(crate) fn actix_path(path: &str) -> String {
+    let mut out = String::new();
+    let mut chars = path.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == ':' {
+            out.push('{');
+            while let Some(&next) = chars.peek() {
+                if next.is_ascii_alphanumeric() || next == '_' {
+                    out.push(next);
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            out.push('}');
+        } else {
+            out.push(ch);
+        }
+    }
+    if out.is_empty() {
+        "/".into()
+    } else {
+        out
+    }
+}
+
+pub(crate) fn join_path(prefix: &str, path: &str) -> String {
+    let prefix = prefix.trim_end_matches('/');
+    if path == "/" {
+        if prefix.is_empty() {
+            "/".into()
+        } else {
+            prefix.to_string()
+        }
+    } else if prefix.is_empty() {
+        path.to_string()
+    } else {
+        format!("{prefix}{path}")
+    }
+}
+
+pub(crate) fn method_name(method: HttpMethod) -> &'static str {
+    match method {
+        HttpMethod::Get => "GET",
+        HttpMethod::Head => "HEAD",
+        HttpMethod::Post => "POST",
+        HttpMethod::Put => "PUT",
+        HttpMethod::Patch => "PATCH",
+        HttpMethod::Delete => "DELETE",
+        HttpMethod::Connect => "CONNECT",
+        HttpMethod::Options => "OPTIONS",
+        HttpMethod::Trace => "TRACE",
+    }
+}
+
+pub(crate) fn normalize_prefix(prefix: &str) -> String {
+    let prefix = prefix.trim();
+    if prefix.is_empty() {
+        String::new()
+    } else if prefix.starts_with('/') {
+        prefix.trim_end_matches('/').to_string()
+    } else {
+        format!("/{}", prefix.trim_end_matches('/'))
+    }
+}
+
+pub(crate) fn duration_to_ms(raw: &str) -> Option<u64> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let mut total_ns: u128 = 0;
+    let mut idx = 0;
+    let bytes = raw.as_bytes();
+    while idx < bytes.len() {
+        let start = idx;
+        while idx < bytes.len() && bytes[idx].is_ascii_digit() {
+            idx += 1;
+        }
+        if start == idx {
+            return None;
+        }
+        let amount: u128 = raw[start..idx].parse().ok()?;
+        let unit_start = idx;
+        while idx < bytes.len() && !bytes[idx].is_ascii_digit() {
+            idx += 1;
+        }
+        let unit = &raw[unit_start..idx];
+        let factor = match unit {
+            "ns" => 1,
+            "us" | "µs" => 1_000,
+            "ms" => 1_000_000,
+            "s" => 1_000_000_000,
+            "m" => 60 * 1_000_000_000,
+            "h" => 3_600 * 1_000_000_000,
+            _ => return None,
+        };
+        total_ns = total_ns.saturating_add(amount.saturating_mul(factor));
+    }
+    Some((total_ns / 1_000_000) as u64)
+}
+
+pub(crate) fn method_builder(method: HttpMethod) -> TokenStream {
+    match method {
+        HttpMethod::Get => quote!(web::get()),
+        HttpMethod::Head => quote!(web::head()),
+        HttpMethod::Post => quote!(web::post()),
+        HttpMethod::Put => quote!(web::put()),
+        HttpMethod::Patch => quote!(web::patch()),
+        HttpMethod::Delete => quote!(web::delete()),
+        HttpMethod::Connect => quote!(web::route().method(actix_web::http::Method::CONNECT)),
+        HttpMethod::Options => quote!(web::route().method(actix_web::http::Method::OPTIONS)),
+        HttpMethod::Trace => quote!(web::route().method(actix_web::http::Method::TRACE)),
+    }
+}
+
+pub(crate) fn collect_type_idents(ty: Option<&TypeExpr>, names: &mut Vec<Ident>) {
+    match ty {
+        Some(TypeExpr::Named(name)) => {
+            let ident = rust_ident(name);
+            if !names.iter().any(|existing| existing == &ident) {
+                names.push(ident);
+            }
+        }
+        Some(TypeExpr::List(inner) | TypeExpr::Optional(inner)) => {
+            collect_type_idents(Some(inner), names);
+        }
+        Some(TypeExpr::Map { key, value }) => {
+            collect_type_idents(Some(key), names);
+            collect_type_idents(Some(value), names);
+        }
+        None => {}
+    }
+}
