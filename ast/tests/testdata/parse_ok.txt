@@ -258,3 +258,1240 @@ ApiFile {
 }
 
 
+---------- Input ----------
+file: info_test.api
+---------- AST ------------
+ApiFile {
+    syntax: Syntax {
+        version: "v1",
+    },
+    imports: [],
+    info: Some(
+        InfoBlock {
+            items: [
+                InfoItem {
+                    key: "title",
+                    value: "type title here",
+                },
+                InfoItem {
+                    key: "desc",
+                    value: "type desc here",
+                },
+                InfoItem {
+                    key: "author",
+                    value: "type author here",
+                },
+                InfoItem {
+                    key: "email",
+                    value: "type email here",
+                },
+                InfoItem {
+                    key: "version",
+                    value: "type version here",
+                },
+                InfoItem {
+                    key: "enable",
+                    value: "true",
+                },
+                InfoItem {
+                    key: "disable",
+                    value: "false",
+                },
+            ],
+        },
+    ),
+    types: [],
+    services: [],
+}
+
+
+---------- Input ----------
+file: import_literal_test.api
+---------- AST ------------
+ApiFile {
+    syntax: Syntax {
+        version: "v1",
+    },
+    imports: [
+        "",
+        "foo",
+        "bar",
+    ],
+    info: None,
+    types: [],
+    services: [],
+}
+
+
+---------- Input ----------
+file: import_group_test.api
+---------- AST ------------
+ApiFile {
+    syntax: Syntax {
+        version: "v1",
+    },
+    imports: [
+        "",
+        "foo",
+        "bar",
+    ],
+    info: None,
+    types: [],
+    services: [],
+}
+
+
+---------- Input ----------
+file: comment_test.api
+---------- AST ------------
+ApiFile {
+    syntax: Syntax {
+        version: "v1",
+    },
+    imports: [],
+    info: None,
+    types: [],
+    services: [],
+}
+
+
+---------- Input ----------
+file: service_test.api
+---------- AST ------------
+ApiFile {
+    syntax: Syntax {
+        version: "v1",
+    },
+    imports: [],
+    info: None,
+    types: [],
+    services: [
+        Service {
+            server: None,
+            name: "foo",
+            routes: [
+                Route {
+                    doc: None,
+                    handler: Some(
+                        "root",
+                    ),
+                    method: Get,
+                    path: "/",
+                    request: None,
+                    returns: None,
+                },
+                Route {
+                    doc: None,
+                    handler: Some(
+                        "bar",
+                    ),
+                    method: Get,
+                    path: "/ping",
+                    request: None,
+                    returns: None,
+                },
+                Route {
+                    doc: None,
+                    handler: Some(
+                        "bar",
+                    ),
+                    method: Get,
+                    path: "/ping;",
+                    request: None,
+                    returns: None,
+                },
+            ],
+        },
+        Service {
+            server: None,
+            name: "bar",
+            routes: [
+                Route {
+                    doc: Some(
+                        AtDoc {
+                            text: Some(
+                                "bar",
+                            ),
+                        },
+                    ),
+                    handler: Some(
+                        "root",
+                    ),
+                    method: Get,
+                    path: "/",
+                    request: Some(
+                        Named(
+                            "Foo",
+                        ),
+                    ),
+                    returns: None,
+                },
+                Route {
+                    doc: Some(
+                        AtDoc {
+                            text: Some(
+                                "bar",
+                            ),
+                        },
+                    ),
+                    handler: Some(
+                        "root2",
+                    ),
+                    method: Get,
+                    path: "/",
+                    request: None,
+                    returns: Some(
+                        Named(
+                            "Foo",
+                        ),
+                    ),
+                },
+                Route {
+                    doc: Some(
+                        AtDoc {
+                            text: Some(
+                                "bar",
+                            ),
+                        },
+                    ),
+                    handler: Some(
+                        "root3",
+                    ),
+                    method: Get,
+                    path: "/",
+                    request: Some(
+                        Named(
+                            "Foo",
+                        ),
+                    ),
+                    returns: Some(
+                        Named(
+                            "Bar",
+                        ),
+                    ),
+                },
+                Route {
+                    doc: Some(
+                        AtDoc {
+                            text: Some(
+                                "bar",
+                            ),
+                        },
+                    ),
+                    handler: Some(
+                        "foo",
+                    ),
+                    method: Get,
+                    path: "/foo/:bar",
+                    request: Some(
+                        Named(
+                            "Foo",
+                        ),
+                    ),
+                    returns: None,
+                },
+                Route {
+                    doc: Some(
+                        AtDoc {
+                            text: Some(
+                                "bar",
+                            ),
+                        },
+                    ),
+                    handler: Some(
+                        "foo",
+                    ),
+                    method: Get,
+                    path: "/foo/:bar",
+                    request: Some(
+                        Named(
+                            "Foo",
+                        ),
+                    ),
+                    returns: None,
+                },
+                Route {
+                    doc: None,
+                    handler: Some(
+                        "foo",
+                    ),
+                    method: Get,
+                    path: "/foo/:bar",
+                    request: None,
+                    returns: Some(
+                        Named(
+                            "Foo",
+                        ),
+                    ),
+                },
+                Route {
+                    doc: None,
+                    handler: Some(
+                        "foo",
+                    ),
+                    method: Get,
+                    path: "/foo/:bar",
+                    request: None,
+                    returns: Some(
+                        Named(
+                            "Foo",
+                        ),
+                    ),
+                },
+            ],
+        },
+        Service {
+            server: None,
+            name: "baz_api",
+            routes: [
+                Route {
+                    doc: None,
+                    handler: Some(
+                        "foo",
+                    ),
+                    method: Post,
+                    path: "/foo/:bar/foo-bar-baz",
+                    request: Some(
+                        Named(
+                            "Foo",
+                        ),
+                    ),
+                    returns: Some(
+                        Optional(
+                            Named(
+                                "Bar",
+                            ),
+                        ),
+                    ),
+                },
+                Route {
+                    doc: None,
+                    handler: Some(
+                        "foo",
+                    ),
+                    method: Post,
+                    path: "/foo/:bar/foo-bar-baz",
+                    request: Some(
+                        Named(
+                            "Foo",
+                        ),
+                    ),
+                    returns: Some(
+                        Optional(
+                            Named(
+                                "Bar",
+                            ),
+                        ),
+                    ),
+                },
+                Route {
+                    doc: None,
+                    handler: Some(
+                        "bar",
+                    ),
+                    method: Post,
+                    path: "/foo",
+                    request: Some(
+                        List(
+                            Named(
+                                "Foo",
+                            ),
+                        ),
+                    ),
+                    returns: Some(
+                        List(
+                            Optional(
+                                Named(
+                                    "Bar",
+                                ),
+                            ),
+                        ),
+                    ),
+                },
+                Route {
+                    doc: None,
+                    handler: Some(
+                        "bar",
+                    ),
+                    method: Post,
+                    path: "/foo",
+                    request: Some(
+                        List(
+                            Named(
+                                "Foo",
+                            ),
+                        ),
+                    ),
+                    returns: Some(
+                        List(
+                            Optional(
+                                Named(
+                                    "Bar",
+                                ),
+                            ),
+                        ),
+                    ),
+                },
+            ],
+        },
+    ],
+}
+
+
+---------- Input ----------
+file: atserver_test.api
+---------- AST ------------
+ApiFile {
+    syntax: Syntax {
+        version: "v1",
+    },
+    imports: [],
+    info: None,
+    types: [],
+    services: [
+        Service {
+            server: Some(
+                AtServer {
+                    items: [
+                        InfoItem {
+                            key: "foo",
+                            value: "bar",
+                        },
+                        InfoItem {
+                            key: "bar",
+                            value: "baz",
+                        },
+                        InfoItem {
+                            key: "baz",
+                            value: "foo",
+                        },
+                        InfoItem {
+                            key: "qux",
+                            value: "/v1",
+                        },
+                        InfoItem {
+                            key: "quux",
+                            value: "/v1/v2",
+                        },
+                        InfoItem {
+                            key: "middleware",
+                            value: "M1,M2",
+                        },
+                        InfoItem {
+                            key: "timeout1",
+                            value: "1h",
+                        },
+                        InfoItem {
+                            key: "timeout2",
+                            value: "10m",
+                        },
+                        InfoItem {
+                            key: "timeout3",
+                            value: "10s",
+                        },
+                        InfoItem {
+                            key: "timeout4",
+                            value: "10ms",
+                        },
+                        InfoItem {
+                            key: "timeout5",
+                            value: "10µs",
+                        },
+                        InfoItem {
+                            key: "timeout6",
+                            value: "10ns",
+                        },
+                        InfoItem {
+                            key: "timeout7",
+                            value: "1h10m10s10ms10µs10ns",
+                        },
+                        InfoItem {
+                            key: "maxBytes",
+                            value: "1024",
+                        },
+                        InfoItem {
+                            key: "prefix",
+                            value: "/v1",
+                        },
+                        InfoItem {
+                            key: "prefix1",
+                            value: "/v1/v2_test/v2-beta",
+                        },
+                        InfoItem {
+                            key: "prefix2",
+                            value: "v1/v2_test/v2-beta",
+                        },
+                        InfoItem {
+                            key: "prefix3",
+                            value: "v1/v2_",
+                        },
+                        InfoItem {
+                            key: "prefix4",
+                            value: "a-b-c",
+                        },
+                        InfoItem {
+                            key: "summary",
+                            value: "test",
+                        },
+                        InfoItem {
+                            key: "key",
+                            value: "bar",
+                        },
+                    ],
+                },
+            ),
+            name: "atserver",
+            routes: [],
+        },
+    ],
+}
+
+
+---------- Input ----------
+file: type_test.api
+---------- AST ------------
+ApiFile {
+    syntax: Syntax {
+        version: "v1",
+    },
+    imports: [],
+    info: None,
+    types: [
+        TypeDef {
+            name: "Resp",
+            fields: [
+                Field {
+                    attrs: [],
+                    name: "msg",
+                    ty: Named(
+                        "String",
+                    ),
+                },
+                Field {
+                    attrs: [],
+                    name: "tags",
+                    ty: List(
+                        Named(
+                            "String",
+                        ),
+                    ),
+                },
+                Field {
+                    attrs: [],
+                    name: "extra",
+                    ty: Map {
+                        key: Named(
+                            "String",
+                        ),
+                        value: Named(
+                            "i64",
+                        ),
+                    },
+                },
+                Field {
+                    attrs: [],
+                    name: "nickname",
+                    ty: Optional(
+                        Named(
+                            "String",
+                        ),
+                    ),
+                },
+            ],
+        },
+        TypeDef {
+            name: "Bar",
+            fields: [
+                Field {
+                    attrs: [],
+                    name: "base",
+                    ty: Named(
+                        "i64",
+                    ),
+                },
+                Field {
+                    attrs: [],
+                    name: "items",
+                    ty: List(
+                        Named(
+                            "String",
+                        ),
+                    ),
+                },
+                Field {
+                    attrs: [],
+                    name: "nested",
+                    ty: List(
+                        Optional(
+                            Named(
+                                "Bar",
+                            ),
+                        ),
+                    ),
+                },
+                Field {
+                    attrs: [],
+                    name: "extra",
+                    ty: Map {
+                        key: Named(
+                            "String",
+                        ),
+                        value: Named(
+                            "i64",
+                        ),
+                    },
+                },
+                Field {
+                    attrs: [],
+                    name: "pointers",
+                    ty: Map {
+                        key: Named(
+                            "String",
+                        ),
+                        value: Optional(
+                            Named(
+                                "i64",
+                            ),
+                        ),
+                    },
+                },
+                Field {
+                    attrs: [],
+                    name: "groups",
+                    ty: Map {
+                        key: Named(
+                            "String",
+                        ),
+                        value: List(
+                            Named(
+                                "i64",
+                            ),
+                        ),
+                    },
+                },
+                Field {
+                    attrs: [],
+                    name: "foo",
+                    ty: Named(
+                        "Foo",
+                    ),
+                },
+                Field {
+                    attrs: [],
+                    name: "qux",
+                    ty: Optional(
+                        Named(
+                            "String",
+                        ),
+                    ),
+                },
+                Field {
+                    attrs: [],
+                    name: "quux",
+                    ty: Named(
+                        "bool",
+                    ),
+                },
+            ],
+        },
+        TypeDef {
+            name: "Foo",
+            fields: [
+                Field {
+                    attrs: [],
+                    name: "name",
+                    ty: Named(
+                        "String",
+                    ),
+                },
+                Field {
+                    attrs: [],
+                    name: "age",
+                    ty: Named(
+                        "i64",
+                    ),
+                },
+            ],
+        },
+        TypeDef {
+            name: "GetUserReq",
+            fields: [
+                Field {
+                    attrs: [
+                        FieldAttr {
+                            name: "path",
+                            value: None,
+                        },
+                        FieldAttr {
+                            name: "json",
+                            value: Some(
+                                "user_id",
+                            ),
+                        },
+                    ],
+                    name: "userId",
+                    ty: Named(
+                        "String",
+                    ),
+                },
+                Field {
+                    attrs: [
+                        FieldAttr {
+                            name: "path",
+                            value: Some(
+                                "id",
+                            ),
+                        },
+                        FieldAttr {
+                            name: "json",
+                            value: Some(
+                                "user_id",
+                            ),
+                        },
+                    ],
+                    name: "userId2",
+                    ty: Named(
+                        "String",
+                    ),
+                },
+                Field {
+                    attrs: [
+                        FieldAttr {
+                            name: "query",
+                            value: None,
+                        },
+                    ],
+                    name: "page",
+                    ty: Optional(
+                        Named(
+                            "i64",
+                        ),
+                    ),
+                },
+            ],
+        },
+    ],
+    services: [],
+}
+
+
+---------- Input ----------
+file: example.api
+---------- AST ------------
+ApiFile {
+    syntax: Syntax {
+        version: "v1",
+    },
+    imports: [
+        "example_base1.api",
+        "example_base2.api",
+    ],
+    info: Some(
+        InfoBlock {
+            items: [
+                InfoItem {
+                    key: "title",
+                    value: "type title here",
+                },
+                InfoItem {
+                    key: "desc",
+                    value: "type desc here",
+                },
+                InfoItem {
+                    key: "author",
+                    value: "type author here",
+                },
+                InfoItem {
+                    key: "email",
+                    value: "type email here",
+                },
+                InfoItem {
+                    key: "version",
+                    value: "type version here",
+                },
+            ],
+        },
+    ),
+    types: [
+        TypeDef {
+            name: "GetFormReq",
+            fields: [
+                Field {
+                    attrs: [],
+                    name: "name",
+                    ty: Named(
+                        "String",
+                    ),
+                },
+                Field {
+                    attrs: [],
+                    name: "age",
+                    ty: Named(
+                        "i64",
+                    ),
+                },
+                Field {
+                    attrs: [],
+                    name: "hobbits",
+                    ty: List(
+                        Named(
+                            "String",
+                        ),
+                    ),
+                },
+            ],
+        },
+        TypeDef {
+            name: "GetFormResp",
+            fields: [
+                Field {
+                    attrs: [],
+                    name: "name",
+                    ty: Named(
+                        "String",
+                    ),
+                },
+                Field {
+                    attrs: [],
+                    name: "age",
+                    ty: Named(
+                        "i64",
+                    ),
+                },
+                Field {
+                    attrs: [],
+                    name: "hobbits",
+                    ty: List(
+                        Named(
+                            "String",
+                        ),
+                    ),
+                },
+            ],
+        },
+        TypeDef {
+            name: "PostJsonReq",
+            fields: [
+                Field {
+                    attrs: [],
+                    name: "name",
+                    ty: Named(
+                        "String",
+                    ),
+                },
+                Field {
+                    attrs: [],
+                    name: "age",
+                    ty: Named(
+                        "i64",
+                    ),
+                },
+                Field {
+                    attrs: [],
+                    name: "hobbits",
+                    ty: List(
+                        Named(
+                            "String",
+                        ),
+                    ),
+                },
+            ],
+        },
+        TypeDef {
+            name: "PostJsonResp",
+            fields: [
+                Field {
+                    attrs: [],
+                    name: "name",
+                    ty: Named(
+                        "String",
+                    ),
+                },
+                Field {
+                    attrs: [],
+                    name: "age",
+                    ty: Named(
+                        "i64",
+                    ),
+                },
+                Field {
+                    attrs: [],
+                    name: "hobbits",
+                    ty: List(
+                        Named(
+                            "String",
+                        ),
+                    ),
+                },
+                Field {
+                    attrs: [],
+                    name: "extra",
+                    ty: Map {
+                        key: Named(
+                            "String",
+                        ),
+                        value: Named(
+                            "String",
+                        ),
+                    },
+                },
+            ],
+        },
+        TypeDef {
+            name: "PostPathReq",
+            fields: [
+                Field {
+                    attrs: [
+                        FieldAttr {
+                            name: "path",
+                            value: None,
+                        },
+                    ],
+                    name: "id",
+                    ty: Named(
+                        "String",
+                    ),
+                },
+            ],
+        },
+        TypeDef {
+            name: "Nest",
+            fields: [
+                Field {
+                    attrs: [],
+                    name: "name",
+                    ty: Named(
+                        "String",
+                    ),
+                },
+            ],
+        },
+        TypeDef {
+            name: "NestDemoReq",
+            fields: [
+                Field {
+                    attrs: [],
+                    name: "nest",
+                    ty: Optional(
+                        Named(
+                            "Nest",
+                        ),
+                    ),
+                },
+            ],
+        },
+        TypeDef {
+            name: "NestDemoResp",
+            fields: [
+                Field {
+                    attrs: [],
+                    name: "nest",
+                    ty: List(
+                        Optional(
+                            Named(
+                                "Nest",
+                            ),
+                        ),
+                    ),
+                },
+            ],
+        },
+    ],
+    services: [
+        Service {
+            server: Some(
+                AtServer {
+                    items: [
+                        InfoItem {
+                            key: "group",
+                            value: "form",
+                        },
+                        InfoItem {
+                            key: "timeout",
+                            value: "3s",
+                        },
+                    ],
+                },
+            ),
+            name: "example",
+            routes: [
+                Route {
+                    doc: None,
+                    handler: Some(
+                        "getForm",
+                    ),
+                    method: Get,
+                    path: "/example/form",
+                    request: Some(
+                        Named(
+                            "GetFormReq",
+                        ),
+                    ),
+                    returns: Some(
+                        Named(
+                            "GetFormResp",
+                        ),
+                    ),
+                },
+                Route {
+                    doc: None,
+                    handler: Some(
+                        "postForm",
+                    ),
+                    method: Post,
+                    path: "/example/form",
+                    request: Some(
+                        Named(
+                            "GetFormReq",
+                        ),
+                    ),
+                    returns: Some(
+                        Named(
+                            "GetFormResp",
+                        ),
+                    ),
+                },
+            ],
+        },
+        Service {
+            server: Some(
+                AtServer {
+                    items: [
+                        InfoItem {
+                            key: "group",
+                            value: "json",
+                        },
+                        InfoItem {
+                            key: "jwt",
+                            value: "Auth",
+                        },
+                        InfoItem {
+                            key: "timeout",
+                            value: "3m",
+                        },
+                    ],
+                },
+            ),
+            name: "example",
+            routes: [
+                Route {
+                    doc: Some(
+                        AtDoc {
+                            text: Some(
+                                "json demo",
+                            ),
+                        },
+                    ),
+                    handler: Some(
+                        "postJson",
+                    ),
+                    method: Post,
+                    path: "/example/json",
+                    request: Some(
+                        Named(
+                            "PostJsonReq",
+                        ),
+                    ),
+                    returns: Some(
+                        Named(
+                            "PostJsonResp",
+                        ),
+                    ),
+                },
+            ],
+        },
+        Service {
+            server: Some(
+                AtServer {
+                    items: [
+                        InfoItem {
+                            key: "group",
+                            value: "path",
+                        },
+                        InfoItem {
+                            key: "middleware",
+                            value: "Path",
+                        },
+                        InfoItem {
+                            key: "prefix",
+                            value: "/v1/v2",
+                        },
+                        InfoItem {
+                            key: "timeout",
+                            value: "100ms",
+                        },
+                    ],
+                },
+            ),
+            name: "example",
+            routes: [
+                Route {
+                    doc: Some(
+                        AtDoc {
+                            text: Some(
+                                "path demo",
+                            ),
+                        },
+                    ),
+                    handler: Some(
+                        "postPath",
+                    ),
+                    method: Post,
+                    path: "/example/path",
+                    request: Some(
+                        Named(
+                            "PostPathReq",
+                        ),
+                    ),
+                    returns: Some(
+                        Named(
+                            "PostJsonResp",
+                        ),
+                    ),
+                },
+                Route {
+                    doc: None,
+                    handler: Some(
+                        "root",
+                    ),
+                    method: Post,
+                    path: "/",
+                    request: None,
+                    returns: Some(
+                        Named(
+                            "PostJsonResp",
+                        ),
+                    ),
+                },
+            ],
+        },
+        Service {
+            server: Some(
+                AtServer {
+                    items: [
+                        InfoItem {
+                            key: "group",
+                            value: "array",
+                        },
+                        InfoItem {
+                            key: "prefix",
+                            value: "/array",
+                        },
+                        InfoItem {
+                            key: "maxBytes",
+                            value: "1024",
+                        },
+                    ],
+                },
+            ),
+            name: "example",
+            routes: [
+                Route {
+                    doc: None,
+                    handler: Some(
+                        "getArray",
+                    ),
+                    method: Post,
+                    path: "/example/array",
+                    request: Some(
+                        Named(
+                            "GetFormReq",
+                        ),
+                    ),
+                    returns: Some(
+                        List(
+                            Named(
+                                "GetFormResp",
+                            ),
+                        ),
+                    ),
+                },
+                Route {
+                    doc: None,
+                    handler: Some(
+                        "getArrayPointer",
+                    ),
+                    method: Post,
+                    path: "/example/array/pointer",
+                    request: Some(
+                        Named(
+                            "GetFormReq",
+                        ),
+                    ),
+                    returns: Some(
+                        List(
+                            Optional(
+                                Named(
+                                    "GetFormResp",
+                                ),
+                            ),
+                        ),
+                    ),
+                },
+                Route {
+                    doc: None,
+                    handler: Some(
+                        "getArrayBase",
+                    ),
+                    method: Post,
+                    path: "/example/array/base",
+                    request: Some(
+                        Named(
+                            "GetFormReq",
+                        ),
+                    ),
+                    returns: Some(
+                        List(
+                            Named(
+                                "String",
+                            ),
+                        ),
+                    ),
+                },
+            ],
+        },
+        Service {
+            server: Some(
+                AtServer {
+                    items: [
+                        InfoItem {
+                            key: "group",
+                            value: "/g1/g2_test/g2_beta",
+                        },
+                        InfoItem {
+                            key: "prefix",
+                            value: "/v1/v2_test/v2-beta",
+                        },
+                        InfoItem {
+                            key: "summary",
+                            value: "test",
+                        },
+                    ],
+                },
+            ),
+            name: "example",
+            routes: [
+                Route {
+                    doc: None,
+                    handler: Some(
+                        "nestDemo",
+                    ),
+                    method: Post,
+                    path: "/a/b_c/d-e/:f/123/g",
+                    request: Some(
+                        Named(
+                            "NestDemoReq",
+                        ),
+                    ),
+                    returns: Some(
+                        Named(
+                            "NestDemoResp",
+                        ),
+                    ),
+                },
+            ],
+        },
+    ],
+}
+
+

@@ -1,0 +1,52 @@
+service foo {
+    #[handler(root)]
+    get /
+
+    #[handler(bar)]
+    get /ping
+
+    #[handler(bar)]
+    get /ping;
+}
+
+service bar {
+    @doc "bar"
+    #[handler(root)]
+    get / (Foo)
+
+    @doc "bar"
+    #[handler(root2)]
+    get / -> Foo
+
+    @doc "bar"
+    #[handler(root3)]
+    get / (Foo) -> Bar
+
+    @doc "bar"
+    #[handler(foo)]
+    get /foo/:bar (Foo)
+
+    @doc "bar"
+    #[handler(foo)]
+    get /foo/:bar (Foo);
+
+    #[handler(foo)]
+    get /foo/:bar -> Foo
+
+    #[handler(foo)]
+    get /foo/:bar () -> Foo;
+}
+
+service baz_api {
+    #[handler(foo)]
+    post /foo/:bar/foo-bar-baz (Foo) -> Bar?
+
+    #[handler(foo)]
+    post /foo/:bar/foo-bar-baz (Foo) -> Bar?;
+
+    #[handler(bar)]
+    post /foo ([Foo]) -> [Bar?]
+
+    #[handler(bar)]
+    post /foo ([Foo]) -> [Bar?];
+}

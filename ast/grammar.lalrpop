@@ -112,6 +112,7 @@ KvValue: String = {
 KvValueTail: String = {
     "," <id:IdentOrKw> => format!(",{id}"),
     "/" <id:IdentOrKw> => format!("/{id}"),
+    "-" <id:IdentOrKw> => format!("-{id}"),
     <p:"path"> => p.text,
 };
 
