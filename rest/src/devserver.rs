@@ -392,7 +392,19 @@ fn render_flamegraph(seconds: u64, frequency: i32) -> Result<Vec<u8>, String> {
     report
         .flamegraph(&mut svg)
         .map_err(|error| error.to_string())?;
+    ensure_flamegraph_svg(&mut svg);
     Ok(svg)
+}
+
+#[cfg(all(feature = "sampling-profiler", unix))]
+fn ensure_flamegraph_svg(svg: &mut Vec<u8>) {
+    if svg.is_empty() {
+        // pprof can legitimately collect no samples in a short window on idle or restricted CI
+        // hosts. Keep the endpoint's image/svg+xml contract while making that state explicit.
+        svg.extend_from_slice(
+            br##"<svg xmlns="http://www.w3.org/2000/svg" width="640" height="80" viewBox="0 0 640 80"><rect width="100%" height="100%" fill="#fafafa"/><text x="20" y="46" font-family="sans-serif" font-size="16">No samples captured during this profiling window</text></svg>"##,
+        );
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -680,6 +692,17 @@ mod tests {
             svg.contains("<svg"),
             "unexpected flamegraph output: {svg:?}"
         );
+        assert!(svg.contains("</svg>"));
+    }
+
+    #[cfg(all(feature = "sampling-profiler", unix))]
+    #[actix_rt::test]
+    async fn empty_sampling_window_has_a_valid_svg_fallback() {
+        let mut svg = Vec::new();
+        ensure_flamegraph_svg(&mut svg);
+        let svg = std::str::from_utf8(&svg).unwrap();
+        assert!(svg.contains("<svg"));
+        assert!(svg.contains("No samples captured"));
         assert!(svg.contains("</svg>"));
     }
 }
