@@ -160,6 +160,10 @@ impl ContinuousProfiler {
     /// Validates the configuration and starts the CPU monitor.
     pub fn start(config: ContinuousProfileConfig) -> Result<Self, ContinuousProfileError> {
         config.validate()?;
+        // reqwest is built without an implicit rustls provider so enabling this feature cannot
+        // conflict with a transport crate's provider. Respect an application-installed provider;
+        // otherwise select the same ring provider used by rust-zero's REST stack.
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let (stop, receiver) = mpsc::channel();
         let worker = thread::Builder::new()
             .name("rust-zero-profiler".to_owned())

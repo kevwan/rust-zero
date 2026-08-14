@@ -25,7 +25,9 @@ jobs:
           - name: telemetry
             command: cargo test --workspace --all-targets --features rust-zero-core/telemetry,rust-zero-rest/telemetry,rust-zero-rpc/telemetry --locked
           - name: all
-            command: cargo test --workspace --all-targets --all-features --locked
+            # All adapters plus both profilers make the REST test binary large enough that
+            # parallel linking can exceed the standard runner's 8 GB memory limit.
+            command: cargo test --jobs 1 --workspace --all-targets --all-features --locked
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
