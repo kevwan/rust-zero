@@ -4,11 +4,13 @@
 //! centralize the transport safeguards that should be applied consistently across services.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{hash_map::RandomState, BTreeMap, BTreeSet},
     error::Error as StdError,
     fmt,
     future::Future,
+    hash::{BuildHasher, Hasher},
     net::SocketAddr,
+    sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
 
@@ -809,6 +811,11 @@ pub struct RpcClientConfig {
         with = "optional_duration_millis"
     )]
     discovery_health_timeout: Option<Duration>,
+    /// Maximum number of unique discovery endpoints connected by one client.
+    /// `None` preserves the opt-out behavior and connects to every valid endpoint.
+    discovery_subset_size: Option<usize>,
+    /// Optional stable seed for repeatable subset membership across client restarts.
+    discovery_subset_seed: Option<u64>,
     tls: Option<RpcClientTlsConfig>,
 }
 
@@ -831,6 +838,8 @@ impl RpcClientConfig {
             keepalive_while_idle: false,
             discovery_health_interval: None,
             discovery_health_timeout: None,
+            discovery_subset_size: None,
+            discovery_subset_seed: None,
             tls: None,
         }
     }
@@ -902,6 +911,22 @@ impl RpcClientConfig {
         self
     }
 
+    /// Limits a discovery-backed channel to a randomized, low-churn endpoint subset.
+    ///
+    /// Membership is stable for the lifetime of the client and across snapshot reordering. Use
+    /// [`Self::with_discovery_subset_seed`] when membership must also survive process restarts.
+    pub fn with_discovery_subset(mut self, size: usize) -> Self {
+        assert!(size > 0, "discovery subset size must be greater than zero");
+        self.discovery_subset_size = Some(size);
+        self
+    }
+
+    /// Sets a repeatable seed for discovery subsetting across client restarts.
+    pub fn with_discovery_subset_seed(mut self, seed: u64) -> Self {
+        self.discovery_subset_seed = Some(seed);
+        self
+    }
+
     pub fn with_tls(mut self, tls: RpcClientTlsConfig) -> Self {
         self.tls = Some(tls);
         self
@@ -943,6 +968,11 @@ impl RpcClientConfig {
                 "concurrency limit must be greater than zero",
             ));
         }
+        if self.discovery_subset_size == Some(0) {
+            return Err(RpcConfigError::Invalid(
+                "discovery subset size must be greater than zero",
+            ));
+        }
         if self.http2_keepalive_interval.is_some() != self.keepalive_timeout.is_some() {
             return Err(RpcConfigError::Invalid(
                 "HTTP/2 keepalive interval and timeout must be configured together",
@@ -971,7 +1001,10 @@ pub enum DiscoveryReadiness {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DiscoveryStatusSnapshot {
     pub readiness: DiscoveryReadiness,
+    /// Endpoints in the complete backend snapshot, including malformed entries.
     pub discovered: usize,
+    /// Valid endpoints selected for this client's balanced channel.
+    pub selected: usize,
     pub available: usize,
     pub rejected: usize,
 }
@@ -1046,16 +1079,23 @@ impl DiscoveryStatus {
 #[derive(Debug, Clone)]
 pub struct RpcClient {
     config: RpcClientConfig,
+    discovery_subset_seed: u64,
 }
 
 impl RpcClient {
     pub fn new(config: RpcClientConfig) -> Self {
-        Self { config }
+        let discovery_subset_seed = config
+            .discovery_subset_seed
+            .unwrap_or_else(random_discovery_subset_seed);
+        Self {
+            config,
+            discovery_subset_seed,
+        }
     }
 
     pub fn try_new(config: RpcClientConfig) -> Result<Self, RpcConfigError> {
         config.validate()?;
-        Ok(Self { config })
+        Ok(Self::new(config))
     }
 
     pub fn config(&self) -> &RpcClientConfig {
@@ -1110,7 +1150,7 @@ impl RpcClient {
         S: EndpointSubscription,
     {
         let initial = subscription.discovered_endpoints();
-        let (configured, rejected) = self.configure_discovered(initial);
+        let (configured, discovered, rejected) = self.configure_discovered(initial);
 
         let capacity = configured
             .values()
@@ -1130,12 +1170,14 @@ impl RpcClient {
                     );
             }
         }
-        let initial_status = discovery_status(configured.len(), configured.len(), rejected);
+        let initial_status =
+            discovery_status(discovered, configured.len(), configured.len(), rejected);
         let (status_updates, status_receiver) = tokio::sync::watch::channel(initial_status);
 
         let client = self.clone();
         tokio::spawn(async move {
             let mut configured = configured;
+            let mut discovered = discovered;
             let mut available: BTreeSet<String> = configured.keys().cloned().collect();
             let mut rejected = rejected;
             let mut health_ticks = client.discovery_health_ticks();
@@ -1145,6 +1187,7 @@ impl RpcClient {
                     snapshot = subscription.changed() => {
                         if snapshot.is_err() {
                             let mut closed = discovery_status(
+                                discovered,
                                 configured.len(),
                                 0,
                                 rejected,
@@ -1153,9 +1196,10 @@ impl RpcClient {
                             status_updates.send_replace(closed);
                             return;
                         }
-                        let (next, next_rejected) =
+                        let (next, next_discovered, next_rejected) =
                             client.configure_discovered(subscription.discovered_endpoints());
                         configured = next;
+                        discovered = next_discovered;
                         rejected = next_rejected;
                         available.retain(|uri| configured.contains_key(uri));
                         available.extend(configured.keys().cloned());
@@ -1189,6 +1233,7 @@ impl RpcClient {
                     installed.insert(key);
                 }
                 status_updates.send_replace(discovery_status(
+                    discovered,
                     configured.len(),
                     available.len(),
                     rejected,
@@ -1207,9 +1252,13 @@ impl RpcClient {
     fn configure_discovered(
         &self,
         endpoints: Vec<DiscoveredEndpoint>,
-    ) -> (BTreeMap<String, (Endpoint, DiscoveredEndpoint)>, usize) {
+    ) -> (
+        BTreeMap<String, (Endpoint, DiscoveredEndpoint)>,
+        usize,
+        usize,
+    ) {
         let discovered = endpoints.len();
-        let configured: BTreeMap<_, _> = endpoints
+        let mut configured: BTreeMap<_, _> = endpoints
             .into_iter()
             .filter_map(|discovered| {
                 self.endpoint(discovered.uri().to_owned())
@@ -1218,7 +1267,10 @@ impl RpcClient {
             })
             .collect();
         let rejected = discovered.saturating_sub(configured.len());
-        (configured, rejected)
+        if let Some(limit) = self.config.discovery_subset_size {
+            configured = select_discovery_subset(configured, limit, self.discovery_subset_seed);
+        }
+        (configured, discovered, rejected)
     }
 
     fn discovery_health_ticks(&self) -> tokio::time::Interval {
@@ -1293,6 +1345,48 @@ fn weighted_key(uri: &str, slot: u32) -> String {
     format!("{uri}\0{slot}")
 }
 
+static DISCOVERY_SUBSET_SEED_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn random_discovery_subset_seed() -> u64 {
+    let state = RandomState::new();
+    let mut hasher = state.build_hasher();
+    hasher.write_u64(DISCOVERY_SUBSET_SEED_COUNTER.fetch_add(1, Ordering::Relaxed));
+    hasher.finish()
+}
+
+fn discovery_subset_score(uri: &str, seed: u64) -> u64 {
+    // FNV-1a followed by SplitMix64 finalization gives deterministic, well-distributed rendezvous
+    // scores without adding a random-number dependency to the transport crate.
+    let mut score = 0xcbf29ce484222325_u64 ^ seed;
+    for byte in uri.as_bytes() {
+        score ^= u64::from(*byte);
+        score = score.wrapping_mul(0x100000001b3);
+    }
+    score = (score ^ (score >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+    score = (score ^ (score >> 27)).wrapping_mul(0x94d049bb133111eb);
+    score ^ (score >> 31)
+}
+
+fn select_discovery_subset(
+    configured: BTreeMap<String, (Endpoint, DiscoveredEndpoint)>,
+    limit: usize,
+    seed: u64,
+) -> BTreeMap<String, (Endpoint, DiscoveredEndpoint)> {
+    if configured.len() <= limit {
+        return configured;
+    }
+    let mut ranked: Vec<_> = configured
+        .keys()
+        .map(|uri| (discovery_subset_score(uri, seed), uri.clone()))
+        .collect();
+    ranked.sort_unstable_by(|left, right| right.cmp(left));
+    let selected: BTreeSet<_> = ranked.into_iter().take(limit).map(|(_, uri)| uri).collect();
+    configured
+        .into_iter()
+        .filter(|(uri, _)| selected.contains(uri))
+        .collect()
+}
+
 fn weighted_keys(
     configured: &BTreeMap<String, (Endpoint, DiscoveredEndpoint)>,
     available: &BTreeSet<String>,
@@ -1308,20 +1402,21 @@ fn weighted_keys(
 
 fn discovery_status(
     discovered: usize,
+    selected: usize,
     available: usize,
     rejected: usize,
 ) -> DiscoveryStatusSnapshot {
-    let total = discovered + rejected;
-    let readiness = if total == 0 {
+    let readiness = if discovered == 0 {
         DiscoveryReadiness::Empty
-    } else if available == discovered && rejected == 0 {
+    } else if selected > 0 && available == selected && rejected == 0 {
         DiscoveryReadiness::Ready
     } else {
         DiscoveryReadiness::Degraded
     };
     DiscoveryStatusSnapshot {
         readiness,
-        discovered: total,
+        discovered,
+        selected,
         available,
         rejected,
     }
@@ -1474,11 +1569,13 @@ mod tests {
         server.validate().unwrap();
 
         let client: RpcClientConfig = rust_zero_core::parse_config(
-            "uri = \"http://127.0.0.1:50052\"\nconnect_timeout_ms = 250",
+            "uri = \"http://127.0.0.1:50052\"\nconnect_timeout_ms = 250\ndiscovery_subset_size = 32\ndiscovery_subset_seed = 7",
             rust_zero_core::ConfigFormat::Toml,
         )
         .unwrap();
         assert_eq!(client.connect_timeout, Some(Duration::from_millis(250)));
+        assert_eq!(client.discovery_subset_size, Some(32));
+        assert_eq!(client.discovery_subset_seed, Some(7));
         client.validate().unwrap();
     }
 
@@ -2425,12 +2522,15 @@ mod tests {
         });
 
         let (updates, receiver) = watch::channel(Vec::new());
-        let channel = RpcClient::new(RpcClientConfig::new("http://unused")).connect_discovered(
-            TestSubscription {
-                receiver,
-                dropped: None,
-            },
-        );
+        let channel = RpcClient::new(
+            RpcClientConfig::new("http://unused")
+                .with_discovery_subset(1)
+                .with_discovery_subset_seed(5),
+        )
+        .connect_discovered(TestSubscription {
+            receiver,
+            dropped: None,
+        });
         updates.send_replace(vec![
             "not a URI".to_owned(),
             format!("http://{first_address}"),
@@ -2552,6 +2652,7 @@ mod tests {
         let (updates, receiver) = watch::channel(DiscoveryStatusSnapshot {
             readiness: DiscoveryReadiness::Empty,
             discovered: 0,
+            selected: 0,
             available: 0,
             rejected: 0,
         });
@@ -2565,6 +2666,7 @@ mod tests {
             .send(DiscoveryStatusSnapshot {
                 readiness: DiscoveryReadiness::Ready,
                 discovered: 1,
+                selected: 1,
                 available: 1,
                 rejected: 0,
             })
@@ -2588,7 +2690,7 @@ mod tests {
     #[test]
     fn weighted_discovery_keys_preserve_relative_capacity() {
         let client = RpcClient::new(RpcClientConfig::new("http://unused"));
-        let (configured, rejected) = client.configure_discovered(vec![
+        let (configured, discovered, rejected) = client.configure_discovered(vec![
             DiscoveredEndpoint::weighted("http://one:8080", 3).unwrap(),
             DiscoveredEndpoint::weighted("http://two:8080", 1).unwrap(),
             DiscoveredEndpoint::new("not a URI").unwrap(),
@@ -2599,10 +2701,11 @@ mod tests {
         assert_eq!(keys.len(), 4);
         assert_eq!(rejected, 1);
         assert_eq!(
-            discovery_status(configured.len(), configured.len(), rejected),
+            discovery_status(discovered, configured.len(), configured.len(), rejected),
             DiscoveryStatusSnapshot {
                 readiness: DiscoveryReadiness::Degraded,
                 discovered: 3,
+                selected: 2,
                 available: 2,
                 rejected: 1,
             }
@@ -2612,16 +2715,90 @@ mod tests {
     #[test]
     fn discovery_status_distinguishes_empty_ready_and_degraded() {
         assert_eq!(
-            discovery_status(0, 0, 0).readiness,
+            discovery_status(0, 0, 0, 0).readiness,
             DiscoveryReadiness::Empty
         );
         assert_eq!(
-            discovery_status(2, 2, 0).readiness,
+            discovery_status(2, 2, 2, 0).readiness,
             DiscoveryReadiness::Ready
         );
         assert_eq!(
-            discovery_status(2, 1, 0).readiness,
+            discovery_status(2, 2, 1, 0).readiness,
             DiscoveryReadiness::Degraded
+        );
+    }
+
+    fn discovered_range(count: usize) -> Vec<DiscoveredEndpoint> {
+        (0..count)
+            .map(|index| DiscoveredEndpoint::new(format!("http://service-{index}:8080")).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn discovery_subsetting_caps_connections_and_can_be_disabled() {
+        let endpoints = discovered_range(10_000);
+        let subset_client = RpcClient::new(
+            RpcClientConfig::new("http://unused")
+                .with_discovery_subset(64)
+                .with_discovery_subset_seed(11),
+        );
+        let (subset, discovered, rejected) = subset_client.configure_discovered(endpoints.clone());
+        assert_eq!(discovered, 10_000);
+        assert_eq!(subset.len(), 64);
+        assert_eq!(rejected, 0);
+
+        let (all, discovered, rejected) =
+            RpcClient::new(RpcClientConfig::new("http://unused")).configure_discovered(endpoints);
+        assert_eq!(discovered, 10_000);
+        assert_eq!(all.len(), 10_000);
+        assert_eq!(rejected, 0);
+    }
+
+    #[test]
+    fn discovery_subsets_are_repeatable_and_low_churn() {
+        let config = RpcClientConfig::new("http://unused")
+            .with_discovery_subset(32)
+            .with_discovery_subset_seed(23);
+        let first = RpcClient::new(config.clone())
+            .configure_discovered(discovered_range(1_000))
+            .0;
+        let reordered = RpcClient::new(config.clone())
+            .configure_discovered(discovered_range(1_000).into_iter().rev().collect())
+            .0;
+        assert_eq!(
+            first.keys().collect::<Vec<_>>(),
+            reordered.keys().collect::<Vec<_>>()
+        );
+
+        let grown = RpcClient::new(config)
+            .configure_discovered(discovered_range(1_001))
+            .0;
+        let retained = first.keys().filter(|uri| grown.contains_key(*uri)).count();
+        assert!(
+            retained >= 31,
+            "one added endpoint replaced too many members"
+        );
+    }
+
+    #[test]
+    fn discovery_subsets_distribute_clients_across_the_fleet() {
+        let endpoints = discovered_range(128);
+        let subsets: BTreeSet<Vec<String>> = (0..32)
+            .map(|seed| {
+                RpcClient::new(
+                    RpcClientConfig::new("http://unused")
+                        .with_discovery_subset(8)
+                        .with_discovery_subset_seed(seed),
+                )
+                .configure_discovered(endpoints.clone())
+                .0
+                .into_keys()
+                .collect()
+            })
+            .collect();
+        assert!(
+            subsets.len() >= 30,
+            "client seeds should spread subset membership"
         );
     }
 }

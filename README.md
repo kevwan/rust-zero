@@ -770,6 +770,8 @@ let _lease = registry.publish_weighted("users", "http://127.0.0.1:50051", 3)?;
 let subscription = registry.subscribe("users")?;
 let (balanced_channel, discovery_status) = RpcClient::new(
     RpcClientConfig::new("http://unused")
+        .with_discovery_subset(64)
+        .with_discovery_subset_seed(7)
         .with_discovery_health_check(Duration::from_secs(5), Duration::from_secs(1)),
 )
 .connect_discovered_with_status(subscription);
@@ -782,6 +784,14 @@ let (reporter, _health_service) = health_reporter();
 let grpc_health_projection = discovery_status.project_to_grpc_health(reporter, "users-rpc");
 let client_auth = BearerToken::new("service-token")?;
 ```
+
+`with_discovery_subset` bounds the number of unique connections a client opens for a large
+discovery snapshot. Membership uses randomized rendezvous ranking, so snapshot reordering does not
+cause churn and adding or removing an endpoint replaces only the affected members. Omit the option
+to connect to every valid endpoint. The optional seed makes membership repeatable across process
+restarts; without it, each client instance receives a random seed to spread load across the fleet.
+`DiscoveryStatusSnapshot` reports both the complete `discovered` count and the locally `selected`
+count.
 
 Exact gRPC method timeouts override service-level timeouts, which override the global request
 timeout. The same settings deserialize from `method_timeouts_ms` and `service_timeouts_ms` maps.

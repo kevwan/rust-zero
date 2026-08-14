@@ -241,7 +241,7 @@ scale.
 - [x] **Feature-enabled runtime test matrix.** Run transport and core tests—not only compilation
   checks—with telemetry and all supported feature combinations. Retain real-backend tests and add
   coverage for gateway TLS/observability plus opt-in etcd TLS where CI credentials permit.
-- [ ] **Large-fleet discovery subsetting.** Add configurable, randomized, stable-enough client-side
+- [x] **Large-fleet discovery subsetting.** Add configurable, randomized, stable-enough client-side
   endpoint subsetting for very large discovery snapshots, with churn distribution, reconnection,
   empty-set recovery, and connection-count tests. Preserve an opt-out mode for applications that
   intentionally connect to every endpoint.
