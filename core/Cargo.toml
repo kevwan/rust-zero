@@ -19,6 +19,7 @@ all-features = true
 default = []
 etcd = ["dep:etcd-client"]
 kubernetes = ["dep:futures", "dep:k8s-openapi", "dep:kube"]
+continuous-profiling = ["dep:pyroscope"]
 stores = ["stores-mongo", "stores-redis", "stores-sql"]
 stores-mongo = ["dep:mongodb"]
 stores-redis = ["dep:futures", "dep:redis"]
@@ -58,6 +59,7 @@ kube = { version = "4.2", features = ["runtime"], optional = true }
 opentelemetry = { version = "0.32", features = ["trace"], optional = true }
 opentelemetry-otlp = { version = "0.32", default-features = false, features = ["grpc-tonic", "http-proto", "reqwest-blocking-client", "trace"], optional = true }
 opentelemetry_sdk = { version = "0.32", features = ["trace"], optional = true }
+pyroscope = { version = "=2.0.1", features = ["backend-pprof-rs"], optional = true }
 mongodb = { version = "3.8", optional = true }
 redis = { version = "0.32", features = ["cluster-async", "tokio-comp"], optional = true }
 serde = { version = "1", features = ["derive"] }

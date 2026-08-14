@@ -49,7 +49,7 @@ tonic = { version = "0.12", default-features = false }
 tracing = "0.1"
 
 [target.'cfg(unix)'.dependencies]
-pprof = { version = "0.15", features = ["flamegraph"], optional = true }
+pprof = { package = "pprof-pyroscope-fork", version = "=0.1500.4", features = ["flamegraph"], optional = true }
 
 [dev-dependencies]
 rcgen = "0.13"

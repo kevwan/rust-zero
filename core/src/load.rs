@@ -124,7 +124,7 @@ struct ShedderState {
     cooldown_until: Option<Instant>,
 }
 
-trait CpuSource: Send + Sync {
+pub(crate) trait CpuSource: Send + Sync {
     fn usage(&self) -> f64;
 }
 
@@ -382,7 +382,7 @@ fn production_limit(state: &ShedderState, config: &LoadShedderConfig) -> usize {
         .min(config.max_concurrency)
 }
 
-struct ProcessCpuSource {
+pub(crate) struct ProcessCpuSource {
     state: Mutex<ProcessCpuState>,
 }
 
@@ -393,7 +393,7 @@ struct ProcessCpuState {
 }
 
 impl ProcessCpuSource {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             state: Mutex::new(ProcessCpuState {
                 wall: Instant::now(),

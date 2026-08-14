@@ -5,6 +5,9 @@ Versioning, with the pre-1.0 compatibility policy described in the README.
 
 ## [Unreleased]
 
+- Added opt-in, CPU-triggered continuous profile export to Pyroscope with validated and redacted
+  configuration, application tags, basic authentication, bounded sampling windows, and graceful
+  final-profile flushing.
 - Added objective stabilization gates, a six-crate public-API/upgrade review, and a repeated
   same-process soak/fault mode with invariant enforcement, RSS growth, and CI smoke coverage.
 - Expanded the typed Redis API with scans, bitmaps, HyperLogLog, score/rank sorted-set operations,

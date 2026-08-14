@@ -484,6 +484,27 @@ Set `auth_token` to protect every endpoint with constant-time bearer authenticat
 public binding. Unix builds can enable the `rest/sampling-profiler` feature and
 `enable_sampling_profiler` to expose a bounded SVG flamegraph at `/debug/flamegraph`.
 
+For production continuous profiling, enable the core crate's `continuous-profiling` feature.
+`ContinuousProfiler` watches normalized process CPU and starts a bounded Pyroscope sampling window
+only when the configured threshold is reached. Basic-auth credentials must be supplied as a pair,
+the password is redacted from debug output, and `shutdown` stops and flushes a running agent:
+
+```rust,no_run
+use rust_zero_core::{ContinuousProfileConfig, ContinuousProfiler};
+
+let mut config = ContinuousProfileConfig::new("https://profiles.example", "users-api");
+config.auth_user = Some("tenant".to_owned());
+config.auth_password = Some("load-this-from-a-secret-store".to_owned());
+config
+    .tags
+    .insert("environment".to_owned(), "production".to_owned());
+
+let profiler = ContinuousProfiler::start(config)?;
+// Keep the handle for the service lifetime.
+profiler.shutdown()?;
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
 ```rust
 use rest::{DevServer, DevServerConfig};
 use rust_zero_core::{HealthRegistry, Metrics, Profiler};

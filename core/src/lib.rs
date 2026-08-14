@@ -11,6 +11,8 @@ pub mod breaker;
 pub mod cache;
 pub mod config;
 pub mod config_center;
+#[cfg(feature = "continuous-profiling")]
+pub mod continuous_profile;
 pub mod discov;
 #[cfg(feature = "etcd")]
 pub mod etcd;
@@ -55,6 +57,8 @@ pub use breaker::{
 pub use cache::{CacheStats, MemoryCache, ReadThroughCache, TtlCache};
 pub use config::{load_config, parse_config, ConfigError, ConfigFormat, ServiceConfig};
 pub use config_center::{ConfigCenterError, ConfigSnapshot, DynamicConfig};
+#[cfg(feature = "continuous-profiling")]
+pub use continuous_profile::{ContinuousProfileConfig, ContinuousProfileError, ContinuousProfiler};
 pub use discov::{
     DiscoveredEndpoint, DiscoveryError, DiscoveryReconnectBackoff, EndpointChangeFuture,
     EndpointSubscription, ServiceEvent, ServiceLease, ServiceRegistry, ServiceSubscription,

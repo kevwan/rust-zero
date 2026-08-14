@@ -2,9 +2,9 @@
 
 This backlog tracks production capabilities still needed after the
 [go-zero v1.10.3](https://github.com/zeromicro/go-zero/tree/v1.10.3) runtime audit on
-2026-08-09. A [follow-up comparison](https://github.com/zeromicro/go-zero/compare/f7805d5e322361f65561e8f562121b35404593a3...91a4cdbaf4e987f1c44ab14fb639756f213328f0)
-from the recorded audit point through `91a4cdba` found only dependency changes on upstream
-`master`; v1.10.3 remains the runtime baseline. Equivalent
+2026-08-14. A [follow-up comparison](https://github.com/zeromicro/go-zero/compare/91a4cdbaf4e987f1c44ab14fb639756f213328f0...ebe46e1ce074c5b4dcf5a405b6e93d5d24418a03)
+from the recorded audit point through `ebe46e1c` found only dependency and workflow changes on
+upstream `master`; v1.10.3 remains the runtime baseline. Equivalent
 Rust/Actix/Tonic behavior is the goal; identical Go APIs are not. `goctl`, API/protobuf/model/client
 generation, templates, and deployment scaffolding remain an intentional developer-experience
 boundary rather than a runtime-parity claim.
@@ -233,6 +233,12 @@ adoption.
   transcoded gRPC routes.
 
 ### P1 — production confidence and large-scale operation
+
+- [x] **CPU-triggered continuous profiling export.** Add an opt-in Pyroscope agent that samples
+  only after process CPU crosses a configurable threshold, stops each sampling window after a
+  bounded duration, supports application tags and paired basic-auth credentials, redacts the
+  password from diagnostics, and flushes the final profile during graceful shutdown. Keep local
+  dev-server reports and on-demand flamegraphs available without this feature or dependency.
 
 - [x] **Cross-framework benchmark baselines.** Check in reproducible rust-zero and go-zero results
   for equivalent REST, gRPC, partial-failure, overload-recovery, discovery, and queue workloads on
