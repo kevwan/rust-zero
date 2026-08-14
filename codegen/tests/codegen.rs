@@ -1,5 +1,8 @@
 //! File-driven codegen suite. Cases live in testdata as `.api` inputs.
-//! This runner checks that each file parses and emits the service-crate layout.
+//!
+//! Default: parse and assert the service-crate layout in memory.
+//! Write trees for inspection:
+//!   UPDATE_CODEGEN=1 cargo test -p rust-zero-codegen --test codegen test_generate_ok
 
 use ast::parse;
 use codegen::generate;
@@ -31,6 +34,7 @@ fn test_generate_ok() {
         .collect();
     cases.sort();
     assert!(!cases.is_empty(), "testdata has no .api cases");
+    let update = std::env::var_os("UPDATE_CODEGEN").is_some();
 
     for api_path in cases {
         let stem = api_path
@@ -41,6 +45,19 @@ fn test_generate_ok() {
             fs::read_to_string(&api_path).unwrap_or_else(|err| panic!("read {stem}.api: {err}"));
         let file = parse(&src).unwrap_or_else(|err| panic!("parse {stem}.api: {err}"));
         let generated = generate(&file);
+        if update {
+            let out_dir = dir.join(stem);
+            if out_dir.exists() {
+                fs::remove_dir_all(&out_dir).unwrap();
+            }
+            for item in &generated {
+                let path = out_dir.join(&item.path);
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent).unwrap();
+                }
+                fs::write(path, &item.contents).unwrap();
+            }
+        }
         assert!(
             generated.iter().any(|item| item.path == "src/main.rs"),
             "{stem}: missing src/main.rs"
