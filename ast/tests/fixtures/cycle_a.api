@@ -1,0 +1,7 @@
+syntax = "v1"
+
+import "cycle_b.api"
+
+struct A {
+    id: String,
+}

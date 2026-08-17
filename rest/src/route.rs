@@ -46,7 +46,7 @@ impl fmt::Debug for RouteJwtConfig {
 }
 
 /// Policy overrides for one method and route pattern.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RoutePolicyConfig {
     pub method: String,
     /// Path below the group prefix. An empty path targets the prefix itself.
@@ -63,6 +63,18 @@ pub struct RoutePolicyConfig {
     pub priority: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sse: Option<bool>,
+}
+
+impl RoutePolicyConfig {
+    /// A public route that inherits the group's timeout, body limit, and middleware.
+    pub fn public(method: impl Into<String>, path: impl Into<String>) -> Self {
+        Self {
+            method: method.into(),
+            path: path.into(),
+            public: true,
+            ..Self::default()
+        }
+    }
 }
 
 /// A route group with a shared prefix and inheritable policy defaults.

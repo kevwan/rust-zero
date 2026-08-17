@@ -1,0 +1,27 @@
+[package]
+name = "rust-zero-ast"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "rust-zero .api DSL AST, lexer, and parser"
+documentation = "https://docs.rs/rust-zero-ast"
+
+[lib]
+name = "ast"
+
+[package.metadata.docs.rs]
+all-features = true
+
+[build-dependencies]
+lalrpop = "0.22"
+
+[dependencies]
+lalrpop-util = { version = "0.22", features = ["lexer"] }
+logos = "0.15"
+thiserror = "2"
