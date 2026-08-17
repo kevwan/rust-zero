@@ -1,0 +1,11 @@
+syntax = "v1"
+
+import "common_types.api"
+
+struct User {
+    name: String,
+}
+
+service greet {
+    get /ping -> User
+}

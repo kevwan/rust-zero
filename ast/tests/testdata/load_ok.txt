@@ -1,0 +1,18 @@
+---------- Input ----------
+file: load_ok.api
+---------- Check -----------
+types: Resp,User,PayReq
+services: greet
+imports: 0
+origin User: common_types.api
+origin PayReq: common_types.api
+origin Resp: load_ok.api
+
+
+---------- Input ----------
+file: greet.api
+---------- Check -----------
+types: Resp
+services: greet
+imports: 0
+origin Resp: greet.api

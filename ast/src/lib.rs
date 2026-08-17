@@ -2,6 +2,7 @@
 
 mod ast;
 mod lexer;
+mod load;
 mod parse;
 
 pub use ast::{
@@ -9,4 +10,5 @@ pub use ast::{
     Syntax, TypeDef, TypeExpr,
 };
 pub use lexer::{lex, LexError, Token, TokenKind};
+pub use load::{load, Bundle, LoadError};
 pub use parse::{parse, ParseError};
