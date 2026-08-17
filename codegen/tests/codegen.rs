@@ -44,7 +44,7 @@ fn test_generate_ok() {
         let src =
             fs::read_to_string(&api_path).unwrap_or_else(|err| panic!("read {stem}.api: {err}"));
         let file = parse(&src).unwrap_or_else(|err| panic!("parse {stem}.api: {err}"));
-        let generated = generate(&file);
+        let generated = generate(&file).unwrap_or_else(|err| panic!("generate {stem}.api: {err}"));
         if update {
             let out_dir = dir.join(stem);
             if out_dir.exists() {
@@ -133,7 +133,56 @@ fn test_generate_ok() {
             manifest.contains("rust-zero-rest"),
             "{stem}: Cargo.toml missing rust-zero-rest"
         );
+        if stem == "pay" {
+            let types = file_named(&generated, "src/types.rs");
+            assert!(
+                types.contains(".required(\"orderId\", &self.orderId)"),
+                "{stem}: PayReq should emit a required check for orderId"
+            );
+            assert!(
+                types.contains(".length(\"orderId\", &self.orderId, 1..=32)"),
+                "{stem}: PayReq should emit a length check for orderId"
+            );
+            assert!(
+                types.contains(".range(\"amount\", self.amount, 1..=1000000)"),
+                "{stem}: PayReq should emit a range check for amount"
+            );
+            assert!(
+                types.contains(
+                    ".one_of(\"currency\", self.currency.as_str(), &[\"cny\", \"usd\"])"
+                ),
+                "{stem}: PayReq should emit a one_of check for currency"
+            );
+            assert!(
+                types.contains("use rust_zero_core::{Validate, Validation, ValidationErrors}"),
+                "{stem}: PayReq rules should import Validation"
+            );
+        }
     }
+}
+
+#[test]
+fn test_unknown_validate_rule_errors() {
+    let file = parse(
+        r#"
+syntax = "v1"
+
+struct PayReq {
+    #[validate(email)]
+    orderId: String
+}
+
+service pay {
+    post /pay (PayReq) -> PayReq
+}
+"#,
+    )
+    .unwrap();
+    let err = generate(&file).expect_err("unknown validate rule should fail");
+    assert!(
+        err.to_string().contains("unknown validate rule `email`"),
+        "unexpected error: {err}"
+    );
 }
 
 fn file_named<'a>(files: &'a [codegen::GeneratedFile], path: &str) -> &'a str {

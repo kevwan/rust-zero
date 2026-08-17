@@ -7,8 +7,11 @@ mod request;
 mod routes;
 mod types;
 mod util;
+mod validate;
 
 use ast::ApiFile;
+
+pub use validate::GenerateError;
 
 /// One generated source file.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -18,7 +21,7 @@ pub struct GeneratedFile {
 }
 
 /// Generate rust-zero REST files from a parsed `.api` tree.
-pub fn generate(ast: &ApiFile) -> Vec<GeneratedFile> {
+pub fn generate(ast: &ApiFile) -> Result<Vec<GeneratedFile>, GenerateError> {
     let mut files = vec![
         GeneratedFile {
             path: "Cargo.toml".into(),
@@ -30,7 +33,7 @@ pub fn generate(ast: &ApiFile) -> Vec<GeneratedFile> {
         },
         GeneratedFile {
             path: "src/types.rs".into(),
-            contents: types::render(ast),
+            contents: types::render(ast)?,
         },
         GeneratedFile {
             path: "src/routes.rs".into(),
@@ -46,5 +49,5 @@ pub fn generate(ast: &ApiFile) -> Vec<GeneratedFile> {
             GeneratedFile { path, contents }
         }));
     }
-    files
+    Ok(files)
 }

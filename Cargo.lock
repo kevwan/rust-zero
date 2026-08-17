@@ -4238,6 +4238,7 @@ dependencies = [
  "quote",
  "rust-zero-ast",
  "syn 2.0.119",
+ "thiserror",
 ]
 
 [[package]]

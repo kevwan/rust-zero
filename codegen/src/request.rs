@@ -29,6 +29,10 @@ impl<'a> RequestViews<'a> {
             && self.form.is_empty()
     }
 
+    pub(crate) fn is_mixed(&self) -> bool {
+        !self.is_json_only()
+    }
+
     pub(crate) fn view_ident(&self, suffix: &str) -> Ident {
         rust_ident(&format!("{}{suffix}", self.original.name))
     }
@@ -50,7 +54,7 @@ pub(crate) fn field_location(field: &Field) -> Location {
 pub(crate) fn attr_value<'a>(field: &'a Field, name: &str) -> Option<&'a str> {
     field.attrs.iter().find_map(|attr| {
         if attr.name == name {
-            attr.value.as_deref()
+            attr.value()
         } else {
             None
         }

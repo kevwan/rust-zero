@@ -2,8 +2,12 @@ syntax = "v1"
 
 struct PayReq {
     #[json("order_id")]
+    #[validate(required, length(1, 32))]
     orderId: String,
+    #[validate(range(1, 1000000))]
     amount: i64,
+    #[validate(one_of("cny", "usd"))]
+    currency: String,
 }
 
 struct PayResp {

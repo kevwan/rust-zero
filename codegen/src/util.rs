@@ -128,7 +128,7 @@ pub(crate) fn type_needs_hashmap(ty: &TypeExpr) -> bool {
 pub(crate) fn json_rename(field: &Field) -> Option<&str> {
     field.attrs.iter().find_map(|attr| {
         if attr.name == "json" {
-            attr.value.as_deref()
+            attr.value()
         } else {
             None
         }
@@ -140,15 +140,23 @@ pub(crate) fn handler_name(route: &Route) -> Ident {
 }
 
 pub(crate) fn handler_fn_name(route: &Route) -> String {
-    if let Some(name) = &route.handler {
+    let raw = if let Some(name) = &route.handler {
         name.clone()
     } else {
         handler_name_from_path(&route.path)
-    }
+    };
+    to_snake(&raw)
 }
 
-pub(crate) fn handler_mod_name(route: &Route) -> Ident {
-    rust_ident(&to_snake(&handler_fn_name(route)))
+pub(crate) fn service_mod_name(name: &str) -> Ident {
+    let mut base = to_snake(name);
+    if base.is_empty() {
+        base = "service".into();
+    }
+    if base.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+        base = format!("service_{base}");
+    }
+    rust_ident(&base)
 }
 
 pub(crate) fn to_snake(name: &str) -> String {
@@ -313,9 +321,17 @@ pub(crate) fn method_builder(method: HttpMethod) -> TokenStream {
     }
 }
 
+const BUILTIN_TYPES: &[&str] = &[
+    "String", "bool", "char", "f32", "f64", "i8", "i16", "i32", "i64", "i128",
+    "isize", "u8", "u16", "u32", "u64", "u128", "usize",
+];
+
 pub(crate) fn collect_type_idents(ty: Option<&TypeExpr>, names: &mut Vec<Ident>) {
     match ty {
         Some(TypeExpr::Named(name)) => {
+            if BUILTIN_TYPES.contains(&name.as_str()) {
+                return;
+            }
             let ident = rust_ident(name);
             if !names.iter().any(|existing| existing == &ident) {
                 names.push(ident);

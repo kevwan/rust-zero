@@ -24,3 +24,4 @@ proc-macro2 = "1"
 quote = "1"
 rust-zero-ast = { path = "../ast", version = "0.1.0-alpha.1" }
 syn = { version = "2", features = ["full"] }
+thiserror = "2"
