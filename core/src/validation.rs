@@ -21,12 +21,12 @@ impl Validation {
     }
 
     pub fn check(
-        &mut self,
+        mut self,
         field: impl Into<String>,
         condition: bool,
         code: &'static str,
         message: impl Into<String>,
-    ) -> &mut Self {
+    ) -> Self {
         if !condition {
             self.violations.push(Violation {
                 field: field.into(),
@@ -37,7 +37,7 @@ impl Validation {
         self
     }
 
-    pub fn required(&mut self, field: impl Into<String>, value: &str) -> &mut Self {
+    pub fn required(self, field: impl Into<String>, value: &str) -> Self {
         self.check(
             field,
             !value.trim().is_empty(),
@@ -47,11 +47,11 @@ impl Validation {
     }
 
     pub fn length(
-        &mut self,
+        self,
         field: impl Into<String>,
         value: &str,
         range: RangeInclusive<usize>,
-    ) -> &mut Self {
+    ) -> Self {
         let length = value.chars().count();
         let message = format!(
             "length must be between {} and {}",
@@ -61,12 +61,7 @@ impl Validation {
         self.check(field, range.contains(&length), "length", message)
     }
 
-    pub fn range<T>(
-        &mut self,
-        field: impl Into<String>,
-        value: T,
-        range: RangeInclusive<T>,
-    ) -> &mut Self
+    pub fn range<T>(self, field: impl Into<String>, value: T, range: RangeInclusive<T>) -> Self
     where
         T: PartialOrd + fmt::Display,
     {
@@ -74,7 +69,7 @@ impl Validation {
         self.check(field, range.contains(&value), "range", message)
     }
 
-    pub fn one_of<T>(&mut self, field: impl Into<String>, value: &T, allowed: &[T]) -> &mut Self
+    pub fn one_of<T>(self, field: impl Into<String>, value: &T, allowed: &[T]) -> Self
     where
         T: PartialEq + fmt::Display,
     {
@@ -104,7 +99,9 @@ impl Validation {
 
 /// Implemented by typed requests and configuration values that validate themselves.
 pub trait Validate {
-    fn validate(&self) -> Result<(), ValidationErrors>;
+    fn validate(&self) -> Result<(), ValidationErrors> {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -144,13 +141,12 @@ mod tests {
 
     #[test]
     fn collects_multiple_field_failures() {
-        let mut validation = Validation::new();
-        validation
+        let errors = Validation::new()
             .required("name", " ")
             .range("age", 12, 18..=120)
-            .one_of("mode", &"broken", &["dev", "prod"]);
-
-        let errors = validation.finish().unwrap_err();
+            .one_of("mode", &"broken", &["dev", "prod"])
+            .finish()
+            .unwrap_err();
         assert_eq!(errors.violations().len(), 3);
         assert_eq!(errors.violations()[0].field, "name");
         assert_eq!(errors.violations()[1].code, "range");
@@ -159,8 +155,9 @@ mod tests {
 
     #[test]
     fn measures_string_length_in_characters() {
-        let mut validation = Validation::new();
-        validation.length("name", "你好", 2..=2);
-        assert!(validation.finish().is_ok());
+        assert!(Validation::new()
+            .length("name", "你好", 2..=2)
+            .finish()
+            .is_ok());
     }
 }

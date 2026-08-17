@@ -611,17 +611,11 @@ mod tests {
         value: u64,
     }
 
-    impl Validate for NumberRequest {
-        fn validate(&self) -> Result<(), ValidationErrors> {
-            Ok(())
-        }
-    }
+    impl Validate for NumberRequest {}
 
     impl Validate for Request {
         fn validate(&self) -> Result<(), ValidationErrors> {
-            let mut validation = Validation::new();
-            validation.required("name", &self.name);
-            validation.finish()
+            Validation::new().required("name", &self.name).finish()
         }
     }
 
