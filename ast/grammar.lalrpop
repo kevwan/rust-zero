@@ -1,6 +1,6 @@
 use crate::ast::{
-    ApiFile, AtDoc, AtServer, Field, FieldAttr, HttpMethod, InfoBlock, InfoItem, Route, Service,
-    Syntax, TypeDef, TypeExpr,
+    ApiFile, AtDoc, AtServer, AttrArg, Field, FieldAttr, HttpMethod, InfoBlock, InfoItem, Route,
+    Service, Syntax, TypeDef, TypeExpr,
 };
 use crate::lexer::{Token, TokenKind};
 use crate::parse::{token_text, unquote, TopItem};
@@ -147,15 +147,33 @@ FieldAttrTail: FieldAttr = {
 };
 
 FieldAttrItem: FieldAttr = {
-    <name:IdentOrKw> => FieldAttr { name, value: None },
-    <name:IdentOrKw> "(" <v:"string"> ")" => FieldAttr {
+    <name:IdentOrKw> => FieldAttr { name, args: Vec::new() },
+    <name:IdentOrKw> "(" <args:AttrArgList?> ")" => FieldAttr {
         name,
-        value: Some(unquote(&v.text)),
+        args: args.unwrap_or_default(),
     },
-    <name:IdentOrKw> "(" <id:IdentOrKw> ")" => FieldAttr {
+};
+
+AttrArgList: Vec<AttrArg> = {
+    <head:AttrArg> <tail:AttrArgTail*> ","? => {
+        let mut args = vec![head];
+        args.extend(tail);
+        args
+    },
+};
+
+AttrArgTail: AttrArg = {
+    "," <arg:AttrArg> => arg,
+};
+
+AttrArg: AttrArg = {
+    <v:"string"> => AttrArg::String(unquote(&v.text)),
+    <v:"int"> => AttrArg::Int(v.text),
+    <name:IdentOrKw> "(" <args:AttrArgList?> ")" => AttrArg::Nested(FieldAttr {
         name,
-        value: Some(id),
-    },
+        args: args.unwrap_or_default(),
+    }),
+    <id:IdentOrKw> => AttrArg::Ident(id),
 };
 
 TypeExpr: TypeExpr = {

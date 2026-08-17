@@ -42,11 +42,30 @@ pub struct Field {
     pub ty: TypeExpr,
 }
 
-/// `#[path]`, `#[path("id")]`, `#[json("user_id")]`
+/// `#[path]`, `#[path("id")]`, `#[json("user_id")]`, `#[validate(required, length(1, 32))]`
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FieldAttr {
     pub name: String,
-    pub value: Option<String>,
+    pub args: Vec<AttrArg>,
+}
+
+impl FieldAttr {
+    /// Single string or ident argument, like `#[json("user_id")]` or `#[path(id)]`.
+    pub fn value(&self) -> Option<&str> {
+        match self.args.as_slice() {
+            [AttrArg::String(value) | AttrArg::Ident(value)] => Some(value),
+            _ => None,
+        }
+    }
+}
+
+/// One argument of a field attribute.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttrArg {
+    Ident(String),
+    String(String),
+    Int(String),
+    Nested(FieldAttr),
 }
 
 /// Type algebra: `Name | [T] | {K: V} | T?`

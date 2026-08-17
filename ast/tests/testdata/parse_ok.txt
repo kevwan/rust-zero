@@ -203,13 +203,15 @@ ApiFile {
                     attrs: [
                         FieldAttr {
                             name: "path",
-                            value: None,
+                            args: [],
                         },
                         FieldAttr {
                             name: "json",
-                            value: Some(
-                                "user_id",
-                            ),
+                            args: [
+                                String(
+                                    "user_id",
+                                ),
+                            ],
                         },
                     ],
                     name: "userId",
@@ -221,15 +223,19 @@ ApiFile {
                     attrs: [
                         FieldAttr {
                             name: "path",
-                            value: Some(
-                                "id",
-                            ),
+                            args: [
+                                String(
+                                    "id",
+                                ),
+                            ],
                         },
                         FieldAttr {
                             name: "json",
-                            value: Some(
-                                "user_id",
-                            ),
+                            args: [
+                                String(
+                                    "user_id",
+                                ),
+                            ],
                         },
                     ],
                     name: "userId2",
@@ -241,7 +247,7 @@ ApiFile {
                     attrs: [
                         FieldAttr {
                             name: "query",
-                            value: None,
+                            args: [],
                         },
                     ],
                     name: "page",
@@ -948,13 +954,15 @@ ApiFile {
                     attrs: [
                         FieldAttr {
                             name: "path",
-                            value: None,
+                            args: [],
                         },
                         FieldAttr {
                             name: "json",
-                            value: Some(
-                                "user_id",
-                            ),
+                            args: [
+                                String(
+                                    "user_id",
+                                ),
+                            ],
                         },
                     ],
                     name: "userId",
@@ -966,15 +974,19 @@ ApiFile {
                     attrs: [
                         FieldAttr {
                             name: "path",
-                            value: Some(
-                                "id",
-                            ),
+                            args: [
+                                String(
+                                    "id",
+                                ),
+                            ],
                         },
                         FieldAttr {
                             name: "json",
-                            value: Some(
-                                "user_id",
-                            ),
+                            args: [
+                                String(
+                                    "user_id",
+                                ),
+                            ],
                         },
                     ],
                     name: "userId2",
@@ -986,7 +998,7 @@ ApiFile {
                     attrs: [
                         FieldAttr {
                             name: "query",
-                            value: None,
+                            args: [],
                         },
                     ],
                     name: "page",
@@ -1000,7 +1012,7 @@ ApiFile {
                     attrs: [
                         FieldAttr {
                             name: "form",
-                            value: None,
+                            args: [],
                         },
                     ],
                     name: "name",
@@ -1012,9 +1024,11 @@ ApiFile {
                     attrs: [
                         FieldAttr {
                             name: "header",
-                            value: Some(
-                                "Authorization",
-                            ),
+                            args: [
+                                String(
+                                    "Authorization",
+                                ),
+                            ],
                         },
                     ],
                     name: "token",
@@ -1367,7 +1381,7 @@ ApiFile {
                     attrs: [
                         FieldAttr {
                             name: "path",
-                            value: None,
+                            args: [],
                         },
                     ],
                     name: "id",
@@ -1717,6 +1731,121 @@ ApiFile {
                             "NestDemoResp",
                         ),
                     ),
+                },
+            ],
+        },
+    ],
+}
+
+
+---------- Input ----------
+file: validate_rules.api
+---------- AST ------------
+ApiFile {
+    syntax: Syntax {
+        version: "v1",
+    },
+    imports: [],
+    info: None,
+    types: [
+        TypeDef {
+            name: "PayReq",
+            fields: [
+                Field {
+                    attrs: [
+                        FieldAttr {
+                            name: "json",
+                            args: [
+                                String(
+                                    "order_id",
+                                ),
+                            ],
+                        },
+                        FieldAttr {
+                            name: "validate",
+                            args: [
+                                Ident(
+                                    "required",
+                                ),
+                                Nested(
+                                    FieldAttr {
+                                        name: "length",
+                                        args: [
+                                            Int(
+                                                "1",
+                                            ),
+                                            Int(
+                                                "32",
+                                            ),
+                                        ],
+                                    },
+                                ),
+                                Nested(
+                                    FieldAttr {
+                                        name: "one_of",
+                                        args: [
+                                            String(
+                                                "cny",
+                                            ),
+                                            String(
+                                                "usd",
+                                            ),
+                                        ],
+                                    },
+                                ),
+                            ],
+                        },
+                    ],
+                    name: "orderId",
+                    ty: Named(
+                        "String",
+                    ),
+                },
+                Field {
+                    attrs: [
+                        FieldAttr {
+                            name: "validate",
+                            args: [
+                                Nested(
+                                    FieldAttr {
+                                        name: "range",
+                                        args: [
+                                            Int(
+                                                "1",
+                                            ),
+                                            Int(
+                                                "1000000",
+                                            ),
+                                        ],
+                                    },
+                                ),
+                            ],
+                        },
+                    ],
+                    name: "amount",
+                    ty: Named(
+                        "i64",
+                    ),
+                },
+            ],
+        },
+    ],
+    services: [
+        Service {
+            server: None,
+            name: "pay",
+            routes: [
+                Route {
+                    doc: None,
+                    handler: None,
+                    method: Post,
+                    path: "/pay",
+                    request: Some(
+                        Named(
+                            "PayReq",
+                        ),
+                    ),
+                    returns: None,
                 },
             ],
         },

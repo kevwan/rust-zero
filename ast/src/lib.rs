@@ -6,7 +6,8 @@ mod load;
 mod parse;
 
 pub use ast::{
-    ApiFile, AtDoc, AtServer, Field, FieldAttr, HttpMethod, InfoBlock, InfoItem, Route, Service,
+    ApiFile, AtDoc, AtServer, AttrArg, Field, FieldAttr, HttpMethod, InfoBlock, InfoItem, Route,
+    Service,
     Syntax, TypeDef, TypeExpr,
 };
 pub use lexer::{lex, LexError, Token, TokenKind};
