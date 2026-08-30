@@ -78,7 +78,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .with_request_timeout(Duration::from_secs(10))
             .with_concurrency_limit(1_024),
     );
-    let (mut reporter, health_service) = health_reporter();
+    let (reporter, health_service) = health_reporter();
     reporter.set_serving::<EchoServer<EchoService>>().await;
 
     server

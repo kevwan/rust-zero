@@ -9,7 +9,7 @@ use std::{
     task::{Context, Poll},
     time::Duration,
 };
-use tonic::{body::BoxBody, Status};
+use tonic::{body::Body as TonicBody, Status};
 use tower::{Layer, Service};
 
 /// Applies an exact-method timeout, then a service timeout, then the global fallback.
@@ -67,7 +67,7 @@ where
     ResponseBody: Body<Data = bytes::Bytes> + Send + 'static,
     ResponseBody::Error: Into<tonic::codegen::StdError>,
 {
-    type Response = Response<BoxBody>;
+    type Response = Response<TonicBody>;
     type Error = S::Error;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
@@ -82,11 +82,9 @@ where
             match timeout {
                 Some(timeout) => tokio::time::timeout(timeout, future).await.map_or_else(
                     |_| Ok(Status::deadline_exceeded("server request timeout").into_http()),
-                    |result| result.map(|response| response.map(tonic::body::boxed)),
+                    |result| result.map(|response| response.map(TonicBody::new)),
                 ),
-                None => future
-                    .await
-                    .map(|response| response.map(tonic::body::boxed)),
+                None => future.await.map(|response| response.map(TonicBody::new)),
             }
         })
     }
@@ -126,7 +124,7 @@ mod tests {
     struct DelayedService;
 
     impl Service<Request<()>> for DelayedService {
-        type Response = Response<tonic::body::BoxBody>;
+        type Response = Response<TonicBody>;
         type Error = Infallible;
         type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Infallible>> + Send>>;
 
@@ -137,7 +135,7 @@ mod tests {
         fn call(&mut self, _request: Request<()>) -> Self::Future {
             Box::pin(async {
                 tokio::time::sleep(Duration::from_millis(50)).await;
-                Ok(Response::new(tonic::body::empty_body()))
+                Ok(Response::new(TonicBody::empty()))
             })
         }
     }

@@ -2,12 +2,12 @@
 
 This backlog tracks production capabilities still needed after the
 [go-zero v1.10.3](https://github.com/zeromicro/go-zero/tree/v1.10.3) runtime audit on
-2026-08-14. A [follow-up comparison](https://github.com/zeromicro/go-zero/compare/91a4cdbaf4e987f1c44ab14fb639756f213328f0...ebe46e1ce074c5b4dcf5a405b6e93d5d24418a03)
-from the recorded audit point through `ebe46e1c` found only dependency and workflow changes on
+2026-08-21. A [follow-up comparison](https://github.com/zeromicro/go-zero/compare/v1.10.3...11f2109)
+from the recorded audit point through `11f2109` found only dependency, workflow, version, and test changes on
 upstream `master`; v1.10.3 remains the runtime baseline. Equivalent
-Rust/Actix/Tonic behavior is the goal; identical Go APIs are not. `goctl`, API/protobuf/model/client
-generation, templates, and deployment scaffolding remain an intentional developer-experience
-boundary rather than a runtime-parity claim.
+Rust/Actix/Tonic behavior is the goal; identical Go APIs are not. Full `goctl`
+API/protobuf/model/client generation remains a developer-experience boundary rather than a
+runtime-parity claim; rust-zero now ships a deliberately smaller scaffolding CLI.
 
 ## Reopened parity gaps
 
@@ -202,14 +202,16 @@ complete, the project claims **broad runtime coverage**, not full runtime parity
 ## Recommended execution order
 
 The previously reopened TLS, server-circuit, gRPC-lifecycle, CORS, legacy MCP, and gateway
-integration items are complete. Stabilization and real-world adoption evidence are the remaining
-runtime-maturity priorities. Durable brokers and the `goctl` developer toolchain remain intentional
-ecosystem boundaries unless explicitly brought into scope.
+integration items are complete. Transport-integrated consistent hashing, automated release-policy
+gates, a focused CLI, and SSE slow-consumer controls are also complete. Stabilization and real-world
+adoption evidence are the remaining runtime-maturity priorities. Durable brokers and full `goctl`
+generation remain intentional ecosystem boundaries unless explicitly brought into scope.
 
 ## Remaining catch-up items
 
-`goctl` and all other code generation remain outside this runtime catch-up scope. MCP Streamable
-HTTP and its opt-in legacy SSE compatibility transport are covered.
+Full `goctl` generation remains outside this runtime catch-up scope. The initial `rust-zero` CLI
+covers safe project creation, protobuf build wiring, OpenAPI route stubs, and Docker/Kubernetes
+scaffolding. MCP Streamable HTTP and its opt-in legacy SSE compatibility transport are covered.
 
 ## Reopened gaps from the 2026-08-13 follow-up audit
 
@@ -257,8 +259,9 @@ adoption.
   to go-zero. Pre-1.0 API compatibility rules remain in force until these gates are met.
   - [x] Define objective alpha-exit gates, evidence retention rules, and failure thresholds in
     `STABILIZATION.md`.
-  - [x] Complete the first public-API and upgrade-path review across all six published crates,
-    recording compatibility risks and required beta hardening.
+  - [x] Complete the first public-API and upgrade-path review across all published library crates,
+    then extend it to the CLI's generated-file contracts, recording compatibility risks and
+    required beta hardening.
   - [x] Add a same-process soak/fault mode with stable JSON output, per-cycle invariant checks,
     latency/allocation summaries, RSS growth reporting, and a repeatable CI smoke campaign.
   - [ ] Publish qualifying sustained campaigns on recorded release hardware (at least 24 hours per

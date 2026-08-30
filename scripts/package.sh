@@ -21,6 +21,7 @@ packages=(
   rust-zero-gateway
   rust-zero-mapreduce
   rust-zero-mcp
+  rust-zero-cli
 )
 
 core_path="${repository_root}/core"
@@ -29,13 +30,13 @@ rpc_path="${repository_root}/rpc"
 
 for package in "${packages[@]}"; do
   case "${package}" in
-    rust-zero-rest|rust-zero-rpc)
+    rust-zero-rest|rust-zero-rpc|rust-zero-mcp)
       cargo package "${package_options[@]}" \
         --config "patch.crates-io.rust-zero-core.path='${core_path}'" \
         --package "${package}"
       ;;
     rust-zero-gateway)
-      # Before the first coordinated publish, resolve normalized registry dependencies to the
+      # Before a coordinated publish, resolve normalized registry dependencies to the
       # exact local workspace sources. These CLI patches do not become part of the archive.
       cargo package "${package_options[@]}" \
         --config "patch.crates-io.rust-zero-core.path='${core_path}'" \

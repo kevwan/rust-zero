@@ -10,21 +10,28 @@ use std::{
     future::Future,
     hash::{BuildHasher, Hasher},
     net::SocketAddr,
-    sync::atomic::{AtomicU64, Ordering},
+    pin::Pin,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, RwLock,
+    },
+    task::{Context, Poll},
     time::Duration,
 };
 
+use http::{Request as HttpRequest, Response as HttpResponse};
 use rust_zero_core::{
-    DiscoveredEndpoint, DiscoveryError, EndpointSubscription, EtcdClient, EtcdConfig, EtcdError,
-    EtcdTlsConfig, HealthRegistry, ServiceRegistry,
+    ConsistentHash, DiscoveredEndpoint, DiscoveryError, EndpointSubscription, EtcdClient,
+    EtcdConfig, EtcdError, EtcdTlsConfig, HealthRegistry, ServiceRegistry,
 };
 use serde::{Deserialize, Serialize};
+use tonic::body::Body as TonicBody;
 use tonic::transport::{
-    Certificate, Channel, ClientTlsConfig, Endpoint, Identity as TonicIdentity, Server,
-    ServerTlsConfig,
+    channel::Change, Certificate, Channel, ClientTlsConfig, Endpoint, Identity as TonicIdentity,
+    Server, ServerTlsConfig,
 };
-use tower::discover::Change;
 use tower::layer::util::{Identity as TowerIdentity, Stack};
+use tower::Service;
 
 pub mod auth;
 pub mod metrics;
@@ -50,6 +57,177 @@ pub use tonic_health::server::{health_reporter, HealthReporter};
 pub use trace::RpcTrace;
 #[cfg(feature = "telemetry")]
 pub use trace::{RpcTelemetryLayer, RpcTelemetryMode};
+
+/// Per-request routing key used by [`RpcConsistentHashChannel`].
+///
+/// Insert it with [`set_hash_key`] before sending a Tonic request. Requests without a key use a
+/// round-robin fallback so ordinary calls continue to distribute across the discovered pool.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RpcHashKey(Vec<u8>);
+
+impl RpcHashKey {
+    pub fn new(key: impl AsRef<[u8]>) -> Self {
+        Self(key.as_ref().to_vec())
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+/// Adds a consistent-hash affinity key to a Tonic request.
+pub fn set_hash_key<T>(request: &mut tonic::Request<T>, key: impl AsRef<[u8]>) {
+    request.extensions_mut().insert(RpcHashKey::new(key));
+}
+
+struct ConsistentHashState {
+    ring: ConsistentHash,
+    channels: BTreeMap<String, Channel>,
+}
+
+impl ConsistentHashState {
+    fn empty(replicas: usize) -> Self {
+        Self {
+            ring: ConsistentHash::new(replicas),
+            channels: BTreeMap::new(),
+        }
+    }
+}
+
+/// A discovery-backed Tonic transport that keeps equal affinity keys on the same endpoint.
+///
+/// The ring is replaced atomically after every complete discovery or health snapshot. Endpoint
+/// weights are represented by independent ring members. Removing endpoints therefore remaps only
+/// the keys owned by the removed members. Calls made while the pool is empty wait for recovery and
+/// remain subject to the surrounding RPC deadline stack.
+#[derive(Clone)]
+pub struct RpcConsistentHashChannel {
+    state: Arc<RwLock<ConsistentHashState>>,
+    changed: Arc<tokio::sync::Notify>,
+    fallback: Arc<AtomicU64>,
+    _lifetime: tokio::sync::watch::Receiver<()>,
+}
+
+impl fmt::Debug for RpcConsistentHashChannel {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let endpoints = self
+            .state
+            .read()
+            .expect("consistent-hash channel state lock poisoned")
+            .channels
+            .len();
+        formatter
+            .debug_struct("RpcConsistentHashChannel")
+            .field("ring_members", &endpoints)
+            .finish()
+    }
+}
+
+impl RpcConsistentHashChannel {
+    fn new(replicas: usize) -> (Self, tokio::sync::watch::Sender<()>) {
+        let (lifetime, receiver) = tokio::sync::watch::channel(());
+        (
+            Self {
+                state: Arc::new(RwLock::new(ConsistentHashState::empty(replicas))),
+                changed: Arc::new(tokio::sync::Notify::new()),
+                fallback: Arc::new(AtomicU64::new(0)),
+                _lifetime: receiver,
+            },
+            lifetime,
+        )
+    }
+
+    fn replace(
+        &self,
+        configured: &BTreeMap<String, (Endpoint, DiscoveredEndpoint)>,
+        available: &BTreeSet<String>,
+        replicas: usize,
+    ) {
+        Self::replace_state(&self.state, &self.changed, configured, available, replicas);
+    }
+
+    fn replace_state(
+        state: &Arc<RwLock<ConsistentHashState>>,
+        changed: &Arc<tokio::sync::Notify>,
+        configured: &BTreeMap<String, (Endpoint, DiscoveredEndpoint)>,
+        available: &BTreeSet<String>,
+        replicas: usize,
+    ) {
+        let previous = state
+            .read()
+            .expect("consistent-hash channel state lock poisoned")
+            .channels
+            .clone();
+        let mut next = ConsistentHashState::empty(replicas);
+        for (uri, (endpoint, discovered)) in configured {
+            if !available.contains(uri) {
+                continue;
+            }
+            let channel = previous
+                .get(&weighted_key(uri, 0))
+                .cloned()
+                .unwrap_or_else(|| endpoint.clone().connect_lazy());
+            for slot in 0..discovered.weight() {
+                let member = weighted_key(uri, slot);
+                next.ring.add(member.clone());
+                next.channels.insert(member, channel.clone());
+            }
+        }
+        *state
+            .write()
+            .expect("consistent-hash channel state lock poisoned") = next;
+        changed.notify_waiters();
+    }
+
+    async fn select(&self, key: Option<&RpcHashKey>) -> Channel {
+        loop {
+            let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let selected = {
+                let state = self
+                    .state
+                    .read()
+                    .expect("consistent-hash channel state lock poisoned");
+                let member = key
+                    .and_then(|key| state.ring.get(key.as_bytes()).map(str::to_owned))
+                    .or_else(|| {
+                        let index = self.fallback.fetch_add(1, Ordering::Relaxed) as usize;
+                        state
+                            .channels
+                            .keys()
+                            .nth(index % state.channels.len().max(1))
+                            .cloned()
+                    });
+                member.and_then(|member| state.channels.get(&member).cloned())
+            };
+            if let Some(channel) = selected {
+                return channel;
+            }
+            notified.await;
+        }
+    }
+}
+
+impl Service<HttpRequest<TonicBody>> for RpcConsistentHashChannel {
+    type Response = HttpResponse<TonicBody>;
+    type Error = tonic::transport::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, _context: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, request: HttpRequest<TonicBody>) -> Self::Future {
+        let channel = self.clone();
+        Box::pin(async move {
+            let key = request.extensions().get::<RpcHashKey>().cloned();
+            let mut selected = channel.select(key.as_ref()).await;
+            std::future::poll_fn(|context| selected.poll_ready(context)).await?;
+            selected.call(request).await
+        })
+    }
+}
 
 /// PEM material used by a gRPC server, with optional client-certificate verification.
 #[derive(Clone, Serialize, Deserialize)]
@@ -1052,7 +1230,7 @@ impl DiscoveryStatus {
     /// Projects channel readiness into a standard gRPC health service entry.
     pub fn project_to_grpc_health(
         mut self,
-        mut reporter: HealthReporter,
+        reporter: HealthReporter,
         service_name: impl Into<String>,
     ) -> tokio::task::JoinHandle<()> {
         let service_name = service_name.into();
@@ -1232,6 +1410,115 @@ impl RpcClient {
                     }
                     installed.insert(key);
                 }
+                status_updates.send_replace(discovery_status(
+                    discovered,
+                    configured.len(),
+                    available.len(),
+                    rejected,
+                ));
+            }
+        });
+
+        (
+            channel,
+            DiscoveryStatus {
+                receiver: status_receiver,
+            },
+        )
+    }
+
+    /// Creates a request-keyed consistent-hash channel from an in-memory service registry.
+    pub fn connect_service_consistent_hash(
+        &self,
+        registry: &ServiceRegistry,
+        service: impl Into<String>,
+        replicas: usize,
+    ) -> Result<RpcConsistentHashChannel, RpcClientError> {
+        let subscription = registry
+            .subscribe(service)
+            .map_err(RpcClientError::Discovery)?;
+        Ok(self.connect_discovered_consistent_hash(subscription, replicas))
+    }
+
+    /// Creates a request-keyed consistent-hash channel from any complete-snapshot discovery source.
+    pub fn connect_discovered_consistent_hash<S>(
+        &self,
+        subscription: S,
+        replicas: usize,
+    ) -> RpcConsistentHashChannel
+    where
+        S: EndpointSubscription,
+    {
+        self.connect_discovered_consistent_hash_with_status(subscription, replicas)
+            .0
+    }
+
+    /// Creates a request-keyed consistent-hash channel and a watchable readiness handle.
+    ///
+    /// `replicas` controls virtual-node density per weighted ring member and must be positive.
+    /// Complete discovery snapshots, endpoint weights, configured subsetting, and active health
+    /// checks are applied atomically to the routing ring.
+    pub fn connect_discovered_consistent_hash_with_status<S>(
+        &self,
+        mut subscription: S,
+        replicas: usize,
+    ) -> (RpcConsistentHashChannel, DiscoveryStatus)
+    where
+        S: EndpointSubscription,
+    {
+        assert!(replicas > 0, "consistent-hash replicas must be positive");
+        let initial = subscription.discovered_endpoints();
+        let (configured, discovered, rejected) = self.configure_discovered(initial);
+        let mut available: BTreeSet<String> = configured.keys().cloned().collect();
+        let (channel, lifetime) = RpcConsistentHashChannel::new(replicas);
+        channel.replace(&configured, &available, replicas);
+
+        let initial_status =
+            discovery_status(discovered, configured.len(), available.len(), rejected);
+        let (status_updates, status_receiver) = tokio::sync::watch::channel(initial_status);
+        let client = self.clone();
+        let watcher_state = Arc::clone(&channel.state);
+        let watcher_changed = Arc::clone(&channel.changed);
+        tokio::spawn(async move {
+            let mut configured = configured;
+            let mut discovered = discovered;
+            let mut rejected = rejected;
+            let mut health_ticks = client.discovery_health_ticks();
+            loop {
+                tokio::select! {
+                    _ = lifetime.closed() => return,
+                    snapshot = subscription.changed() => {
+                        if snapshot.is_err() {
+                            let mut closed = discovery_status(
+                                discovered,
+                                configured.len(),
+                                0,
+                                rejected,
+                            );
+                            closed.readiness = DiscoveryReadiness::Degraded;
+                            status_updates.send_replace(closed);
+                            return;
+                        }
+                        let (next, next_discovered, next_rejected) =
+                            client.configure_discovered(subscription.discovered_endpoints());
+                        configured = next;
+                        discovered = next_discovered;
+                        rejected = next_rejected;
+                        available.retain(|uri| configured.contains_key(uri));
+                        available.extend(configured.keys().cloned());
+                    }
+                    _ = health_ticks.tick(), if client.config.discovery_health_interval.is_some() => {
+                        available = client.probe_discovered(&configured).await;
+                    }
+                }
+
+                RpcConsistentHashChannel::replace_state(
+                    &watcher_state,
+                    &watcher_changed,
+                    &configured,
+                    &available,
+                    replicas,
+                );
                 status_updates.send_replace(discovery_status(
                     discovered,
                     configured.len(),
@@ -2284,7 +2571,7 @@ mod tests {
                 Duration::from_secs(1),
             ))
             .build();
-        let (mut reporter, health) = health_reporter();
+        let (reporter, health) = health_reporter();
         reporter
             .set_serving::<EchoServer<StackedEchoService>>()
             .await;
@@ -2558,6 +2845,93 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(message, "second");
+
+        drop(channel);
+        first_server.abort();
+        second_server.abort();
+    }
+
+    #[tokio::test]
+    async fn consistent_hash_discovery_keeps_affinity_and_remaps_removed_endpoints() {
+        let first_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let first_address = first_listener.local_addr().unwrap();
+        let first_server = tokio::spawn(async move {
+            Server::builder()
+                .add_service(EchoServer::new(NamedEchoService("first")))
+                .serve_with_incoming(TcpListenerStream::new(first_listener))
+                .await
+                .unwrap();
+        });
+        let second_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let second_address = second_listener.local_addr().unwrap();
+        let second_server = tokio::spawn(async move {
+            Server::builder()
+                .add_service(EchoServer::new(NamedEchoService("second")))
+                .serve_with_incoming(TcpListenerStream::new(second_listener))
+                .await
+                .unwrap();
+        });
+
+        let first_uri = format!("http://{first_address}");
+        let second_uri = format!("http://{second_address}");
+        let (updates, receiver) = watch::channel(vec![first_uri.clone(), second_uri.clone()]);
+        let channel = RpcClient::new(RpcClientConfig::new("http://unused"))
+            .connect_discovered_consistent_hash(
+                TestSubscription {
+                    receiver,
+                    dropped: None,
+                },
+                128,
+            );
+
+        let mut observed = BTreeMap::new();
+        for index in 0..256 {
+            let key = format!("customer-{index}");
+            let mut request = Request::new(EchoRequest::default());
+            set_hash_key(&mut request, key.as_bytes());
+            let selected = EchoClient::new(channel.clone())
+                .echo(request)
+                .await
+                .unwrap()
+                .into_inner()
+                .message;
+
+            let mut repeat = Request::new(EchoRequest::default());
+            set_hash_key(&mut repeat, key.as_bytes());
+            assert_eq!(
+                EchoClient::new(channel.clone())
+                    .echo(repeat)
+                    .await
+                    .unwrap()
+                    .into_inner()
+                    .message,
+                selected
+            );
+            observed.entry(selected).or_insert(key);
+            if observed.len() == 2 {
+                break;
+            }
+        }
+        assert_eq!(observed.len(), 2, "both endpoints should own affinity keys");
+
+        let removed_name = "first";
+        let removed_key = observed.get(removed_name).unwrap().clone();
+        updates.send_replace(vec![second_uri]);
+        let remapped = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let mut request = Request::new(EchoRequest::default());
+                set_hash_key(&mut request, removed_key.as_bytes());
+                if let Ok(response) = EchoClient::new(channel.clone()).echo(request).await {
+                    if response.get_ref().message == "second" {
+                        break response.into_inner().message;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(remapped, "second");
 
         drop(channel);
         first_server.abort();

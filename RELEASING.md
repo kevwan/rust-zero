@@ -1,6 +1,6 @@
 # Releasing rust-zero
 
-The six public crates use one version and are published as a unit. A release commit must have a
+The seven public packages use one version and are published as a unit. A release commit must have a
 clean worktree, pass CI on Rust 1.89 and stable, and contain matching versions in `Cargo.toml`,
 `Cargo.lock`, and `CHANGELOG.md`.
 
@@ -8,9 +8,9 @@ clean worktree, pass CI on Rust 1.89 and stable, and contain matching versions i
 
 1. Confirm the proposed `rust-zero-*` package names are available for the first release, or owned
    by the project for later releases, on crates.io.
-2. Run `./scripts/package.sh`. It builds each normalized `.crate` archive independently. Before
-   the first release, the script supplies a command-line-only patch for the unpublished
-   `rust-zero-core`; the patch is never written to an archive.
+2. Run `./scripts/package.sh`. It builds each normalized `.crate` archive independently. The
+   script supplies command-line-only patches for workspace dependencies whose coordinated version
+   is not indexed yet; those patches are never written to an archive.
 3. Publish in dependency order, waiting for crates.io to index core before publishing dependants:
 
    ```bash
@@ -20,14 +20,16 @@ clean worktree, pass CI on Rust 1.89 and stable, and contain matching versions i
    cargo publish -p rust-zero-gateway
    cargo publish -p rust-zero-mapreduce
    cargo publish -p rust-zero-mcp
+   cargo publish -p rust-zero-cli
    ```
 
-4. Confirm that all six releases build on docs.rs and that their documentation links resolve.
+4. Confirm that all six library releases build on docs.rs and their documentation links resolve;
+   install `rust-zero-cli` from crates.io and verify `rust-zero --help` separately.
 5. Tag the exact release commit and push the tag only after every crate is visible:
 
    ```bash
-   git tag -s v0.1.0-alpha.1 -m "rust-zero v0.1.0-alpha.1"
-   git push origin v0.1.0-alpha.1
+   git tag -s v0.1.0-alpha.2 -m "rust-zero v0.1.0-alpha.2"
+   git push origin v0.1.0-alpha.2
    ```
 
 6. Create the GitHub release from the matching changelog entry. Do not reuse a published version

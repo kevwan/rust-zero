@@ -75,9 +75,15 @@ fn hash_bytes(bytes: &[u8]) -> u64 {
     const OFFSET_BASIS: u64 = 0xcbf29ce484222325;
     const PRIME: u64 = 0x100000001b3;
 
-    bytes.iter().fold(OFFSET_BASIS, |hash, byte| {
+    let hash = bytes.iter().fold(OFFSET_BASIS, |hash, byte| {
         (hash ^ u64::from(*byte)).wrapping_mul(PRIME)
-    })
+    });
+    // FNV alone leaves visible structure for short or sequential keys. A SplitMix64 finalizer
+    // preserves determinism while distributing both ring points and request keys across the
+    // complete output space.
+    let hash = (hash ^ (hash >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+    let hash = (hash ^ (hash >> 27)).wrapping_mul(0x94d049bb133111eb);
+    hash ^ (hash >> 31)
 }
 
 #[cfg(test)]
@@ -103,5 +109,17 @@ mod tests {
         for customer in 0..100 {
             assert_eq!(ring.get(format!("customer-{customer}")), Some("b"));
         }
+    }
+
+    #[test]
+    fn sequential_keys_are_distributed_across_members() {
+        let mut ring = ConsistentHash::new(128);
+        ring.add("http://127.0.0.1:31001\0slot-0");
+        ring.add("http://127.0.0.1:31002\0slot-0");
+
+        let selected: HashSet<_> = (0..256)
+            .filter_map(|index| ring.get(format!("customer-{index}")))
+            .collect();
+        assert_eq!(selected.len(), 2);
     }
 }

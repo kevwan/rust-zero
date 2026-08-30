@@ -62,6 +62,19 @@ use rust_zero_core::CircuitBreaker;
 use rest::RestServerConfig;
 ```
 
+For a new service, install the companion CLI and generate a runnable REST project:
+
+```bash
+cargo install rust-zero-cli
+rust-zero new users-api
+cd users-api
+cargo run
+```
+
+`rust-zero proto`, `rust-zero openapi`, `rust-zero docker`, and `rust-zero kubernetes` add focused
+protobuf, route, container, and deployment scaffolding. Generated files are never overwritten
+unless `--force` is supplied.
+
 ## Choose a crate
 
 All public crates are released at the same version.
@@ -74,6 +87,7 @@ All public crates are released at the same version.
 | [`rust-zero-gateway`](https://docs.rs/rust-zero-gateway) | Streaming HTTP proxying and descriptor/reflection-driven gRPC transcoding |
 | [`rust-zero-mcp`](https://docs.rs/rust-zero-mcp) | MCP servers using Streamable HTTP, legacy HTTP+SSE, tools, resources, and prompts |
 | [`rust-zero-mapreduce`](https://docs.rs/rust-zero-mapreduce) | Bounded asynchronous MapReduce execution |
+| [`rust-zero-cli`](https://crates.io/crates/rust-zero-cli) | Project, protobuf, OpenAPI, Docker, and Kubernetes scaffolding via the `rust-zero` binary |
 
 ## Explore by task
 
@@ -106,7 +120,7 @@ example starts its own HTTP and gRPC upstreams, making it the quickest way to tr
 
 ## What is included
 
-rust-zero provides composable production primitives rather than a code generator:
+rust-zero provides composable production primitives plus a focused, optional scaffolding CLI:
 
 - REST and gRPC authentication, middleware, clients, servers, streaming, and graceful draining.
 - Circuit breaking, bounded retries, deadlines, adaptive shedding, rate limiting, load balancing,
@@ -308,6 +322,12 @@ Permits remain active until HTTP or gRPC response streams finish, so long-lived 
 latency and in-flight measurements. Attach a shared `HttpClientMetrics` instance with
 `HttpClient::with_metrics` to record bounded service, method, status/error, latency, and in-flight
 client metrics without labeling raw URLs.
+
+For long-lived EventSource responses, `sse_response_with_backpressure` observes whether the
+downstream transport requests the next frame. `SseBackpressurePolicy` records slow consumers after
+the soft threshold and terminates the body stream after the hard threshold; source-side idle time
+does not count against either limit. Register `SseMetrics` in the same metrics registry to expose
+the bounded `slow` and `disconnected` outcomes.
 
 For the standard production stack, load `RestServerConfig` and provide only application routes:
 
@@ -823,6 +843,12 @@ to connect to every valid endpoint. The optional seed makes membership repeatabl
 restarts; without it, each client instance receives a random seed to spread load across the fleet.
 `DiscoveryStatusSnapshot` reports both the complete `discovered` count and the locally `selected`
 count.
+
+Affinity-sensitive clients can replace `connect_discovered_with_status` with
+`connect_discovered_consistent_hash_with_status`, then call `set_hash_key(&mut request, key)` on
+each Tonic request. The weighted ring is atomically rebuilt from healthy discovery snapshots;
+requests without a key deliberately fall back to round robin, and calls wait for discovery
+recovery within their configured deadline when no usable endpoint remains.
 
 Exact gRPC method timeouts override service-level timeouts, which override the global request
 timeout. The same settings deserialize from `method_timeouts_ms` and `service_timeouts_ms` maps.

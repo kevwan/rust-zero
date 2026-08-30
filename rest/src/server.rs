@@ -16,12 +16,13 @@ use actix_web::{
 use rust_zero_core::{
     AdaptiveShedder, CircuitBreakerConfig, LoadShedderConfig, Metrics, RollingCircuitBreakerConfig,
 };
+use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     fmt,
     future::Future,
-    io::{self, BufReader, Cursor},
+    io,
     net::{SocketAddr, TcpListener},
     path::PathBuf,
     rc::Rc,
@@ -91,8 +92,7 @@ impl RestTlsConfig {
 
     fn rustls_config(&self) -> Result<rustls::ServerConfig, RestServerConfigError> {
         self.validate()?;
-        let mut certificates = BufReader::new(Cursor::new(self.certificate_pem.as_bytes()));
-        let certificates = rustls_pemfile::certs(&mut certificates)
+        let certificates = CertificateDer::pem_slice_iter(self.certificate_pem.as_bytes())
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| RestServerConfigError::Tls(error.to_string()))?;
         if certificates.is_empty() {
@@ -100,18 +100,13 @@ impl RestTlsConfig {
                 "TLS certificate PEM contains no certificates".to_owned(),
             ));
         }
-        let mut private_key = BufReader::new(Cursor::new(self.private_key_pem.as_bytes()));
-        let private_key = rustls_pemfile::private_key(&mut private_key)
-            .map_err(|error| RestServerConfigError::Tls(error.to_string()))?
-            .ok_or_else(|| {
-                RestServerConfigError::Tls("TLS private key PEM contains no private key".to_owned())
-            })?;
+        let private_key = PrivateKeyDer::from_pem_slice(self.private_key_pem.as_bytes())
+            .map_err(|error| RestServerConfigError::Tls(error.to_string()))?;
 
         let builder = rustls::ServerConfig::builder();
         let config = if let Some(client_ca) = &self.client_ca_pem {
             let mut roots = rustls::RootCertStore::empty();
-            let mut reader = BufReader::new(Cursor::new(client_ca.as_bytes()));
-            let roots_to_add = rustls_pemfile::certs(&mut reader)
+            let roots_to_add = CertificateDer::pem_slice_iter(client_ca.as_bytes())
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|error| RestServerConfigError::Tls(error.to_string()))?;
             if roots_to_add.is_empty() {
@@ -1001,7 +996,7 @@ mod tests {
         test as actix_test, web, HttpResponse,
     };
     use rust_zero_core::{parse_config, ConfigFormat};
-    use std::path::Path;
+    use std::{io::Cursor, path::Path};
     use tokio::sync::Notify;
 
     #[test]
@@ -1458,18 +1453,13 @@ priority = true
             .unwrap();
 
         let mut roots = rustls::RootCertStore::empty();
-        let mut ca_reader = BufReader::new(Cursor::new(ca.as_bytes()));
-        for root in rustls_pemfile::certs(&mut ca_reader) {
+        for root in CertificateDer::pem_slice_iter(ca.as_bytes()) {
             roots.add(root.unwrap()).unwrap();
         }
-        let mut certificate_reader = BufReader::new(Cursor::new(client_certificate.as_bytes()));
-        let certificates = rustls_pemfile::certs(&mut certificate_reader)
+        let certificates = CertificateDer::pem_slice_iter(client_certificate.as_bytes())
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
-        let mut key_reader = BufReader::new(Cursor::new(client_key.as_bytes()));
-        let key = rustls_pemfile::private_key(&mut key_reader)
-            .unwrap()
-            .unwrap();
+        let key = PrivateKeyDer::from_pem_slice(client_key.as_bytes()).unwrap();
         let client_config = rustls::ClientConfig::builder()
             .with_root_certificates(roots)
             .with_client_auth_cert(certificates, key)

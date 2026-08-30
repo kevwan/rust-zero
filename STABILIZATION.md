@@ -43,19 +43,20 @@ from demos, CI smoke tests, benchmarks, or go-zero feature parity.
      approved publication. An anonymized organization is acceptable; fabricated or unverifiable
      claims are not.
 
-## Public-API and upgrade review — 2026-08-14
+## Public-API and upgrade review — 2026-08-21
 
 The first review covered all re-exported items, configuration types, error types, feature flags,
-and framework types exposed by the six published crates.
+framework types exposed by the six library crates, and the generated-file contracts of the CLI.
 
 | Crate | Review result | Compatibility risk retained for alpha |
 | --- | --- | --- |
 | `rust-zero-core` | Builders and typed primitives are coherent; external adapters remain feature-gated and `do_command` is an explicit Redis escape hatch | Several configuration structs have public fields and several enums are exhaustive, so adding fields/variants can break source consumers |
 | `rust-zero-rest` | Standard assembly provides one documented path while raw Actix composition remains possible | Public APIs intentionally expose Actix request, response, body, and middleware types; Actix major upgrades can therefore require a rust-zero minor migration |
-| `rust-zero-rpc` | Generated-client-independent builders and status/error boundaries are documented | Tonic/Tower service types and public status snapshots expose dependency and struct-shape changes; snapshot fields must not be added casually |
-| `rust-zero-gateway` | Configuration-driven proxy/transcoding is the stable entry point | Descriptor/reflection and dynamic protobuf types expose prost/tonic compatibility constraints |
+| `rust-zero-rpc` | Generated-client-independent builders and status/error boundaries are documented; the workspace is aligned on Tonic 0.14, Prost 0.14, and Tower 0.5 | Tonic/Tower service types and public status snapshots expose dependency and struct-shape changes; snapshot fields must not be added casually |
+| `rust-zero-gateway` | Configuration-driven proxy/transcoding is the stable entry point; descriptor, reflection, and generated types use the workspace Prost 0.14 stack | Descriptor/reflection and dynamic protobuf types expose prost/tonic compatibility constraints |
 | `rust-zero-mcp` | Protocol version and transport selection are explicit and legacy compatibility is opt-in | MCP specification changes may add protocol variants; handlers must continue receiving unknown-method errors rather than relying on exhaustive matching |
 | `rust-zero-mapreduce` | The small functional surface has no external framework types | Closure/future bounds and error ownership are the principal source-compatibility constraints |
+| `rust-zero-cli` | Commands are non-destructive by default and generated output is deterministic | Command flags and generated file layouts become user-facing compatibility surfaces once published |
 
 Review decisions:
 
@@ -67,8 +68,8 @@ Review decisions:
 - Before beta, audit which exhaustive public enums and public-field structs can become
   `#[non_exhaustive]`; that change itself is source-breaking and belongs in a documented alpha
   minor release.
-- Add automated API-diff enforcement before beta. Until then, release review compares generated
-  documentation and the public re-export lists against the previous published tag.
+- Keep automated `cargo-semver-checks` comparisons against the preceding published tag. A failed
+  diff requires either an API-compatible fix or explicit prerelease migration notes.
 
 ## Current evidence
 
@@ -78,6 +79,9 @@ Review decisions:
   on every change. Smoke results validate the harness only and do not satisfy the duration gate.
 - Real Redis, SQL, MongoDB, etcd, Kubernetes, REST, gRPC, gateway, and MCP integration tests are in
   CI.
+- Weekly `cargo-deny` checks enforce advisories, licenses, duplicate-dependency visibility, and
+  crates.io-only sources. Every temporary advisory exception records its transitive scope and
+  exposure rationale in `deny.toml`.
 - No qualifying 24/72-hour campaign or independent 30-day production deployment is recorded yet.
 
 ## Recording new evidence

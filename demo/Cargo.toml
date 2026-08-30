@@ -3,11 +3,12 @@ name = "rust-zero-demo"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 publish = false
 description = "Local rust-zero middleware demonstration"
 
 [dependencies]
 actix-rt = "2.9.0"
 actix-web = "4.5.1"
-rest = { package = "rust-zero-rest", path = "../rest", version = "0.1.0-alpha.1" }
+rest = { package = "rust-zero-rest", path = "../rest", version = "0.1.0-alpha.2" }
 tracing-subscriber = "0.3"

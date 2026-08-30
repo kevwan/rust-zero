@@ -59,7 +59,7 @@ kube = { version = "4.2", features = ["runtime"], optional = true }
 opentelemetry = { version = "0.32", features = ["trace"], optional = true }
 opentelemetry-otlp = { version = "0.32", default-features = false, features = ["grpc-tonic", "http-proto", "reqwest-blocking-client", "trace"], optional = true }
 opentelemetry_sdk = { version = "0.32", features = ["trace"], optional = true }
-pyroscope = { version = "=2.0.1", default-features = false, features = ["backend-pprof-rs", "rustls-no-provider"], optional = true }
+pyroscope = { version = "2.1.1", default-features = false, features = ["backend-pprof-rs", "rustls-no-provider"], optional = true }
 mongodb = { version = "3.8", optional = true }
 redis = { version = "0.32", features = ["cluster-async", "tokio-comp"], optional = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }

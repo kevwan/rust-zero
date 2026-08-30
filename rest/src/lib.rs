@@ -49,7 +49,10 @@ pub use server::{
     RestCorsConfig, RestServer, RestServerConfig, RestServerConfigError, RestTlsConfig,
     ServerlessHandler, ServerlessRequest, ServerlessResponse,
 };
-pub use sse::{sse_response, SseEvent};
+pub use sse::{
+    sse_response, sse_response_with_backpressure, SseBackpressurePolicy,
+    SseBackpressurePolicyError, SseEvent, SseMetrics,
+};
 pub use static_assets::{EmbeddedAsset, StaticAssets, StaticAssetsError};
 #[cfg(feature = "telemetry")]
 pub use trace::OpenTelemetryTracing;

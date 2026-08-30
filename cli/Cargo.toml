@@ -1,0 +1,25 @@
+[package]
+name = "rust-zero-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Project and deployment scaffolding for rust-zero services"
+documentation = "https://docs.rs/rust-zero-cli"
+
+[[bin]]
+name = "rust-zero"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+
+[dev-dependencies]
+tempfile = "3"

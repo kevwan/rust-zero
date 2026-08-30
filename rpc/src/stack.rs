@@ -19,7 +19,7 @@ use std::{
     task::{Context, Poll},
     time::{Duration, Instant},
 };
-use tonic::{body::BoxBody, Code, Status};
+use tonic::{body::Body as TonicBody, Code, Status};
 use tower::{Layer, Service};
 
 type Validator<T> = dyn Fn(&str) -> Option<T> + Send + Sync;
@@ -200,7 +200,7 @@ where
     ResponseBody::Error: Into<tonic::codegen::StdError>,
     T: Clone + Send + Sync + 'static,
 {
-    type Response = Response<BoxBody>;
+    type Response = Response<TonicBody>;
     type Error = S::Error;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
@@ -302,7 +302,7 @@ where
                     } else if !parts.status.is_success() {
                         body.finish_transport_error();
                     }
-                    Ok(Response::from_parts(parts, tonic::body::boxed(body)))
+                    Ok(Response::from_parts(parts, TonicBody::new(body)))
                 }
                 Ok(Err(error)) => {
                     if let Some(permit) = breaker_permit {
@@ -579,7 +579,7 @@ where
     ResponseBody: Body<Data = bytes::Bytes> + Send + 'static,
     ResponseBody::Error: Into<tonic::codegen::StdError>,
 {
-    type Response = Response<BoxBody>;
+    type Response = Response<TonicBody>;
     type Error = S::Error;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
@@ -658,7 +658,7 @@ where
                     } else if !parts.status.is_success() {
                         wrapped.finish(CircuitOutcome::Failure);
                     }
-                    Ok(Response::from_parts(parts, tonic::body::boxed(wrapped)))
+                    Ok(Response::from_parts(parts, TonicBody::new(wrapped)))
                 }
                 Err(error) => {
                     if let Some(permit) = permit {

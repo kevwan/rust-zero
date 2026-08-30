@@ -1,0 +1,45 @@
+[advisories]
+ignore = [
+    # Actix HTTP still uses h2 0.3; this is a low-severity queued-empty-frame issue. Remove when
+    # Actix migrates to the patched h2 0.4 line.
+    { id = "RUSTSEC-2026-0258", reason = "Actix HTTP has no patched h2 0.3 release; request/body limits and active draining reduce exposure" },
+    # inferno is used only to render locally collected profiler stacks. rust-zero never sends
+    # attacker-controlled XML through quick-xml.
+    { id = "RUSTSEC-2026-0194", reason = "quick-xml is reachable only through offline flamegraph generation, not untrusted XML parsing" },
+    { id = "RUSTSEC-2026-0195", reason = "quick-xml is reachable only through offline flamegraph generation, not untrusted XML parsing" },
+    # SQLx MySQL uses rsa for encryption with the server's public key; rust-zero does not perform
+    # observable private-key RSA operations through this dependency.
+    { id = "RUSTSEC-2023-0071", reason = "SQLx MySQL uses RSA public-key encryption and holds no vulnerable private key" },
+    # Tonic 0.12 retains this parser. rust-zero's direct PEM parsing uses rustls-pki-types.
+    { id = "RUSTSEC-2025-0134", reason = "remaining transitive use is owned by Tonic 0.12 pending its transport upgrade" },
+]
+
+[licenses]
+confidence-threshold = 0.8
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDDL-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"
+highlight = "all"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = [
+    "https://github.com/rust-lang/crates.io-index",
+]

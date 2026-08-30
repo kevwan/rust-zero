@@ -5,12 +5,53 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  schedule:
+    - cron: "23 3 * * 1"
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
 jobs:
+  semver:
+    name: semver (${{ matrix.package }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        package:
+          - rust-zero-core
+          - rust-zero-rest
+          - rust-zero-rpc
+          - rust-zero-gateway
+          - rust-zero-mcp
+          - rust-zero-mapreduce
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install protobuf compiler
+        run: sudo apt-get update && sudo apt-get install --yes protobuf-compiler
+      - name: Compare public API with the latest published prerelease
+        uses: obi1kenobi/cargo-semver-checks-action@v2
+        with:
+          baseline-rev: v0.1.0-alpha.1
+          package: ${{ matrix.package }}
+
+  dependency-policy:
+    name: dependency policy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check advisories, licenses, duplicate versions, and sources
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          rust-version: "1.89"
+          arguments: --all-features --locked
+
   feature-matrix:
     name: features (${{ matrix.name }})
     runs-on: ubuntu-latest
