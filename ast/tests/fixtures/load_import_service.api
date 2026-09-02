@@ -1,0 +1,7 @@
+syntax = "v1"
+
+import "greet.api"
+
+service shop {
+    get /ping -> Resp
+}

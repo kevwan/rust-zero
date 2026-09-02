@@ -1,0 +1,28 @@
+---------- Input ----------
+file: load_dup_type.api
+---------- Error -----------
+duplicate type 'User'
+
+
+---------- Input ----------
+file: load_import_service.api
+---------- Error -----------
+must not declare a service
+
+
+---------- Input ----------
+file: cycle_a.api
+---------- Error -----------
+import cycle
+
+
+---------- Input ----------
+file: load_undefined.api
+---------- Error -----------
+undefined type 'Missing'
+
+
+---------- Input ----------
+file: service_test.api
+---------- Error -----------
+duplicate handler 'bar'

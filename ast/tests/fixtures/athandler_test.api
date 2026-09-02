@@ -1,0 +1,10 @@
+service handler {
+    #[handler(foo)]
+    get /foo
+
+    #[handler(foo1)]
+    get /foo1
+
+    #[handler(_bar)]
+    get /bar
+}

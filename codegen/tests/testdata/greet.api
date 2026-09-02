@@ -1,0 +1,9 @@
+syntax = "v1"
+
+struct Resp {
+    msg: String,
+}
+
+service greet {
+    get /ping -> Resp
+}

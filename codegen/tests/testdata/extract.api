@@ -1,0 +1,25 @@
+syntax = "v1"
+
+struct GetUserReq {
+    #[path]
+    #[json("user_id")]
+    userId: String,
+    #[path("id"), json("user_id")]
+    userId2: String,
+    #[query]
+    page: i64?,
+    #[form]
+    name: String,
+    #[header("Authorization")]
+    token: String,
+}
+
+struct User {
+    id: String,
+}
+
+#[server(prefix = "/v1", timeout = "3s", maxBytes = 1024, middleware = Path)]
+service users {
+    #[handler(getUser)]
+    get /users/:userId/:id (GetUserReq) -> User
+}

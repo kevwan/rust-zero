@@ -1,0 +1,101 @@
+syntax = "v1"
+
+import "example_base1.api"
+
+import (
+    "example_base2.api"
+)
+
+info (
+    title: "type title here"
+    desc: "type desc here"
+    author: "type author here"
+    email: "type email here"
+    version: "type version here"
+)
+
+struct GetFormReq {
+    name: String,
+    age: i64,
+    hobbits: [String],
+}
+
+struct GetFormResp {
+    name: String,
+    age: i64,
+    hobbits: [String],
+}
+
+struct PostJsonReq {
+    name: String,
+    age: i64,
+    hobbits: [String],
+}
+
+struct PostJsonResp {
+    name: String,
+    age: i64,
+    hobbits: [String],
+    extra: {String: String},
+}
+
+struct PostPathReq {
+    #[path]
+    id: String,
+}
+
+struct Nest {
+    name: String,
+}
+
+struct NestDemoReq {
+    nest: Nest?,
+}
+
+struct NestDemoResp {
+    nest: [Nest?],
+}
+
+#[server(group = "form", timeout = "3s")]
+service example {
+    #[handler(getForm)]
+    get /example/form (GetFormReq) -> GetFormResp
+
+    #[handler(postForm)]
+    post /example/form (GetFormReq) -> GetFormResp
+}
+
+#[server(group = "json", jwt = Auth, timeout = "3m")]
+service example {
+    #[doc = "json demo"]
+    #[handler(postJson)]
+    post /example/json (PostJsonReq) -> PostJsonResp
+}
+
+#[server(group = "path", middleware = Path, prefix = "/v1/v2", timeout = "100ms")]
+service example {
+    #[doc(desc = "path demo")]
+    #[handler(postPath)]
+    post /example/path (PostPathReq) -> PostJsonResp
+
+    #[handler(root)]
+    post / -> PostJsonResp
+}
+
+#[server(group = "array", prefix = "/array", maxBytes = 1024)]
+service example {
+    #[handler(getArray)]
+    post /example/array (GetFormReq) -> [GetFormResp]
+
+    #[handler(getArrayPointer)]
+    post /example/array/pointer (GetFormReq) -> [GetFormResp?]
+
+    #[handler(getArrayBase)]
+    post /example/array/base (GetFormReq) -> [String]
+}
+
+#[server(group = "/g1/g2_test/g2_beta", prefix = "/v1/v2_test/v2-beta", summary = "test")]
+service example {
+    #[handler(nestDemo)]
+    post /a/b_c/d-e/:f/123/g (NestDemoReq) -> NestDemoResp
+}

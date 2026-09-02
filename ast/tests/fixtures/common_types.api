@@ -1,0 +1,10 @@
+syntax = "v1"
+
+struct User {
+    id: String,
+}
+
+struct PayReq {
+    user: User,
+    amount: i64,
+}

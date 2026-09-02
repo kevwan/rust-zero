@@ -1,0 +1,10 @@
+service doc {
+    #[doc = ""]
+    get /empty
+
+    #[doc = "foo"]
+    get /foo
+
+    #[doc = "bar"]
+    get /bar
+}

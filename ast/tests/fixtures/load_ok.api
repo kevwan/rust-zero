@@ -1,0 +1,12 @@
+syntax = "v1"
+
+import "common_types.api"
+
+struct Resp {
+    msg: String,
+}
+
+service greet {
+    #[handler(createPay)]
+    post /pay (PayReq) -> Resp
+}

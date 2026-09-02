@@ -1,0 +1,37 @@
+struct Resp {
+    msg: String,
+    tags: [String],
+    extra: {String: i64},
+    nickname: String?,
+}
+
+struct Bar {
+    base: i64,
+    items: [String],
+    nested: [Bar?],
+    extra: {String: i64},
+    pointers: {String: i64?},
+    groups: {String: [i64]},
+    foo: Foo,
+    qux: String?,
+    quux: bool,
+}
+
+struct Foo {
+    name: String,
+    age: i64,
+}
+
+struct GetUserReq {
+    #[path]
+    #[json("user_id")]
+    userId: String,
+    #[path("id"), json("user_id")]
+    userId2: String,
+    #[query]
+    page: i64?,
+    #[form]
+    name: String,
+    #[header("Authorization")]
+    token: String,
+}

@@ -1,0 +1,5 @@
+syntax = "v1"
+
+service greet {
+    get /ping -> Missing
+}
