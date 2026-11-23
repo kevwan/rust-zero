@@ -10,8 +10,6 @@ ignore = [
     # SQLx MySQL uses rsa for encryption with the server's public key; rust-zero does not perform
     # observable private-key RSA operations through this dependency.
     { id = "RUSTSEC-2023-0071", reason = "SQLx MySQL uses RSA public-key encryption and holds no vulnerable private key" },
-    # Tonic 0.12 retains this parser. rust-zero's direct PEM parsing uses rustls-pki-types.
-    { id = "RUSTSEC-2025-0134", reason = "remaining transitive use is owned by Tonic 0.12 pending its transport upgrade" },
 ]
 
 [licenses]
